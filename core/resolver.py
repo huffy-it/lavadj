@@ -115,18 +115,24 @@ async def direct_url(webpage_url: str) -> str | None:
         return None
 
     # Nunca por shell: los títulos y las URLs vienen de YouTube y no son de fiar.
-    proceso = await asyncio.create_subprocess_exec(
-        config.YTDLP_BIN,
-        "--no-warnings",
-        "--skip-download",
-        "--no-playlist",
-        "--extractor-args", CLIENT_ARG,
-        "-f", FORMATO,
-        "--get-url",
-        webpage_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proceso = await asyncio.create_subprocess_exec(
+            config.YTDLP_BIN,
+            "--no-warnings",
+            "--skip-download",
+            "--no-playlist",
+            "--extractor-args", CLIENT_ARG,
+            "-f", FORMATO,
+            "--get-url",
+            webpage_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as error:
+        # No existe (FileNotFoundError) o no se puede ejecutar (PermissionError).
+        # Se devuelve None y `resolve()` cae a la pista original, como promete.
+        log.error("No pude lanzar yt-dlp (%s): %s", config.YTDLP_BIN, error)
+        return None
     try:
         salida, error = await asyncio.wait_for(
             proceso.communicate(), timeout=config.YTDLP_TIMEOUT
@@ -135,9 +141,6 @@ async def direct_url(webpage_url: str) -> str | None:
         proceso.kill()
         await proceso.wait()
         log.warning("yt-dlp se pasó de %ss con %s", config.YTDLP_TIMEOUT, webpage_url)
-        return None
-    except FileNotFoundError:
-        log.error("No encuentro yt-dlp en %s", config.YTDLP_BIN)
         return None
 
     if proceso.returncode != 0:
@@ -378,6 +381,14 @@ class ResolvingPlayer(wavelink.Player):
             kwargs["start"] = inicio
         self.resolviendo += 1
         try:
-            return await super().play(await resolve(track), *args, **kwargs)
+            resuelta = await resolve(track)
+            # Resolver tarda segundos y en ese rato pudo llegar un `!stop`, la
+            # desconexión por inactividad o el corte por canal vacío. Si ahora
+            # se llamara a `super().play()`, wavelink haría el PATCH igual y
+            # Lavalink recrearía un player huérfano de un servidor ya cerrado.
+            if not self.connected:
+                log.debug("El player se desconectó mientras se resolvía %r: no toco", titulo_de(track))
+                return None
+            return await super().play(resuelta, *args, **kwargs)
         finally:
             self.resolviendo -= 1

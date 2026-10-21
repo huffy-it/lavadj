@@ -20,8 +20,6 @@ from core.resolver import revisar_ytdlp                     # noqa: E402
 from core.feeds import invalidate_all as invalidate_feeds   # noqa: E402
 from core.tts import purge_cache as purge_dj_cache          # noqa: E402
 
-log.info("Caché limpiada: %s del DJ", purge_dj_cache())
-
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -37,6 +35,12 @@ async def on_ready():
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
     log.info('Nodo Lavalink conectado: %s', payload.node.uri)
+    # `resumed=False` es una sesión nueva: si ya había players, Lavalink los
+    # perdió (reinicio del nodo) y el cog tiene que rehacerlos. En el primer
+    # arranque no hay ninguno y no pasa nada.
+    cog = bot.get_cog("Music")
+    if cog and not payload.resumed:
+        await cog.recuperar_players(list(payload.node.players.values()))
 
 
 @bot.event
@@ -129,6 +133,9 @@ async def main():
             log.debug("%s no disponible en esta plataforma", señal)
 
     api_runner = await start_server(bot, apagar)
+    # Después de bindear el puerto, no antes: si ya hay otro bot corriendo, esto
+    # muere aquí con "address in use" sin haberle borrado los clips en uso.
+    log.info("Caché limpiada: %s del DJ", purge_dj_cache())
     try:
         async with bot:
             await bot.load_extension('cogs.music')
@@ -142,7 +149,8 @@ async def main():
         await api_runner.cleanup()
 
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    pass
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

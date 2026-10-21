@@ -724,3 +724,199 @@ async def test_no_arranca_encima_del_autoplay_que_esta_resolviendo(cog):
 
     assert vc.tocando == []
     assert list(vc.queue) == [b]
+
+
+# --- reinicio del nodo de audio -------------------------------------------------
+
+class PlayerDeSesionVieja(FakePlayer):
+    """Un player que quedó apuntando a una sesión de Lavalink que ya no existe.
+
+    Imita lo que `recuperar_players` toca: la voz que se reenvía, el tema en
+    curso con su última posición y el `play()` que lo repite.
+    """
+
+    def __init__(self, actual=None, posicion=0, **kwargs):
+        super().__init__(playing=actual is not None, **kwargs)
+        self._current = actual
+        self._last_position = posicion
+        self._last_update = 2        # Lavalink ya reportó este tema...
+        self._inicio_ns = 1          # ...después de que arrancó
+        self.paused = False
+        self.voces = 0
+        self.rechaza_la_voz = False
+        self.falla_el_play = False
+        self.repetidos = []
+        self.guild.voice_client = self
+
+    @property
+    def current(self):
+        return self._current
+
+    async def _dispatch_voice_update(self):
+        self.voces += 1
+        if self.rechaza_la_voz:
+            self.connected = False      # wavelink desconecta si Lavalink la rechaza
+
+    async def play(self, track, **kwargs):
+        if self.falla_el_play:
+            raise RuntimeError("Lavalink no responde")
+        self.repetidos.append((track, kwargs))
+
+    async def disconnect(self):
+        self.connected = False
+
+
+async def test_un_nodo_reiniciado_retoma_el_tema_donde_iba(cog):
+    """Sin esto `playing` queda en verdadero para siempre y la cola no avanza."""
+    sonando, siguiente = FakeTrack("sonando"), FakeTrack("siguiente")
+    vc = PlayerDeSesionVieja(actual=sonando, posicion=95_000, temas=[siguiente])
+    vc.paused = True
+
+    await cog.recuperar_players([vc])
+
+    assert vc.voces == 1
+    assert vc.repetidos == [(sonando, {"start": 95_000, "paused": True, "add_history": False})]
+    assert list(vc.queue) == [siguiente]
+    assert vc.connected
+
+
+async def test_un_nodo_reiniciado_no_reanuda_desde_la_posicion_del_tema_anterior(cog):
+    vc = PlayerDeSesionVieja(actual=FakeTrack("nuevo"), posicion=95_000)
+    vc._last_update = 1         # la última actualización es anterior al arranque
+    vc._inicio_ns = 2
+
+    await cog.recuperar_players([vc])
+
+    assert vc.repetidos[0][1]["start"] == 0
+
+
+async def test_un_nodo_reiniciado_con_el_player_ocioso_solo_rehace_la_voz(cog):
+    vc = PlayerDeSesionVieja(actual=None)
+
+    await cog.recuperar_players([vc])
+
+    assert vc.voces == 1
+    assert vc.repetidos == []
+    assert vc.connected
+
+
+async def test_si_lavalink_rechaza_la_voz_se_corta_y_se_avisa(cog):
+    vc = PlayerDeSesionVieja(actual=FakeTrack("sonando"), temas=[FakeTrack("otro")])
+    vc.rechaza_la_voz = True
+    vc.text_channel = FakeCanalTexto()
+
+    await cog.recuperar_players([vc])
+
+    assert vc.repetidos == []
+    assert not vc.connected
+    assert list(vc.queue) == []
+    assert vc.text_channel.enviados == [music_mod.AVISO_NODO_REINICIADO]
+
+
+async def test_si_no_se_puede_repetir_el_tema_se_corta_y_avisa_en_el_panel(cog):
+    """El aviso va donde está el panel; no se repite en el canal de texto."""
+    vc = PlayerDeSesionVieja(actual=FakeTrack("sonando"))
+    vc.falla_el_play = True
+    vc.text_channel = FakeCanalTexto()
+    canal_del_panel = FakeCanalTexto()
+
+    class MensajeFalso:
+        channel = canal_del_panel
+
+        async def delete(self):
+            pass
+
+    class VistaFalsa:
+        def stop(self):
+            pass
+
+    cog._panels[vc.guild.id] = (MensajeFalso(), VistaFalsa())
+
+    await cog.recuperar_players([vc])
+
+    assert not vc.connected
+    assert canal_del_panel.enviados == [music_mod.AVISO_NODO_REINICIADO]
+    assert vc.text_channel.enviados == []
+
+
+async def test_un_player_roto_no_frena_a_los_demas(cog):
+    roto = PlayerDeSesionVieja(actual=FakeTrack("roto"), guild=FakeGuild(1))
+    roto.falla_el_play = True
+    bueno = PlayerDeSesionVieja(actual=FakeTrack("bueno"), guild=FakeGuild(2))
+
+    await cog.recuperar_players([roto, bueno])
+
+    assert len(bueno.repetidos) == 1
+
+
+# --- wavs del DJ que no se quedan en disco ---------------------------------------
+
+async def test_si_lavalink_no_carga_el_clip_se_borra_su_wav(cog, tmp_path, monkeypatch):
+    wav = tmp_path / "dj_x.wav"
+    wav.write_bytes(b"RIFF")
+    proximo = FakeTrack("proximo")
+    vc = FakePlayer(temas=[proximo])
+
+    async def _prepare(*a, **kw):
+        return None
+
+    async def _sin_track(self, clip):
+        return None
+
+    monkeypatch.setattr(cog.dj, "prepare", _prepare)
+    monkeypatch.setattr(cog.dj, "take", lambda g, t: Clip(wav, "hola", None, "bumper"))
+    monkeypatch.setattr(Music, "_clip_a_track", _sin_track)
+
+    await cog._encolar_dj(vc, proximo)
+
+    assert not wav.exists()
+
+
+async def test_si_lavalink_no_carga_el_aviso_se_borra_su_wav(cog, tmp_path, monkeypatch):
+    wav = tmp_path / "dj_aviso.wav"
+    wav.write_bytes(b"RIFF")
+
+    async def _aviso(texto):
+        return Clip(wav, texto, None, "aviso")
+
+    async def _sin_track(self, clip):
+        return None
+
+    monkeypatch.setattr(cog.dj, "aviso", _aviso)
+    monkeypatch.setattr(Music, "_clip_a_track", _sin_track)
+
+    await cog._decir(FakePlayer(), "se cayó")
+
+    assert not wav.exists()
+
+
+async def test_al_cortar_se_borran_los_cortes_del_dj_que_esperaban_en_la_cola(cog, tmp_path, monkeypatch):
+    monkeypatch.setattr(music_mod.tts, "CACHE_DIR", tmp_path)
+    wav = tmp_path / "dj_pendiente.wav"
+    wav.write_bytes(b"RIFF")
+    clip = FakeTrack("corte")
+    clip.uri = str(wav)
+    ajeno = tmp_path.parent / "cancion.wav"
+    ajeno.write_bytes(b"RIFF")
+    cancion = FakeTrack("tema")
+    cancion.uri = str(ajeno)
+    vc = PlayerDeSesionVieja(temas=[clip, cancion])
+
+    await cog.teardown(vc.guild)
+
+    assert not wav.exists()
+    assert ajeno.exists()
+
+
+@pytest.mark.asyncio
+async def test_un_tema_que_falla_antes_del_primer_reporte_igual_se_reintenta(cog, sin_espera):
+    """wavelink deja `_last_update` en None hasta el primer playerUpdate: la
+    cuenta para reanudar no puede reventar ahí, o el tema se pierde sin reintento."""
+    vc = _reproductor_con_canal()
+    vc._last_update = None
+    vc._inicio_ns = 123
+    caida = FakeTrack("la primera de la noche")
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, caida))
+
+    assert list(vc.queue) == [caida]

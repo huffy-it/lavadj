@@ -37,6 +37,12 @@ CAIDAS_SEGUIDAS_MAX = 3
 # El tope fijo de wavelink: con su cuenta de fallos ahí, deja de avanzar la cola.
 TOPE_DE_WAVELINK = 3
 
+# Lo que se avisa cuando el nodo de audio se reinició y no hubo manera de retomar.
+AVISO_NODO_REINICIADO = (
+    "El nodo de audio se reinició y no pude retomar la transmisión: "
+    "la corté. Usa `!play` para volver a empezar."
+)
+
 
 def en_el_mismo_canal():
     """Los controles son de quien está escuchando, no de cualquiera del server.
@@ -176,6 +182,11 @@ class Music(commands.Cog):
             del self._reintentos[clave]
         self._caidas.pop(guild.id, None)
         if vc:
+            # Los cortes del DJ que quedaron esperando en la cola no van a sonar
+            # nunca: sin esto sus wavs se quedan en dj_cache hasta el próximo
+            # arranque.
+            for pista in vc.queue:
+                self._borrar_clip_dj(pista)
             vc.queue.clear()
             vc.auto_queue.clear()
             await vc.disconnect()
@@ -183,6 +194,67 @@ class Music(commands.Cog):
         await self._delete_panel(guild.id)
         if note and panel:
             await panel[0].channel.send(note)
+
+    # --- reinicio del nodo de audio ---------------------------------------------
+    async def recuperar_players(self, players) -> None:
+        """Rehace los players cuando Lavalink arrancó una sesión nueva.
+
+        Si el proceso de Lavalink se reinicia, wavelink reconecta con una sesión
+        nueva (`resumed=False`) y los players del servidor ya no existen, pero
+        los nuestros siguen con `_current` puesto: `playing` da verdadero, no
+        llega ningún `track_end` y la cola no avanza nunca más. Se intenta
+        retomar cada uno donde iba; si no se puede, se corta con un aviso.
+        """
+        for vc in players:
+            if getattr(vc, "guild", None) is None:
+                continue
+            try:
+                await self._retomar(vc)
+            except Exception:  # noqa: BLE001 - un servidor roto no frena a los demás
+                log.exception("No pude retomar el player de %s: lo corto", vc.guild)
+                await self._cortar_por_nodo(vc)
+
+    async def _retomar(self, vc: wavelink.Player) -> None:
+        """Vuelve a mandarle la voz a la sesión nueva y repite el tema en curso."""
+        # Es lo mismo que hace wavelink al cambiar de nodo (`switch_node`): el
+        # session_id/token/endpoint de Discord siguen valiendo, solo hay que
+        # contárselos a la sesión nueva. Si Lavalink los rechaza, el propio
+        # método desconecta el player y `connected` queda en falso.
+        await vc._dispatch_voice_update()
+        if not vc.connected:
+            raise RuntimeError("la sesión nueva rechazó el estado de voz")
+
+        actual = vc.current
+        if actual is None:
+            log.info("Nodo reiniciado: voz restablecida en %s (sin tema en curso)", vc.guild)
+            return
+
+        # `_last_position` solo vale si Lavalink ya reportó ESTE tema (ver
+        # `on_wavelink_track_exception`); si no, es la posición del anterior.
+        posicion = 0
+        if (getattr(vc, "_last_update", None) or 0) > getattr(vc, "_inicio_ns", 0):
+            posicion = getattr(vc, "_last_position", 0) or 0
+        # La cola queda intacta: solo se vuelve a tocar el tema que sonaba. Pasa
+        # por `ResolvingPlayer.play`, que pide una URL fresca a yt-dlp (la
+        # anterior pudo caducar). `add_history=False`: no es un tema nuevo.
+        await vc.play(actual, start=posicion, paused=vc.paused, add_history=False)
+        log.info(
+            "Nodo reiniciado: retomé %r en %s desde %ss",
+            resolver.titulo_de(actual), vc.guild, posicion // 1000,
+        )
+
+    async def _cortar_por_nodo(self, vc: wavelink.Player) -> None:
+        """Último recurso cuando no se pudo retomar: se corta y se avisa."""
+        canal = getattr(vc, "text_channel", None)
+        con_panel = vc.guild.id in self._panels
+        try:
+            await self.teardown(vc.guild, note=AVISO_NODO_REINICIADO)
+            # `teardown` solo avisa donde estaba el panel; sin panel, al canal
+            # de texto del comando.
+            if canal and not con_panel:
+                await canal.send(AVISO_NODO_REINICIADO)
+        except Exception:  # noqa: BLE001
+            log.exception("No pude cortar limpio el player de %s", vc.guild)
 
     # --- autoplay y cola -----------------------------------------------------
     def autoplay_activo(self, guild_id: int) -> bool:
@@ -255,11 +327,13 @@ class Music(commands.Cog):
             tts.cleanup(clip.path)
             return
         track = await self._clip_a_track(clip)
-        if track:
-            # Siempre a `queue`, aunque el tema que presenta lo haya elegido el
-            # autoplay: wavelink vacía primero `queue` y solo después va a
-            # `auto_queue`, así que el clip queda justo antes de su canción.
-            vc.queue.put_at(0, track)
+        if not track:
+            tts.cleanup(clip.path)
+            return
+        # Siempre a `queue`, aunque el tema que presenta lo haya elegido el
+        # autoplay: wavelink vacía primero `queue` y solo después va a
+        # `auto_queue`, así que el clip queda justo antes de su canción.
+        vc.queue.put_at(0, track)
 
     # --- wavelink events -----------------------------------------------------
     @commands.Cog.listener()
@@ -267,8 +341,8 @@ class Music(commands.Cog):
         vc: wavelink.Player = payload.player
         # El wav del DJ ya sonó (o se cortó): no hace falta en disco. Si solo se
         # borrara al arrancar el bot, dj_cache crecería sin tope.
-        if payload.track is not None and self._es_clip_dj(payload.track):
-            tts.cleanup(getattr(payload.track, "uri", None) or payload.track.identifier)
+        if payload.track is not None:
+            self._borrar_clip_dj(payload.track)
         if not vc or not vc.guild:
             return
 
@@ -376,7 +450,8 @@ class Music(commands.Cog):
         # `_last_position` solo vale si Lavalink ya reportó ESTE tema: si no, es
         # la posición del anterior y reanudar ahí revienta con EOFException.
         corte = 0
-        if getattr(vc, "_last_update", 0) > getattr(vc, "_inicio_ns", 0):
+        # wavelink arranca `_last_update` en None hasta el primer playerUpdate.
+        if (getattr(vc, "_last_update", None) or 0) > getattr(vc, "_inicio_ns", 0):
             corte = getattr(vc, "_last_position", 0) or 0
         largo = getattr(pista, "length", 0) or 0
         if hasattr(vc, "reanudar") and 5000 < corte and (not largo or corte < largo - 15000):
@@ -412,6 +487,8 @@ class Music(commands.Cog):
         track = await self._clip_a_track(clip)
         if track:
             vc.queue.put_at(0, track)
+        else:
+            tts.cleanup(clip.path)
 
     @staticmethod
     def _es_clip_dj(pista: wavelink.Playable) -> bool:
@@ -421,6 +498,11 @@ class Music(commands.Cog):
             str(getattr(pista, campo, "") or "").startswith(carpeta)
             for campo in ("uri", "identifier")
         )
+
+    def _borrar_clip_dj(self, pista: wavelink.Playable) -> None:
+        """Borra el wav si la pista es un corte del DJ; una canción ni se toca."""
+        if self._es_clip_dj(pista):
+            tts.cleanup(getattr(pista, "uri", None) or pista.identifier)
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):

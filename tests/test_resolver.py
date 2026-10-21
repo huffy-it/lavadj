@@ -403,8 +403,72 @@ async def test_el_player_avisa_que_esta_resolviendo(monkeypatch):
 
     monkeypatch.setattr(resolver, "resolve", _resolve)
     monkeypatch.setattr(wavelink.Player, "play", _play)
+    monkeypatch.setattr(wavelink.Player, "connected", property(lambda self: True))
 
     await vc.play(FakePlayable())
 
     assert visto == [1, 1]
     assert vc.resolviendo == 0
+
+
+# --- yt-dlp que no se puede lanzar ---------------------------------------------
+
+@pytest.mark.parametrize("error", [FileNotFoundError("no existe"), PermissionError("sin permiso")])
+async def test_direct_url_con_el_binario_roto_devuelve_none(monkeypatch, error):
+    """Un OSError al lanzar yt-dlp no puede escapar: en el autoplay mataría la cola."""
+    async def _exec(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+    assert await resolver.direct_url("https://youtu.be/abc") is None
+
+
+async def test_resolve_cae_a_la_pista_original_si_yt_dlp_no_se_puede_lanzar(monkeypatch):
+    async def _exec(*args, **kwargs):
+        raise FileNotFoundError("no existe")
+
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+    pista = FakePlayable()
+    assert await resolver.resolve(pista) is pista
+
+
+# --- play() después de desconectarse ---------------------------------------------
+
+def _player_que_resuelve(monkeypatch, conectado):
+    import wavelink
+
+    vc = resolver.ResolvingPlayer.__new__(resolver.ResolvingPlayer)
+    vc.reanudar = {}
+    vc.resolviendo = 0
+    llamadas = []
+
+    async def _resolve(pista):
+        return pista
+
+    async def _play(self, pista, *a, **kw):
+        llamadas.append(pista)
+        return pista
+
+    monkeypatch.setattr(resolver, "resolve", _resolve)
+    monkeypatch.setattr(wavelink.Player, "play", _play)
+    monkeypatch.setattr(wavelink.Player, "connected", property(lambda self: conectado))
+    return vc, llamadas
+
+
+async def test_play_no_toca_lavalink_si_el_player_se_desconecto_mientras_resolvia(monkeypatch):
+    """Si no, el PATCH recrearía un player huérfano de un servidor ya cerrado."""
+    vc, llamadas = _player_que_resuelve(monkeypatch, conectado=False)
+
+    assert await vc.play(FakePlayable()) is None
+
+    assert llamadas == []
+    assert vc.resolviendo == 0
+
+
+async def test_play_sigue_tocando_si_el_player_esta_conectado(monkeypatch):
+    vc, llamadas = _player_que_resuelve(monkeypatch, conectado=True)
+    pista = FakePlayable()
+
+    assert await vc.play(pista) is pista
+
+    assert llamadas == [pista]
