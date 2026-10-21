@@ -1,0 +1,3 @@
+# Para correr los tests:  .venv/bin/python -m pytest
+pytest
+pytest-asyncio

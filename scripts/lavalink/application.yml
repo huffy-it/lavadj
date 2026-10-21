@@ -1,0 +1,94 @@
+# Configuración del nodo Lavalink de LavaDJ.
+# Se monta dentro del contenedor en /opt/Lavalink/application.yml (ver
+# start-lavalink.sh). Queda expuesto solo a localhost porque el puerto se
+# publica con `podman --publish 127.0.0.1:2333`.
+server:
+  port: 2333
+  # 0.0.0.0 es DENTRO del contenedor. Si aquí pusiéramos 127.0.0.1, Lavalink solo
+  # aceptaría conexiones desde el propio contenedor y el bot nunca llegaría.
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    # Lavalink v4 sacó YouTube del core: sin este plugin `!play` no encuentra
+    # nada. Lavalink lo baja solo al arrancar y lo deja en el volumen
+    # lavadj-lavalink-plugins.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      snapshot: false
+  server:
+    password: "youshallnotpass"
+    sources:
+      # En false a propósito: de YouTube se encarga el plugin de arriba.
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      # Los clips de voz del DJ son .wav en dj_cache/, montado en el contenedor
+      # con la misma ruta absoluta que ve el bot.
+      local: true
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 5   # 10 es el máximo y cuesta CPU; en Discord no se nota
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+    gc-warnings: true
+
+plugins:
+  youtube:
+    enabled: true
+    # Clientes del plugin, más información en
+    # https://github.com/lavalink-devs/youtube-source
+    #
+    # El plugin (1.18.2, la última release) ya no consigue sacar el audio de
+    # YouTube: los clientes piden login, reciben un 400 o les llega SABR, que
+    # lavaplayer no entiende. La búsqueda sigue funcionando, así que desde
+    # Discord parece que el bot simplemente no carga nada.
+    #
+    # Por eso el audio ya no sale de aquí: lo resuelve yt-dlp del lado del bot
+    # (core/resolver.py) y Lavalink recibe la URL por su fuente `http`. Esta
+    # lista es solo el camino de respaldo, para el día que el plugin reviva.
+    # Si falta audio, lo que se toca es YTDLP_PLAYER_CLIENT en el .env.
+    #
+    # Este proyecto NO usa credenciales de YouTube: nada de cuentas, cookies ni
+    # sesiones. Es una decisión, no un pendiente.
+    clients:
+      - MUSIC
+      - ANDROID_MUSIC
+      - ANDROID
+      - ANDROID_VR
+      - WEB
+      - WEBEMBEDDED
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ""
+  environment: ""
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO

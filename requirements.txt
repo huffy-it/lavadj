@@ -1,0 +1,5 @@
+discord.py[voice]
+wavelink
+python-dotenv
+aiohttp
+feedparser

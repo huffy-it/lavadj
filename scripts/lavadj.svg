@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="chasis" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#221C17"/>
+      <stop offset="1" stop-color="#0E0B0A"/>
+    </linearGradient>
+    <radialGradient id="lampara" cx="38%" cy="34%" r="70%">
+      <stop offset="0" stop-color="#FFC3AE"/>
+      <stop offset="0.5" stop-color="#FF3B21"/>
+      <stop offset="1" stop-color="#A81C09"/>
+    </radialGradient>
+    <filter id="halo" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="3.2"/>
+    </filter>
+  </defs>
+
+  <rect x="3" y="3" width="58" height="58" rx="13" fill="url(#chasis)" stroke="#3A2F26" stroke-width="1.5"/>
+
+  <!-- Arcos de emisión -->
+  <g fill="none" stroke="#E8A93C" stroke-linecap="round" opacity="0.85">
+    <path d="M20 24a17 17 0 0 0 0 16" stroke-width="2.6"/>
+    <path d="M44 24a17 17 0 0 1 0 16" stroke-width="2.6"/>
+    <path d="M13.5 18a26 26 0 0 0 0 28" stroke-width="2" opacity="0.45"/>
+    <path d="M50.5 18a26 26 0 0 1 0 28" stroke-width="2" opacity="0.45"/>
+  </g>
+
+  <!-- Testigo al aire -->
+  <circle cx="32" cy="32" r="9" fill="#FF3B21" opacity="0.55" filter="url(#halo)"/>
+  <circle cx="32" cy="32" r="8" fill="url(#lampara)" stroke="#FF7A5E" stroke-width="1"/>
+</svg>

@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+dj_cache/
+dj_feeds.json
+lavalink/
+bot_out.log
+bot_err.log

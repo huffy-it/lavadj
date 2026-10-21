@@ -1,0 +1,7 @@
+{
+  "_comment": "Feeds RSS que lee el DJ para las noticias. Copia este archivo a dj_feeds.json (que no se versiona) y agrega o saca lo que quieras: se leen al arrancar el bot. Los titulares viven solo en RAM (TTL 15 min), nunca tocan disco.",
+  "feeds": [
+    "https://feeds.bbci.co.uk/mundo/rss.xml",
+    "https://rss.dw.com/rdf/rss-sp-all"
+  ]
+}

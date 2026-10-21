@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LavaDJ</title>
+<style>
+  :root { --bg:#14161a; --card:#1e2127; --fg:#e6e8eb; --mut:#8b929c; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1f24; --mut:#6a7280; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
+  main { max-width:900px; margin:auto; display:grid; gap:12px; }
+  h1 { margin:0 0 4px; font-size:20px; display:flex; align-items:center; gap:10px; }
+  .card { background:var(--card); border-radius:10px; padding:14px 16px; }
+  .card h2 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); display:inline-block; }
+  .ok { background:var(--ok); } .warn { background:var(--warn); } .bad { background:var(--bad); }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:3px 0; }
+  .row span:first-child { color:var(--mut); }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:7px 14px; font:inherit; cursor:pointer; }
+  button.bad { background:var(--bad); } button:disabled { opacity:.5; }
+  .acciones { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input[type=range] { flex:1; min-width:120px; }
+  ul { margin:0; padding-left:18px; } li.leido { color:var(--mut); text-decoration:line-through; }
+  pre { margin:0; max-height:300px; overflow:auto; font:12px/1.4 ui-monospace,Consolas,monospace; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span id="luz" class="dot"></span> LavaDJ <small id="usuario" style="color:var(--mut);font-weight:400"></small></h1>
+
+  <div class="card">
+    <h2>Estado</h2>
+    <div class="row"><span>Bot</span><span id="bot">…</span></div>
+    <div class="row"><span>Lavalink (audio)</span><span id="lava">…</span></div>
+    <div class="row"><span>Transmisión</span><span id="salud">…</span></div>
+    <div class="row"><span>yt-dlp</span><span id="ytdlp">…</span></div>
+    <div class="row"><span>Servidores</span><span id="servidores">…</span></div>
+  </div>
+
+  <div class="card"><h2>En el aire</h2><div id="voz">Nada.</div></div>
+
+  <div class="card">
+    <h2>Voz del DJ</h2>
+    <div class="acciones">
+      <input id="vol" type="range" min="0" max="200" step="5">
+      <b id="volTxt">–</b>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Titulares del DJ</h2>
+    <div class="acciones" style="margin-bottom:8px">
+      <button id="refrescar">Refrescar noticias</button><span id="edad" style="color:var(--mut)"></span>
+    </div>
+    <ul id="titulares"></ul>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <pre id="log">…</pre>
+  </div>
+
+  <div class="card acciones"><button id="parar" class="bad">Apagar el bot</button></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const api = (ruta, opts) => fetch('/api/' + ruta, opts).then(r => r.json());
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur = s => s < 60 ? s + ' s' : s < 3600 ? Math.floor(s/60) + ' min' : Math.floor(s/3600) + ' h ' + Math.floor(s%3600/60) + ' min';
+let moviendo = false;
+
+async function actualizar() {
+  try {
+    const e = await api('status');
+    $('luz').className = 'dot ' + (e.salud && e.salud.estado === 'bien' && e.lavalink.conectado ? 'ok' : 'warn');
+    $('usuario').textContent = e.usuario || '';
+    $('bot').textContent = (e.listo ? 'listo' : 'arrancando') + ' · ' + dur(Math.floor(e.uptime));
+    $('lava').textContent = e.lavalink.conectado ? 'conectado' : 'DESCONECTADO';
+    $('salud').textContent = e.salud ? e.salud.estado + (e.salud.motivo ? ' – ' + e.salud.motivo : '') : '–';
+    $('ytdlp').textContent = e.ytdlp.version ? e.ytdlp.version + (e.ytdlp.viejo ? ' (viejo)' : '') : 'no encontrado';
+    $('servidores').textContent = e.servidores;
+    $('voz').innerHTML = e.voz.length ? e.voz.map(v =>
+      `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.sonando ? '▶ ' + esc(v.cancion || '') : 'quieto'} · ${v.en_cola} en cola</span></div>`).join('') : 'Nada.';
+  } catch (_) {
+    $('luz').className = 'dot bad'; $('bot').textContent = 'APAGADO';
+    return;
+  }
+  try {
+    const d = await api('dj_volume');
+    if (!moviendo) { $('vol').value = d.volumen; $('volTxt').textContent = d.volumen + '%' + (d.disponible ? '' : ' (DJ no disponible)'); }
+    const h = await api('headlines');
+    $('edad').textContent = h.edad == null ? 'sin bajar' : 'hace ' + dur(Math.floor(h.edad));
+    $('titulares').innerHTML = (h.titulares || []).map(t => `<li class="${t.leido ? 'leido' : ''}">${esc(t.texto)}</li>`).join('');
+    const l = await api('log?lineas=60');
+    const caja = $('log'), abajo = caja.scrollTop + caja.clientHeight >= caja.scrollHeight - 20;
+    caja.textContent = l.lineas.join('\n');
+    if (abajo) caja.scrollTop = caja.scrollHeight;
+  } catch (_) {}
+}
+
+$('vol').oninput = () => { moviendo = true; $('volTxt').textContent = $('vol').value + '%'; };
+$('vol').onchange = async () => { await api('dj_volume?valor=' + $('vol').value, {method:'POST'}); moviendo = false; };
+$('refrescar').onclick = async () => { $('refrescar').disabled = true; await api('refresh_news', {method:'POST'}); $('refrescar').disabled = false; actualizar(); };
+// Sin confirm(): los navegadores embebidos lo bloquean y el botón parecía muerto.
+let armado = null;
+$('parar').onclick = async () => {
+  const b = $('parar');
+  if (!armado) {
+    b.textContent = 'Click otra vez para confirmar';
+    armado = setTimeout(() => { armado = null; b.textContent = 'Apagar el bot'; }, 4000);
+    return;
+  }
+  clearTimeout(armado); armado = null;
+  b.disabled = true; b.textContent = 'Apagando…';
+  try { await api('stop?motivo=panel+web', {method:'POST'}); } catch (_) {}
+  setTimeout(actualizar, 1500);
+};
+
+actualizar(); setInterval(() => { if (!document.hidden) actualizar(); }, 3000);
+</script>
+</body>
+</html>
