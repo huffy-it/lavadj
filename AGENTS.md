@@ -93,8 +93,10 @@ capas antes de tocar nada:
 
 ```sh
 # 1. ¿Encuentra? Si esto devuelve tracks, la búsqueda está sana y el bot no tiene la culpa.
+#    ytmsearch y no ytsearch: es la que usa el bot (la de wavelink por defecto), y
+#    ytsearch puede devolver "empty" en el plugin aunque la del bot funcione.
 curl -H "Authorization: youshallnotpass" \
-  "http://127.0.0.1:2333/v4/loadtracks?identifier=ytsearch%3Aalgo"
+  "http://127.0.0.1:2333/v4/loadtracks?identifier=ytmsearch%3Aalgo"
 
 # 2. ¿Reproduce? El error real sale aquí, no en logs/bot.log.
 podman logs lavadj-lavalink 2>&1 | grep -iE "failed|AllClientsFailed"
