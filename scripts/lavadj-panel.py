@@ -948,7 +948,11 @@ class Panel(Adw.ApplicationWindow):
         self.detalle.set_text(self.texto_de_estado(estado))
 
         ocupado = self.ocupado
-        self.boton_aire.set_sensitive(not al_aire and not ocupado)
+        # Mientras se vigila el arranque el bot todavía no contesta (al_aire es
+        # falso): sin `vigilando` el botón se reactivaba y un segundo click
+        # lanzaba un segundo bot. `revisar_arranque` lo limpia al levantar o al
+        # vencer el plazo, así que no se queda apagado para siempre.
+        self.boton_aire.set_sensitive(not al_aire and not ocupado and not self.vigilando)
         self.boton_cortar.set_sensitive(al_aire and not ocupado)
         self.boton_noticias.set_sensitive(al_aire and not ocupado)
 

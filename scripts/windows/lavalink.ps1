@@ -18,7 +18,12 @@ function Responde {
     } catch { $false }
 }
 function Proceso {
-    if (Test-Path $Pid_) { Get-Process -Id (Get-Content $Pid_) -ErrorAction SilentlyContinue }
+    # Tras un reinicio el PID del archivo puede ser de cualquier otro programa:
+    # solo cuenta si ese proceso es java.
+    if (Test-Path $Pid_) {
+        $p = Get-Process -Id (Get-Content $Pid_) -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -eq 'java') { $p }
+    }
 }
 function Argumentos {
     # Más heap que en Linux y G1: con 384m y GC serial las pausas atrasaban los
@@ -54,7 +59,11 @@ switch ($Accion) {
     "stop" {
         $p = Proceso
         if ($p) { Stop-Process -Id $p.Id -Force; Remove-Item $Pid_ -ErrorAction SilentlyContinue; Write-Host "Lavalink detenido." }
-        else { Write-Host "No estaba corriendo." }
+        else {
+            # Un pid viejo de otro proceso no se toca; solo se borra el archivo.
+            Remove-Item $Pid_ -ErrorAction SilentlyContinue
+            Write-Host "No estaba corriendo."
+        }
     }
     "status" {
         if (Responde) { Write-Host "arriba (puerto $Puerto)" }

@@ -11,9 +11,9 @@ function InstalarPaquete($id) {
     winget install --id $id -e --accept-package-agreements --accept-source-agreements
 }
 
-# 1. venv + dependencias de Python (yt-dlp incluido: queda en .venv\Scripts)
+# 1. venv + dependencias de Python (yt-dlp viene en requirements.txt y queda en .venv\Scripts)
 if (-not (Test-Path .venv)) { python -m venv .venv }
-.\.venv\Scripts\python.exe -m pip install -q -r requirements.txt yt-dlp
+.\.venv\Scripts\python.exe -m pip install -q -r requirements.txt
 
 # 2. Programas del sistema
 if (-not (Tiene java))       { InstalarPaquete "EclipseAdoptium.Temurin.21.JRE" }

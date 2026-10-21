@@ -41,7 +41,7 @@ flowchart LR
 |---|---|---|
 | Python 3 con `venv` | 3.11 (la versión con la que se desarrolla) | 3.11 (ídem) |
 | Lavalink 4 | contenedor con `podman` | `Lavalink.jar` con Java 21 |
-| `yt-dlp` | lo instalas tú | lo instala `setup.ps1` |
+| `yt-dlp` | en `requirements.txt` | en `requirements.txt` (lo instala `setup.ps1`) |
 | `espeak-ng` | lo instalas tú | lo instala `setup.ps1` |
 | `ffmpeg` | lo instalas tú (recomendado) | lo instala `setup.ps1` |
 | `python3-gobject` con GTK4/libadwaita | solo para el panel GTK | no aplica |
@@ -69,13 +69,9 @@ cp dj_feeds.example.json dj_feeds.json     # opcional: noticias del DJ
 Instala además, con el gestor de tu distribución, `podman`, `espeak-ng` y
 `ffmpeg`.
 
-**yt-dlp** no está en `requirements.txt`. Instálalo donde el bot lo encuentre:
-en el PATH, en el venv o en `~/.local/bin/yt-dlp` (o apunta a otro sitio con
-`YTDLP_BIN`). Lo más simple es el propio venv:
-
-```bash
-.venv/bin/python -m pip install yt-dlp
-```
+**yt-dlp** viene en `requirements.txt` y queda en el venv. El bot lo busca en el
+PATH, en el venv o en `~/.local/bin/yt-dlp` (o apunta a otro sitio con
+`YTDLP_BIN`).
 
 YouTube cambia seguido y yt-dlp **no se actualiza solo**: mantenlo al día
 (`.venv/bin/python -m pip install -U yt-dlp`). El bot avisa en el log cuando la
@@ -110,7 +106,7 @@ proyecto, en PowerShell:
 powershell -ExecutionPolicy Bypass -File scripts\windows\setup.ps1   # una sola vez
 ```
 
-`setup.ps1` crea el venv, instala las dependencias y `yt-dlp`, instala por winget
+`setup.ps1` crea el venv, instala las dependencias (`yt-dlp` incluido), instala por winget
 Java 21 (Temurin), ffmpeg y eSpeak NG, descarga `Lavalink.jar` a `lavalink\` y
 crea `.env` y `dj_feeds.json` a partir de los ejemplos. Si winget instaló algo,
 abre una terminal nueva para que tome el PATH.
@@ -224,7 +220,10 @@ con marca en los ya leídos y tema claro u oscuro. Guarda sus ajustes en
 
 **Seguridad.** La API escucha **solo en `127.0.0.1`** y no tiene autenticación.
 Nada de fuera de tu máquina llega hasta ella; no la expongas a la red sin añadirle
-una clave antes.
+una clave antes. Para que ninguna página web que abras en el navegador pueda
+apagar el bot o leer su estado, la API rechaza (403) las peticiones con un `Host`
+que no sea `127.0.0.1`, `localhost` o `[::1]` con su puerto, y los POST cuyo
+`Origin` sea otro.
 
 | Endpoint | Método | Qué hace |
 |---|---|---|

@@ -3,3 +3,4 @@ wavelink
 python-dotenv
 aiohttp
 feedparser
+yt-dlp

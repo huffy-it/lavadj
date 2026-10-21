@@ -220,3 +220,66 @@ def test_el_log_sin_archivo_viene_vacio(tmp_path, monkeypatch):
     monkeypatch.setattr(api, "LOG_FILE", tmp_path / "no_existe.log")
     respuesta = asyncio.run(api.handle_log(pedido("GET", "/api/log")))
     assert cuerpo(respuesta)["lineas"] == []
+
+
+# --- protección contra CSRF y DNS rebinding --------------------------------
+
+async def _con_servidor(prueba):
+    """Levanta la app de verdad en un puerto libre y le pasa (cliente, puerto, app).
+
+    El middleware compara contra el puerto que se le dio, así que se crea con el
+    mismo puerto en el que escucha el servidor de prueba.
+    """
+    from aiohttp.test_utils import TestClient, TestServer, unused_port
+
+    puerto = unused_port()
+    app = api.crear_app(FakeBot(FakeCog()), asyncio.Event(), puerto)
+    async with TestClient(TestServer(app, port=puerto)) as cliente:
+        await prueba(cliente, puerto, app)
+
+
+async def test_host_ajeno_da_403():
+    async def prueba(cliente, puerto, app):
+        for host in ("evil.example.com", f"evil.example.com:{puerto}", "127.0.0.1", f"127.0.0.1:{puerto + 1}"):
+            r = await cliente.get("/api/dj_volume", headers={"Host": host})
+            assert r.status == 403, host
+
+    await _con_servidor(prueba)
+
+
+async def test_get_con_host_bueno_funciona():
+    async def prueba(cliente, puerto, app):
+        for host in (f"127.0.0.1:{puerto}", f"localhost:{puerto}", f"[::1]:{puerto}"):
+            r = await cliente.get("/api/dj_volume", headers={"Host": host})
+            assert r.status == 200, host
+
+    await _con_servidor(prueba)
+
+
+async def test_post_con_origin_ajeno_da_403_y_no_apaga():
+    async def prueba(cliente, puerto, app):
+        for origen in ("http://evil.example.com", "null", f"http://127.0.0.1:{puerto + 1}", "https://127.0.0.1:%d" % puerto):
+            r = await cliente.post("/api/stop", headers={"Origin": origen})
+            assert r.status == 403, origen
+        assert not app["apagar"].is_set()
+
+    await _con_servidor(prueba)
+
+
+async def test_post_con_origin_propio_funciona():
+    async def prueba(cliente, puerto, app):
+        r = await cliente.post("/api/stop", headers={"Origin": f"http://127.0.0.1:{puerto}"})
+        assert r.status == 200
+        assert app["apagar"].is_set()
+
+    await _con_servidor(prueba)
+
+
+async def test_post_sin_origin_funciona():
+    # Así llama el panel GTK (urllib no manda Origin).
+    async def prueba(cliente, puerto, app):
+        r = await cliente.post("/api/stop")
+        assert r.status == 200
+        assert app["apagar"].is_set()
+
+    await _con_servidor(prueba)

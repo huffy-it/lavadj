@@ -6,6 +6,6 @@ __pycache__/
 logs/
 dj_cache/
 dj_feeds.json
-lavalink/
+/lavalink/
 bot_out.log
 bot_err.log

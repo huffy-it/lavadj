@@ -5,7 +5,9 @@ del DJ, refrescar noticias y apagar) y sirve el panel web en `/`; los paneles so
 clientes HTTP comunes y corrientes.
 
 Solo escucha en 127.0.0.1: no hay autenticación a propósito, porque nada de
-fuera de la máquina llega hasta aquí.
+fuera de la máquina llega hasta aquí. Eso no basta contra una página web que
+abras en el navegador: puede mandar un formulario a 127.0.0.1 o usar DNS
+rebinding. Por eso un middleware valida `Host` y `Origin` (ver `proteger`).
 """
 
 import asyncio
@@ -203,9 +205,45 @@ async def handle_stop(request: web.Request) -> web.Response:
     return web.json_response({"status": "stopping"})
 
 
-async def start_server(bot, apagar: asyncio.Event) -> web.AppRunner:
-    """Levanta la API y devuelve el runner para poder cerrarlo al salir."""
-    app = web.Application()
+def _anfitriones_locales(puerto: int) -> frozenset[str]:
+    return frozenset(f"{nombre}:{puerto}" for nombre in ("127.0.0.1", "localhost", "[::1]"))
+
+
+def proteger(puerto: int):
+    """Middleware contra CSRF y DNS rebinding.
+
+    - `Host`: una página con DNS rebinding resuelve su dominio a 127.0.0.1, pero
+      el navegador sigue mandando `Host: dominio-malo:puerto`. Si no es
+      uno de los nuestros, 403 (también para los GET, que es donde se filtraría
+      el estado y el log).
+    - `Origin`: un formulario de cualquier página puede hacer POST a localhost y
+      CORS no lo frena. El navegador siempre manda `Origin` en esos POST, así
+      que si viene y no es el nuestro (o es `null`), 403. Sin `Origin` (urllib
+      del panel GTK, curl) pasa: no es un navegador cruzando orígenes.
+
+    El puerto se pasa explícito (el de `config.API_PORT`, o el real en tests)
+    en vez de leerlo de la conexión, que detrás de un reenvío mentiría.
+    """
+    anfitriones = _anfitriones_locales(puerto)
+    origenes = frozenset(f"http://{a}" for a in anfitriones)
+
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        if request.headers.get("Host", "").lower() not in anfitriones:
+            log.warning("API: Host rechazado (%r)", request.headers.get("Host"))
+            return web.json_response({"error": "host no permitido"}, status=403)
+        if request.method not in ("GET", "HEAD"):
+            origen = request.headers.get("Origin")
+            if origen is not None and origen.lower() not in origenes:
+                log.warning("API: Origin rechazado (%r) en %s %s", origen, request.method, request.path)
+                return web.json_response({"error": "origen no permitido"}, status=403)
+        return await handler(request)
+
+    return middleware
+
+
+def crear_app(bot, apagar: asyncio.Event, puerto: int) -> web.Application:
+    app = web.Application(middlewares=[proteger(puerto)])
     app["bot"] = bot
     app["apagar"] = apagar
     app["arranque"] = time.monotonic()
@@ -219,6 +257,12 @@ async def start_server(bot, apagar: asyncio.Event) -> web.AppRunner:
         web.post("/api/refresh_news", handle_refresh),
         web.post("/api/stop", handle_stop),
     ])
+    return app
+
+
+async def start_server(bot, apagar: asyncio.Event) -> web.AppRunner:
+    """Levanta la API y devuelve el runner para poder cerrarlo al salir."""
+    app = crear_app(bot, apagar, config.API_PORT)
 
     runner = web.AppRunner(app)
     await runner.setup()
