@@ -1192,7 +1192,7 @@ class Music(commands.Cog):
             return await ctx.send("No hay nada reproduciendo.")
         t = vc.current
         tag = " 🔁" if vc.queue.mode == wavelink.QueueMode.loop else ""
-        req = getattr(t, "requester", "?")
+        req = getattr(t, "requester", None) or "autoplay"
         await ctx.send(
             f"🎵 **{t.title}**{tag}\n"
             f"Duración: `{format_duration(t.length)}` — Pedido por: {req}"

@@ -27,7 +27,7 @@ def build_embed(vc: wavelink.Player) -> discord.Embed:
         colour=discord.Colour.dark_teal(),
     )
     if track:
-        req = getattr(track, "requester", "?")
+        req = getattr(track, "requester", None) or "autoplay"
         embed.add_field(name="Pedido por", value=req, inline=True)
         embed.add_field(name="Duración", value=format_duration(track.length), inline=True)
     

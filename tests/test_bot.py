@@ -462,10 +462,13 @@ class ArbolFalso:
     """Lo único que bot.py le pide al árbol de comandos: copiar lo global a un servidor y sincronizar."""
 
     def __init__(self, fallan=()):
-        self.copiados, self.sincronizados, self.fallan = [], [], set(fallan)
+        self.copiados, self.sincronizados, self.fallan, self.limpiados = [], [], set(fallan), []
 
     def copy_global_to(self, *, guild):
         self.copiados.append(guild.id)
+
+    def clear_commands(self, *, guild):
+        self.limpiados.append(guild)
 
     async def sync(self, *, guild=None):
         destino = guild.id if guild else None
@@ -489,7 +492,8 @@ async def test_con_lista_blanca_se_copia_y_se_sincroniza_en_cada_servidor(bot_mo
         await bot_mod.sincronizar_comandos()
 
     assert arbol.copiados == [1, 2]
-    assert arbol.sincronizados == [1, 2]
+    assert arbol.sincronizados == [1, 2, None]      # el último vacía los globales
+    assert arbol.limpiados == [None]
     assert "17 registrados en el servidor 1" in caplog.text and "17 registrados en el servidor 2" in caplog.text
 
 
@@ -502,6 +506,7 @@ async def test_sin_lista_blanca_la_sincronizacion_es_global(bot_mod, monkeypatch
 
     assert arbol.copiados == []
     assert arbol.sincronizados == [None]
+    assert arbol.limpiados == []
     assert "17 registrados de forma global" in caplog.text and "tardar" in caplog.text
 
 
@@ -512,7 +517,7 @@ async def test_los_comandos_de_barra_se_sincronizan_una_sola_vez_aunque_on_ready
     for _ in range(3):
         await bot_mod.on_ready()
 
-    assert arbol.sincronizados == [1]
+    assert arbol.sincronizados == [1, None]
 
 
 async def test_un_error_al_sincronizar_no_tumba_al_bot_ni_a_los_demas_servidores(bot_mod, monkeypatch, caplog):
@@ -522,7 +527,7 @@ async def test_un_error_al_sincronizar_no_tumba_al_bot_ni_a_los_demas_servidores
     with caplog.at_level(logging.INFO, logger="bot"):
         await bot_mod.sincronizar_comandos()
 
-    assert arbol.sincronizados == [2]
+    assert arbol.sincronizados == [2, None]
     assert "No pude registrar los comandos de barra en el servidor 1" in caplog.text
     assert "17 registrados en el servidor 2" in caplog.text
 

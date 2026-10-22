@@ -90,7 +90,8 @@ async def sincronizar_comandos() -> None:
     if comandos_sincronizados:
         return
     comandos_sincronizados = True
-    for servidor in [discord.Object(id=g) for g in sorted(config.SERVIDORES_PERMITIDOS)] or [None]:
+    servidores = [discord.Object(id=g) for g in sorted(config.SERVIDORES_PERMITIDOS)]
+    for servidor in servidores or [None]:
         donde = f"en el servidor {servidor.id}" if servidor else "de forma global (pueden tardar en aparecer)"
         try:
             if servidor:
@@ -100,6 +101,13 @@ async def sincronizar_comandos() -> None:
             log.exception("No pude registrar los comandos de barra %s", donde)
             continue
         log.info("Comandos de barra: %s registrados %s", len(comandos), donde)
+    if servidores:
+        # Los globales de un arranque sin lista blanca se verían duplicados junto a los del servidor.
+        try:
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+        except Exception:  # noqa: BLE001
+            log.exception("No pude borrar los comandos de barra globales")
 
 
 @bot.event
