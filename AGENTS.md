@@ -8,15 +8,25 @@ Linux, directo con Java en Windows) ← **bot.py** (Discord + API HTTP) ← **pa
 ## Comandos
 
 ```sh
-.venv/bin/python -m pytest              # toda la suite, menos de un segundo
+.venv/bin/python -m pytest              # toda la suite, unos segundos y sin red
 .venv/bin/python bot.py                 # el bot (necesita Lavalink arriba)
 scripts/lavalink/start-lavalink.sh      # nodo de audio (podman)
 python3 scripts/lavadj-panel.py       # el panel GTK4 — python del SISTEMA, no el venv
+
+# Comprobar que el audio de YouTube suena de verdad (Lavalink arriba, bot apagado):
+.venv/bin/python -m pytest -m integracion            # REST contra Lavalink y yt-dlp reales
+.venv/bin/python scripts/probar-que-suena.py         # entra a voz y toca varias pistas
 ```
 
 En Windows el venv usa `.venv\Scripts\python.exe` en lugar de `.venv/bin/python`, y
 los scripts de `scripts\windows\` hacen el trabajo de los de arriba: `setup.ps1`
 (instalación), `lavalink.ps1` (nodo de audio) y `start.ps1` (nodo + bot + panel web).
+Las dos últimas líneas de arriba son, en Windows,
+`.venv\Scripts\python.exe -m pytest -m integracion` y
+`.venv\Scripts\python.exe scripts\probar-que-suena.py`.
+
+Los tests marcados `integracion` están excluidos de `pytest` a secas (`pytest.ini`),
+para que la suite siga siendo rápida y sin red.
 
 **Dos intérpretes distintos, a propósito:**
 - **bot y tests → `.venv/bin/python`.** Con el `python3` del sistema los tests ni
@@ -46,6 +56,8 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
 | `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte) |
 | `scripts/windows/` | Instalación y arranque en Windows (PowerShell) |
+| `scripts/probar-que-suena.py` | Prueba de punta a punta: entra a voz y comprueba que suena (ver "Verificar que suena") |
+| `tests/test_integracion.py` | Tests `integracion` (excluidos por defecto): Lavalink y yt-dlp reales |
 
 Puertos: bot API `9876`, Lavalink `2333`.
 `dj_cache/` se monta **en la misma ruta** dentro del contenedor de Lavalink — si
@@ -135,6 +147,11 @@ manda el plugin.
 **Una prueba suelta no alcanza**: encola varios temas o una lista `RD` antes de
 cantar victoria. Un tema suelto puede sonar y el bot caerse igual en el siguiente.
 
+**La prueba final es `scripts/probar-que-suena.py`**: después de cualquier arreglo
+—o cuando alguien dice "no suena"— córrela antes de dar el problema por resuelto. Entra a voz
+y toca varias pistas por el mismo camino que el bot, así que cubre justo lo que los
+`curl` y `yt-dlp` de arriba no pueden (ver la sección de más abajo).
+
 **Este proyecto no usa credenciales de YouTube** — ni cuentas, ni cookies, ni
 sesiones de ningún tipo. Es decisión del dueño, no un pendiente: no las
 propongas ni las agregues.
@@ -146,11 +163,60 @@ el track. La prueba de verdad es conectarse con el token del `.env` y wavelink,
 entrar a un canal de voz, hacer `play` y esperar `on_wavelink_track_start` contra
 `on_wavelink_track_exception`.
 
-Dos cosas que hacen perder media hora si no las sabes:
+Eso ya está hecho en `scripts/probar-que-suena.py`; no lo reescribas a mano cada vez:
+
+```sh
+# Linux
+.venv/bin/python scripts/probar-que-suena.py                  # con Lavalink arriba y el bot apagado
+.venv/bin/python scripts/probar-que-suena.py --cortar-bot     # apaga el bot por la API antes
+.venv/bin/python scripts/probar-que-suena.py --lista "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ"
+.venv/bin/python scripts/probar-que-suena.py --help           # servidor, canal, consultas, tiempos
+```
+
+```powershell
+# Windows
+.\.venv\Scripts\python.exe scripts\probar-que-suena.py
+.\.venv\Scripts\python.exe scripts\probar-que-suena.py --cortar-bot
+.\.venv\Scripts\python.exe scripts\probar-que-suena.py --lista "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ"
+```
+
+Usa el `Resolver` y el `ResolvingPlayer` reales (con `client.resolver`, como el bot),
+toca unas 4 búsquedas variadas o las primeras pistas de una playlist, y por cada una
+mide los segundos desde `play()` hasta que Lavalink avisa del arranque —yt-dlp incluido,
+que es el dato a bajar—. Igual que el bot, adelanta la URL de la pista siguiente
+mientras suena la actual, así que desde la segunda el tiempo baja; con
+`--sin-precarga` se ve la diferencia. Después la deja sonar unos segundos, porque una
+pista puede arrancar y reventar al rato. Imprime OK o FALLA por pista y un resumen;
+sale con 0 si todas sonaron, 1 si alguna falló y 2 si ni siquiera pudo prepararse la
+prueba.
+
+Dos cosas que hacen perder media hora si no las sabes, y que el script ya respeta:
 - **Filtra los canales por `canal.permissions_for(guild.me)`.** Casi ninguno deja
   entrar al bot y los que no, tardan 30 s en fallar con `ChannelTimeoutException`.
+  El script solo considera canales con `connect` y `speak` y prefiere los que no
+  tienen personas, para no meterle música de prueba a nadie.
 - **Corta el bot antes** (`curl -X POST 127.0.0.1:9876/api/stop`) o los dos se
-  pelean la sesión de voz.
+  pelean la sesión de voz. El script se detiene con un aviso si la API del bot
+  contesta; con `--cortar-bot` hace ese POST por ti (sin cabecera `Origin`, que es lo
+  que la API acepta) y espera a que calle. Después el bot queda apagado: arráncalo tú.
+
+Respeta también `SERVIDORES_PERMITIDOS`: no toca en servidores fuera de la lista.
+
+**Los tests `integracion`** (`tests/test_integracion.py`) comprueban por separado las
+mitades que más se rompen, vía REST, sin entrar a voz: que yt-dlp entregue una URL
+`https://`, que la fuente `http` de Lavalink la abra (`loadType == "track"`) y que la
+búsqueda del bot (`ytmsearch`) devuelva resultados. Son más rápidos que el script y
+señalan qué mitad falló, pero **no prueban que suene**: eso solo lo hace el script.
+Se saltan solos, con el motivo, si Lavalink o yt-dlp no están.
+
+```sh
+.venv/bin/python -m pytest -m integracion -rs              # Linux (-rs muestra por qué se salta)
+.\.venv\Scripts\python.exe -m pytest -m integracion -rs    # Windows (PowerShell)
+```
+
+**Nada de esto va a CI.** YouTube bloquea las IP de centros de datos: en un runner
+fallaría por motivos que no son del bot. Se corre en la máquina del dueño, con su
+Lavalink y su `.env`.
 
 ## Arranque diario
 

@@ -284,6 +284,7 @@ un cliente de YouTube que YouTube cerró:
 2. Prueba otro cliente y ponlo en `YTDLP_PLAYER_CLIENT` dentro de `.env`
    (`android_vr`, `ios`, `mweb`, `web`...).
 3. Mira `logs/bot.log` y, en Linux, `podman logs lavadj-lavalink`.
+4. Comprueba que suena con `scripts/probar-que-suena.py` (ver [Desarrollo](#desarrollo)).
 
 El diagnóstico completo, con los comandos para separar qué capa falla, está en
 [AGENTS.md](AGENTS.md). El proyecto no usa credenciales ni cookies de YouTube, y
@@ -303,8 +304,21 @@ eso es una decisión de diseño.
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-Los tests son async (`asyncio_mode = auto`) y corren en menos de un segundo. Usa
+Los tests son async (`asyncio_mode = auto`) y corren en unos segundos, sin red. Usa
 siempre el python del venv: con el del sistema no se colectan.
+
+Para comprobar que el audio de YouTube suena de verdad (no solo que el código
+funcione) hay dos pruebas aparte, que **no** corren con `pytest` a secas y que se
+ejecutan en tu máquina, no en CI, porque YouTube bloquea las IP de centros de datos:
+
+```powershell
+# Windows (en Linux: .venv/bin/python)
+.\.venv\Scripts\python.exe -m pytest -m integracion          # Lavalink y yt-dlp reales, sin entrar a voz
+.\.venv\Scripts\python.exe scripts\probar-que-suena.py       # entra a un canal de voz y toca varias pistas
+```
+
+Las dos necesitan Lavalink arriba, y el script además necesita el bot apagado (o
+`--cortar-bot`). Los detalles están en [AGENTS.md](AGENTS.md).
 
 Antes de tocar código lee [AGENTS.md](AGENTS.md): explica la arquitectura, las
 reglas del proyecto (el audio siempre sale de Lavalink, el panel solo habla por
