@@ -34,6 +34,8 @@ para que la suite siga siendo rápida y sin red.
 - **panel GTK4 → `python3` del sistema.** GTK4/libadwaita vienen de `python3-gobject`
   del sistema y no están en el venv. No intentes "arreglar" esto metiendo pygobject
   al venv: en distros inmutables como Bazzite no compila y no hace falta.
+- **`scripts/lavadj_panel_logica.py`** corre con el del sistema y se prueba con el del
+  venv: solo biblioteca estándar, ni `gi` ni nada del venv (lo vigila un test).
 
 En Linux no instales Java: se lo lleva adentro el contenedor de Lavalink. Es
 deliberado — en distros inmutables, meter Java con `rpm-ostree` obliga a reiniciar y
@@ -54,7 +56,9 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/dj.py`, `tts.py`, `feeds.py` | DJ de radio: noticias → espeak-ng → `dj_cache/*.wav` |
 | `core/spotify.py` | Embed público: de Spotify salen **solo nombres**, nunca audio |
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
-| `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte) |
+| `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte): solo la ventana y el arranque |
+| `scripts/lavadj_panel_logica.py` | Lo del panel sin GTK (API del bot, arranque, textos, ajustes), con tests |
+| `scripts/lavadj-panel.css` | Estilo del panel; si falta, arranca sin estilo y avisa por stderr |
 | `scripts/windows/` | Instalación y arranque en Windows (PowerShell) |
 | `scripts/probar-que-suena.py` | Prueba de punta a punta: entra a voz y comprueba que suena (ver "Verificar que suena") |
 | `tests/test_integracion.py` | Tests `integracion` (excluidos por defecto): Lavalink y yt-dlp reales |

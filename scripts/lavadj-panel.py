@@ -8,18 +8,25 @@ No sabe nada del proceso del bot: le habla por HTTP a la API que el propio bot
 levanta en localhost (core/api.py). Lo único que hace "a la antigua" es el
 arranque, que sí necesita lanzar un proceso.
 
+Aquí solo vive la ventana. La lógica sin GTK está en lavadj_panel_logica.py (con
+tests) y el estilo en lavadj-panel.css, los dos junto a este archivo.
+
 El aparato tiene dos acabados —noche y día— y el testigo de aire es rojo en los
 dos: una lámpara de ON AIR no cambia de color según la luz de la sala.
 """
 
-import json
-import subprocess
+import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
+
+from lavadj_panel_logica import (
+    LINEAS_MONITOR, LOG_FILE, REFRESCO, START_LOG, aviso_de_salud,
+    aviso_sin_titulares, botones_activos, consultar, estado_bot, guardar_ajuste,
+    lavalink_arriba, leer_ajustes, levantar_bot, levantar_lavalink, lineas_de_log,
+    motivo_de_la_caida, postear, resumen_de_titulares, texto_de_estado,
+    veredicto_de_arranque,
+)
 
 import gi
 
@@ -27,433 +34,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
-PROJECT = Path(__file__).resolve().parent.parent
-VENV_PYTHON = PROJECT / ".venv" / "bin" / "python"
-BOT_SCRIPT = PROJECT / "bot.py"
-LOG_FILE = PROJECT / "logs" / "bot.log"
-START_LOG = PROJECT / "logs" / "arranque.log"
-LAVALINK_SCRIPT = PROJECT / "scripts" / "lavalink" / "start-lavalink.sh"
-
-AJUSTES = Path(GLib.get_user_config_dir()) / "lavadj" / "panel.json"
-# Compat: antes del cambio de nombre los ajustes vivían en ~/.config/huffybot.
-AJUSTES_VIEJOS = Path(GLib.get_user_config_dir()) / "huffybot" / "panel.json"
-
-
-def _del_env(nombre: str, por_defecto: str) -> str:
-    """Una variable del .env del proyecto.
-
-    El bot las lee con python-dotenv desde core/config.py, pero aquí corre el
-    python del sistema y no hay dotenv: para tres valores alcanza con leer el
-    archivo. Sin esto, cambiar API_PORT en el .env dejaba al panel hablándole
-    al puerto viejo y mostrando "FUERA DEL AIRE" con el bot perfectamente vivo.
-    """
-    try:
-        for linea in (PROJECT / ".env").read_text(encoding="utf-8").splitlines():
-            linea = linea.strip()
-            if linea.startswith("#") or "=" not in linea:
-                continue
-            clave, _, valor = linea.partition("=")
-            if clave.strip() == nombre:
-                return valor.strip().strip("'\"") or por_defecto
-    except OSError:
-        pass
-    return por_defecto
-
-
-API_BASE = f"http://127.0.0.1:{_del_env('API_PORT', '9876')}/api"
-LAVALINK_URL = _del_env("LAVALINK_URI", "http://127.0.0.1:2333").rstrip("/") + "/version"
-LAVALINK_PASSWORD = _del_env("LAVALINK_PASSWORD", "youshallnotpass")
-
-REFRESCO = 2          # segundos entre lecturas de estado
-LINEAS_MONITOR = 200  # cuántas líneas de log guarda el cajón
-
-
-# --- Estado del bot --------------------------------------------------------
-
-def estado_bot() -> dict | None:
-    """Lo que dice la API. None = no hay bot escuchando."""
-    try:
-        with urllib.request.urlopen(f"{API_BASE}/status", timeout=0.5) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
-        return None
-
-
-def consultar(ruta: str, metodo: str = "GET", timeout: float = 2.0, **params) -> tuple[str, dict]:
-    """Llama a la API. Devuelve (error, datos); error vacío = salió bien."""
-    url = f"{API_BASE}/{ruta}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    peticion = urllib.request.Request(url, method=metodo)
-    try:
-        with urllib.request.urlopen(peticion, timeout=timeout) as resp:
-            cuerpo = resp.read().decode()
-    except urllib.error.URLError as error:
-        return str(getattr(error, "reason", error)), {}
-    except (TimeoutError, OSError) as error:
-        return str(error), {}
-    try:
-        return "", json.loads(cuerpo)
-    except json.JSONDecodeError:
-        return "", {}
-
-
-def postear(ruta: str, timeout: float = 2.0, **params) -> str:
-    """POST a la API. Devuelve "" si salió bien, o el motivo del fallo.
-
-    `motivo` queda escrito en el log del bot: cuando la transmisión se corta
-    sola, lo primero que uno quiere saber es quién lo pidió.
-    """
-    return consultar(ruta, "POST", timeout, **params)[0]
-
-
-def lavalink_arriba() -> bool:
-    """El nodo de audio. Sin él el bot levanta igual, pero no suena nada."""
-    peticion = urllib.request.Request(
-        LAVALINK_URL, headers={"Authorization": LAVALINK_PASSWORD}
-    )
-    try:
-        with urllib.request.urlopen(peticion, timeout=0.5):
-            return True
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return False
-
-
-def levantar_lavalink() -> str:
-    """Arranca el contenedor de Lavalink. Bloquea: va en un hilo aparte."""
-    try:
-        resultado = subprocess.run(
-            [str(LAVALINK_SCRIPT), "start"],
-            capture_output=True, text=True, timeout=180,
-        )
-    except FileNotFoundError:
-        return "falta start-lavalink.sh"
-    except subprocess.TimeoutExpired:
-        return "Lavalink tardó demasiado en levantar"
-    if resultado.returncode != 0:
-        ultima = (resultado.stdout + resultado.stderr).strip().splitlines()
-        return ultima[-1][:120] if ultima else "no pude levantar Lavalink"
-    return ""
-
-
-# Lo mismo que rota bot.log. Sin esto el panel appendea para siempre: este
-# archivo había llegado a 11 MB y nadie lo mira nunca.
-ARRANQUE_MAXIMO = 2_000_000
-
-
-def rotar_arranque() -> None:
-    """Corre arranque.log a .1 cuando se pasó de tamaño.
-
-    Va ANTES de tomar la marca de posición: si se rotara después,
-    motivo_de_la_caida() leería con un offset del archivo viejo.
-    """
-    try:
-        if START_LOG.exists() and START_LOG.stat().st_size > ARRANQUE_MAXIMO:
-            START_LOG.replace(START_LOG.parent / f"{START_LOG.name}.1")
-    except OSError:
-        pass  # que no rote no es motivo para no arrancar el bot
-
-
-def levantar_bot() -> tuple[str, int]:
-    """Lanza el bot. Devuelve (error, posición del log antes de arrancar).
-
-    La posición sirve para leer después SOLO lo que escupió este arranque: si el
-    proceso se cae por un import roto, el panel puede mostrar el motivo en vez
-    de volver a "sin proceso" como si no hubiera pasado nada.
-    """
-    if not VENV_PYTHON.exists():
-        return f"Falta el venv en {VENV_PYTHON.parent}", 0
-    START_LOG.parent.mkdir(exist_ok=True)
-    rotar_arranque()
-    marca = START_LOG.stat().st_size if START_LOG.exists() else 0
-    try:
-        salida = open(START_LOG, "a")
-    except OSError as error:
-        return f"No se pudo escribir {START_LOG.name}: {error.strerror}", marca
-    try:
-        subprocess.Popen(
-            [str(VENV_PYTHON), str(BOT_SCRIPT)],
-            cwd=PROJECT,
-            stdout=salida,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,  # sobrevive al cierre del panel
-        )
-    except OSError as error:
-        return f"No arrancó: {error.strerror}", marca
-    finally:
-        salida.close()
-    return "", marca
-
-
-def motivo_de_la_caida(desde: int) -> str:
-    """La última línea con pinta de error de lo que escribió este arranque."""
-    try:
-        with open(START_LOG, "r", errors="replace") as archivo:
-            archivo.seek(desde)
-            lineas = [l.strip() for l in archivo.read().splitlines() if l.strip()]
-    except OSError:
-        return ""
-    if not lineas:
-        return ""
-    # El traceback termina en la línea que importa: "ModuleNotFoundError: ...".
-    for linea in reversed(lineas):
-        if not linea.startswith(("File ", "  ", "Traceback")):
-            return linea[:160]
-    return lineas[-1][:160]
-
-
-def texto_edad(segundos: float | None) -> str:
-    """Cuándo se bajaron los titulares. None = nunca."""
-    if segundos is None:
-        return "sin bajar"
-    if segundos < 60:
-        return "recién bajados"
-    return f"hace {texto_duracion(segundos)}"
-
-
-def texto_duracion(segundos: float) -> str:
-    minutos = int(segundos // 60)
-    if minutos < 1:
-        return f"{int(segundos)} s"
-    if minutos < 60:
-        return f"{minutos} min"
-    horas, resto = divmod(minutos, 60)
-    return f"{horas} h {resto:02d} min"
-
-
-def _acortar(linea: str) -> str:
-    """"2026-08-03 00:14:13,831 INFO bot: Bot listo" -> "00:14  bot: Bot listo"."""
-    partes = linea.split(None, 3)
-    if len(partes) == 4 and partes[1][:2].isdigit():
-        return f"{partes[1][:5]}  {partes[3]}"
-    return linea
-
-
-def lineas_de_log(cuantas: int = 1, fuente: Path = LOG_FILE) -> list[str]:
-    try:
-        with open(fuente, "rb") as archivo:
-            archivo.seek(0, 2)
-            archivo.seek(max(0, archivo.tell() - 16384))
-            crudas = archivo.read().decode("utf-8", "replace").splitlines()
-    except OSError:
-        return []
-    utiles = [_acortar(l) for l in crudas if l.strip()]
-    return utiles[-cuantas:]
-
-
-# --- Ajustes ---------------------------------------------------------------
-
-def leer_ajustes() -> dict:
-    for ruta in (AJUSTES, AJUSTES_VIEJOS):  # el viejo solo si aún no hay nuevo
-        try:
-            return json.loads(ruta.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-    return {}
-
-
-def guardar_ajuste(clave: str, valor) -> None:
-    datos = leer_ajustes()
-    datos[clave] = valor
-    try:
-        AJUSTES.parent.mkdir(parents=True, exist_ok=True)
-        AJUSTES.write_text(json.dumps(datos))
-    except OSError:
-        pass  # que no se guarde la preferencia no es motivo para romper nada
-
-
-# --- Interfaz --------------------------------------------------------------
-#
-# Dos acabados del mismo aparato. Lo único que NO cambia entre uno y otro es el
-# testigo de aire: una lámpara de ON AIR es roja con la sala iluminada o a
-# oscuras, y es el ancla de todo el panel.
-#
-# Todo lo de aquí abajo está scopeado bajo .panel a propósito. Un selector
-# `button {}` pelado le pisaría el estilo a los botones de los toasts, a los
-# diálogos y a cualquier cosa que libadwaita dibuje por su cuenta.
-
-CSS = """
-/* --- Estructura, común a los dos acabados --- */
-.chasis { padding: 10px 24px 22px 24px; }
-
-.legend {
-  font-family: "Fira Code", monospace;
-  font-size: 10px;
-  font-weight: bold;
-}
-
-.testigo {
-  min-width: 26px; min-height: 26px;
-  border-radius: 50%;
-}
-
-.estado {
-  font-family: Cantarell, sans-serif;
-  font-size: 25px; font-weight: 800;
-}
-
-.detalle {
-  font-family: "Fira Code", monospace;
-  font-size: 11px;
-}
-
-.piloto {
-  font-family: "Fira Code", monospace;
-  font-size: 9px;
-  font-weight: bold;
-  padding: 2px 7px;
-  border-radius: 3px;
-}
-
-.monitor {
-  font-family: "Fira Code", monospace;
-  font-size: 10px;
-  padding: 9px 24px;
-}
-
-.panel button.tirador {
-  min-height: 0;
-  padding: 3px 7px;
-  margin: 5px 18px 5px 0;
-  background: none;
-  border: none;
-  box-shadow: none;
-}
-
-.cajon textview, .cajon textview text {
-  font-family: "Fira Code", monospace;
-  font-size: 10px;
-  padding: 8px 24px;
-}
-
-/* Titulares en cola: los que el DJ ya leyó se apagan, no desaparecen. */
-.titulares { padding: 8px 24px; }
-.titular {
-  font-family: "Fira Code", monospace;
-  font-size: 10px;
-}
-
-/* Botón de aire: el único que se sale del estilo del sistema, porque el rojo
-   de aire es la identidad del aparato. El de cortar usa .destructive-action de
-   libadwaita, que ya trae los estados correctos. */
-.panel button.aire {
-  font-weight: bold;
-  border-radius: 6px;
-  min-height: 38px;
-  background: linear-gradient(#C33018, #92200D);
-  border: 1px solid #E0563A;
-  color: #FFF1EA;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.14);
-}
-.panel button.aire:hover { background: linear-gradient(#DB3A1E, #A82710); }
-.panel button.aire:active { background: #8C1E0C; box-shadow: inset 0 2px 5px rgba(0,0,0,.5); }
-.panel button.aire:focus-visible { outline: 2px solid #FF8368; outline-offset: 2px; }
-/* Ya está al aire: el botón queda claramente muerto, para que el único rojo
-   vivo del panel sea el de cortar. */
-.panel button.aire:disabled,
-.panel button.aire:disabled:backdrop {
-  background: none;
-  border: 1px solid alpha(@window_fg_color, .12);
-  color: alpha(@window_fg_color, .40);
-  box-shadow: none;
-}
-
-/* ================= ACABADO NOCHE ================= */
-window.panel.noche { background: linear-gradient(#191512, #100D0B); }
-.panel.noche .legend { color: #8A7259; }
-.panel.noche .testigo {
-  background: radial-gradient(circle at 34% 30%, #6B3A2E, #331A15 70%);
-  box-shadow: inset 0 1px 2px rgba(0,0,0,.9), 0 0 0 1px #241713;
-}
-.panel.noche .estado { color: #4E4038; }
-.panel.noche .estado.al-aire { color: #F4E7DA; }
-.panel.noche .detalle { color: #E8A93C; }
-.panel.noche .detalle.apagado { color: #6E5B49; }
-.panel.noche .piloto { color: #6E5B49; background: #141110; border: 1px solid #2E2621; }
-.panel.noche .piloto.encendido { color: #9FD68B; border-color: #33512B; }
-.panel.noche .piloto.aviso { color: #E8A93C; border-color: #8A5312; }
-.panel.noche .piloto.grave { color: #FF6A4D; border-color: #92200D; }
-.panel.noche .monitor { color: #6E5B49; background: #0C0A09; border-top: 1px solid #241E1A; }
-.panel.noche button.tirador { color: #6E5B49; }
-.panel.noche button.tirador:hover { background: #1A1512; color: #A98F6F; }
-.panel.noche .cajon { background: #0C0A09; border-top: 1px solid #241E1A; }
-.panel.noche .titular { color: #C2A98A; }
-.panel.noche .titular.leido { color: #5A4A3C; }
-.panel.noche .cajon textview, .panel.noche .cajon textview text {
-  background: #0C0A09; color: #7E6A55;
-}
-
-/* ================= ACABADO DÍA =================
-   Frente de aluminio arena con la serigrafía grabada en grafito, no un tema
-   oscuro invertido: la referencia es una consola de estudio, no papel. */
-window.panel.dia { background: linear-gradient(#EAE6DB, #D9D4C7); }
-.panel.dia .legend { color: #6E5C46; }
-.panel.dia .testigo {
-  background: radial-gradient(circle at 34% 30%, #B9A08F, #8A7261 70%);
-  box-shadow: inset 0 1px 3px rgba(0,0,0,.45), 0 0 0 1px #B3A895;
-}
-.panel.dia .estado { color: #9C907D; }
-.panel.dia .estado.al-aire { color: #211B14; }
-.panel.dia .detalle { color: #8A5312; }
-.panel.dia .detalle.apagado { color: #8E8371; }
-.panel.dia .piloto { color: #7A6E5C; background: #F1ECE2; border: 1px solid #C0B6A3; }
-.panel.dia .piloto.encendido { color: #3D6B2E; border-color: #96B98A; }
-.panel.dia .piloto.aviso { color: #8A5312; border-color: #C2A98A; }
-.panel.dia .piloto.grave { color: #C33018; border-color: #E5B6B6; }
-.panel.dia .monitor { color: #7A6E5C; background: #F1ECE2; border-top: 1px solid #C0B6A3; }
-.panel.dia button.tirador { color: #7A6E5C; }
-.panel.dia button.tirador:hover { background: #E3DCCF; color: #4A3E2E; }
-.panel.dia .cajon { background: #F1ECE2; border-top: 1px solid #C0B6A3; }
-.panel.dia .titular { color: #3B3226; }
-.panel.dia .titular.leido { color: #9A8F7C; }
-.panel.dia .cajon textview, .panel.dia .cajon textview text {
-  background: #F1ECE2; color: #6B5F4E;
-}
-/* libadwaita 1.9 dibuja los botones destructivos teñidos, no en rojo sólido —
-   y para este panel está bien, deja al testigo como el único rojo saturado.
-   Lo único que hay que corregir es que sobre el frente arena ese rosa queda
-   casi al mismo tono que la chapa y el botón pierde el borde. Se oscurece lo
-   justo para que se despegue; sigue siendo teñido, no sólido. */
-.panel.dia button.destructive-action:not(:disabled) {
-  background: #EDC7C7;
-  color: #8E1721;
-}
-.panel.dia button.destructive-action:not(:disabled):hover { background: #E5B6B6; }
-
-/* ================= EL TESTIGO DE AIRE =================
-   Va al final a propósito: es lo único que NO cambia con el acabado, y tiene
-   que ganarle a la regla apagada de cada paleta. Empatan en especificidad, así
-   que lo que decide es el orden — no hay que moverlo más arriba.
-   Lo único que cambia entre día y noche es el halo: de día una lámpara
-   encendida casi no tiñe la sala. */
-.panel .testigo.al-aire {
-  background: radial-gradient(circle at 34% 30%, #FFB9A2, #FF3B21 55%, #B81E0B);
-  box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF6A4D,
-              0 0 26px 8px rgba(255,59,33,.42), 0 0 60px 18px rgba(255,59,33,.20);
-}
-.panel.dia .testigo.al-aire {
-  box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #D8442A,
-              0 0 14px 3px rgba(255,59,33,.28);
-}
-.panel .testigo.al-aire.late { animation: latido 3.4s ease-in-out infinite; }
-@keyframes latido {
-  0%,100% { box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF6A4D,
-                        0 0 26px 8px rgba(255,59,33,.42),
-                        0 0 60px 18px rgba(255,59,33,.20); }
-  50%     { box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF8368,
-                        0 0 34px 11px rgba(255,59,33,.60),
-                        0 0 74px 24px rgba(255,59,33,.28); }
-}
-/* El latido de día late igual, pero sin encender media sala. */
-.panel.dia .testigo.al-aire.late { animation: latido-dia 3.4s ease-in-out infinite; }
-@keyframes latido-dia {
-  0%,100% { box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #D8442A,
-                        0 0 14px 3px rgba(255,59,33,.28); }
-  50%     { box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #F05335,
-                        0 0 20px 5px rgba(255,59,33,.42); }
-}
-"""
+ESTILO = Path(__file__).with_name("lavadj-panel.css")
 
 
 class Panel(Adw.ApplicationWindow):
@@ -728,17 +309,12 @@ class Panel(Adw.ApplicationWindow):
 
         titulares = datos.get("titulares") or []
         if not titulares:
-            sin_fuentes = not datos.get("fuentes")
             self.lista_titulares.append(Gtk.Label(
-                label=("No hay feeds configurados (dj_feeds.json)." if sin_fuentes
-                       else "El DJ todavía no bajó noticias. Prueba «Refrescar noticias»."),
-                xalign=0, wrap=True, css_classes=["titular", "leido"]))
+                label=aviso_sin_titulares(datos), xalign=0, wrap=True,
+                css_classes=["titular", "leido"]))
             return
 
-        leidos = sum(1 for t in titulares if t.get("leido"))
-        self.lista_titulares.append(self._legend(
-            f"{len(titulares)} TITULARES · {leidos} YA AL AIRE"
-            f" · {texto_edad(datos.get('edad'))}"))
+        self.lista_titulares.append(self._legend(resumen_de_titulares(datos)))
         for titular in titulares:
             ya = bool(titular.get("leido"))
             fila = Gtk.Label(
@@ -841,64 +417,27 @@ class Panel(Adw.ApplicationWindow):
 
     def revisar_arranque(self, estado: dict | None) -> None:
         """Vigila el arranque para no dejar al bot muriendo en silencio."""
-        if not self.vigilando:
+        veredicto = veredicto_de_arranque(self.vigilando, estado, time.monotonic())
+        if not veredicto:
             return
-        marca, plazo = self.vigilando
-        if estado:                      # levantó bien
-            self.vigilando = None
+        marca = self.vigilando[0]
+        self.vigilando = None
+        if veredicto == "levanto":
             self.fuente_log = LOG_FILE
             return
-        if time.monotonic() < plazo:
-            return
-        self.vigilando = None
         # El traceback del arranque no pasa por bot.log: el cajón tiene que
         # apuntar al archivo donde sí está, o "Ver log" no muestra nada útil.
         self.fuente_log = START_LOG
         motivo = motivo_de_la_caida(marca)
         self.avisar(motivo or "El bot no levantó", falla=True, con_log=True)
 
-    def texto_de_estado(self, estado: dict | None) -> str:
-        """Qué está haciendo la emisora ahora. Nunca un mensaje de evento."""
-        if self.ocupado:
-            return self.tarea
-        if self.vigilando:
-            return "levantando…"
-        if not estado:
-            return "sin proceso"
-        sonando = next(
-            (s["cancion"] for s in estado.get("voz", []) if s.get("cancion")), None)
-        if sonando:
-            return f"♪ {sonando}"
-        vivo = estado.get("uptime")
-        desde = f" · hace {texto_duracion(vivo)}" if vivo is not None else ""
-        return f"{estado.get('usuario') or 'conectado'}{desde}"
-
     def pintar_salud(self, estado: dict | None) -> None:
-        """Enciende el testigo de averías, o lo apaga si no hay nada que decir.
-
-        Se informa lo más grave primero. Un bot de antes de que esto existiera
-        no manda `salud` y el testigo simplemente queda apagado.
-        """
-        salud = (estado or {}).get("salud") or {}
-        ytdlp = (estado or {}).get("ytdlp") or {}
-
-        if salud.get("estado") == "mudo":
-            texto, clase, detalle = "MUDO", "grave", salud.get("motivo") or ""
-        elif salud.get("estado") == "flojo":
-            texto, clase, detalle = "FLOJO", "aviso", salud.get("motivo") or ""
-        elif ytdlp.get("viejo"):
-            texto, clase = "YT-DLP", "aviso"
-            detalle = (f"yt-dlp está en {ytdlp.get('version')}, "
-                       f"hace {ytdlp.get('dias')} días. Conviene actualizarlo.")
-        elif ytdlp.get("cliente") and ytdlp.get("cliente") != ytdlp.get("cliente_configurado"):
-            texto, clase = "YT-DLP", "aviso"
-            detalle = (f"El bot cambió solo el cliente de YouTube de "
-                       f"{ytdlp.get('cliente_configurado')} a {ytdlp.get('cliente')}. "
-                       f"Para fijarlo, pon YTDLP_PLAYER_CLIENT={ytdlp.get('cliente')} en el .env.")
-        else:
+        """Enciende el testigo de averías, o lo apaga si no hay nada que decir."""
+        aviso = aviso_de_salud(estado)
+        if aviso is None:
             self.pulso.set_visible(False)
             return
-
+        texto, clase, detalle = aviso
         self.pulso.set_text(texto)
         self.pulso.set_css_classes(["piloto", clase])
         self.pulso.set_tooltip_text(detalle)
@@ -950,16 +489,13 @@ class Panel(Adw.ApplicationWindow):
         self.pintar_salud(estado)
 
         self.detalle.set_css_classes(["detalle"] if al_aire else ["detalle", "apagado"])
-        self.detalle.set_text(self.texto_de_estado(estado))
+        self.detalle.set_text(
+            texto_de_estado(estado, self.ocupado, self.tarea, bool(self.vigilando)))
 
-        ocupado = self.ocupado
-        # Mientras se vigila el arranque el bot todavía no contesta (al_aire es
-        # falso): sin `vigilando` el botón se reactivaba y un segundo click
-        # lanzaba un segundo bot. `revisar_arranque` lo limpia al levantar o al
-        # vencer el plazo, así que no se queda apagado para siempre.
-        self.boton_aire.set_sensitive(not al_aire and not ocupado and not self.vigilando)
-        self.boton_cortar.set_sensitive(al_aire and not ocupado)
-        self.boton_noticias.set_sensitive(al_aire and not ocupado)
+        aire, cortar, noticias = botones_activos(al_aire, self.ocupado, bool(self.vigilando))
+        self.boton_aire.set_sensitive(aire)
+        self.boton_cortar.set_sensitive(cortar)
+        self.boton_noticias.set_sensitive(noticias)
 
         # Cuando el bot levanta, "Salir al aire" se apaga y GTK le pasa el foco
         # al botón de al lado, que es CORTAR: el siguiente Espacio o Enter te
@@ -994,12 +530,18 @@ class App(Adw.Application):
         elif guardado == "dia":
             gestor.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
 
-        proveedor = Gtk.CssProvider()
-        proveedor.load_from_data(CSS.encode())
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), proveedor,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
+        try:
+            css = ESTILO.read_bytes()
+        except OSError as error:
+            print(f"lavadj-panel: arranco sin estilo, no pude leer el CSS: {error}",
+                  file=sys.stderr)
+        else:
+            proveedor = Gtk.CssProvider()
+            proveedor.load_from_data(css)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), proveedor,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
 
         ventana = Panel(self)
         ventana.aplicar_luz(gestor.get_dark())

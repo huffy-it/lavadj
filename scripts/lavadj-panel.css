@@ -1,0 +1,183 @@
+/* Dos acabados del mismo aparato, noche y día; lo único que no cambia es el
+   testigo de aire. Todo va bajo .panel a propósito: un `button {}` pelado le
+   pisaría el estilo a los toasts, los diálogos y lo que libadwaita dibuje solo. */
+
+/* --- Estructura, común a los dos acabados --- */
+.chasis { padding: 10px 24px 22px 24px; }
+
+.legend {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  font-weight: bold;
+}
+
+.testigo {
+  min-width: 26px; min-height: 26px;
+  border-radius: 50%;
+}
+
+.estado {
+  font-family: Cantarell, sans-serif;
+  font-size: 25px; font-weight: 800;
+}
+
+.detalle {
+  font-family: "Fira Code", monospace;
+  font-size: 11px;
+}
+
+.piloto {
+  font-family: "Fira Code", monospace;
+  font-size: 9px;
+  font-weight: bold;
+  padding: 2px 7px;
+  border-radius: 3px;
+}
+
+.monitor {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  padding: 9px 24px;
+}
+
+.panel button.tirador {
+  min-height: 0;
+  padding: 3px 7px;
+  margin: 5px 18px 5px 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+
+.cajon textview, .cajon textview text {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+  padding: 8px 24px;
+}
+
+/* Titulares en cola: los que el DJ ya leyó se apagan, no desaparecen. */
+.titulares { padding: 8px 24px; }
+.titular {
+  font-family: "Fira Code", monospace;
+  font-size: 10px;
+}
+
+/* Botón de aire: el único que se sale del estilo del sistema, porque el rojo
+   de aire es la identidad del aparato. El de cortar usa .destructive-action de
+   libadwaita, que ya trae los estados correctos. */
+.panel button.aire {
+  font-weight: bold;
+  border-radius: 6px;
+  min-height: 38px;
+  background: linear-gradient(#C33018, #92200D);
+  border: 1px solid #E0563A;
+  color: #FFF1EA;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.14);
+}
+.panel button.aire:hover { background: linear-gradient(#DB3A1E, #A82710); }
+.panel button.aire:active { background: #8C1E0C; box-shadow: inset 0 2px 5px rgba(0,0,0,.5); }
+.panel button.aire:focus-visible { outline: 2px solid #FF8368; outline-offset: 2px; }
+/* Ya está al aire: el botón queda claramente muerto, para que el único rojo
+   vivo del panel sea el de cortar. */
+.panel button.aire:disabled,
+.panel button.aire:disabled:backdrop {
+  background: none;
+  border: 1px solid alpha(@window_fg_color, .12);
+  color: alpha(@window_fg_color, .40);
+  box-shadow: none;
+}
+
+/* ================= ACABADO NOCHE ================= */
+window.panel.noche { background: linear-gradient(#191512, #100D0B); }
+.panel.noche .legend { color: #8A7259; }
+.panel.noche .testigo {
+  background: radial-gradient(circle at 34% 30%, #6B3A2E, #331A15 70%);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.9), 0 0 0 1px #241713;
+}
+.panel.noche .estado { color: #4E4038; }
+.panel.noche .estado.al-aire { color: #F4E7DA; }
+.panel.noche .detalle { color: #E8A93C; }
+.panel.noche .detalle.apagado { color: #6E5B49; }
+.panel.noche .piloto { color: #6E5B49; background: #141110; border: 1px solid #2E2621; }
+.panel.noche .piloto.encendido { color: #9FD68B; border-color: #33512B; }
+.panel.noche .piloto.aviso { color: #E8A93C; border-color: #8A5312; }
+.panel.noche .piloto.grave { color: #FF6A4D; border-color: #92200D; }
+.panel.noche .monitor { color: #6E5B49; background: #0C0A09; border-top: 1px solid #241E1A; }
+.panel.noche button.tirador { color: #6E5B49; }
+.panel.noche button.tirador:hover { background: #1A1512; color: #A98F6F; }
+.panel.noche .cajon { background: #0C0A09; border-top: 1px solid #241E1A; }
+.panel.noche .titular { color: #C2A98A; }
+.panel.noche .titular.leido { color: #5A4A3C; }
+.panel.noche .cajon textview, .panel.noche .cajon textview text {
+  background: #0C0A09; color: #7E6A55;
+}
+
+/* ================= ACABADO DÍA =================
+   Frente de aluminio arena con la serigrafía grabada en grafito, no un tema
+   oscuro invertido: la referencia es una consola de estudio, no papel. */
+window.panel.dia { background: linear-gradient(#EAE6DB, #D9D4C7); }
+.panel.dia .legend { color: #6E5C46; }
+.panel.dia .testigo {
+  background: radial-gradient(circle at 34% 30%, #B9A08F, #8A7261 70%);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.45), 0 0 0 1px #B3A895;
+}
+.panel.dia .estado { color: #9C907D; }
+.panel.dia .estado.al-aire { color: #211B14; }
+.panel.dia .detalle { color: #8A5312; }
+.panel.dia .detalle.apagado { color: #8E8371; }
+.panel.dia .piloto { color: #7A6E5C; background: #F1ECE2; border: 1px solid #C0B6A3; }
+.panel.dia .piloto.encendido { color: #3D6B2E; border-color: #96B98A; }
+.panel.dia .piloto.aviso { color: #8A5312; border-color: #C2A98A; }
+.panel.dia .piloto.grave { color: #C33018; border-color: #E5B6B6; }
+.panel.dia .monitor { color: #7A6E5C; background: #F1ECE2; border-top: 1px solid #C0B6A3; }
+.panel.dia button.tirador { color: #7A6E5C; }
+.panel.dia button.tirador:hover { background: #E3DCCF; color: #4A3E2E; }
+.panel.dia .cajon { background: #F1ECE2; border-top: 1px solid #C0B6A3; }
+.panel.dia .titular { color: #3B3226; }
+.panel.dia .titular.leido { color: #9A8F7C; }
+.panel.dia .cajon textview, .panel.dia .cajon textview text {
+  background: #F1ECE2; color: #6B5F4E;
+}
+/* libadwaita 1.9 dibuja los botones destructivos teñidos, no en rojo sólido —
+   y para este panel está bien, deja al testigo como el único rojo saturado.
+   Lo único que hay que corregir es que sobre el frente arena ese rosa queda
+   casi al mismo tono que la chapa y el botón pierde el borde. Se oscurece lo
+   justo para que se despegue; sigue siendo teñido, no sólido. */
+.panel.dia button.destructive-action:not(:disabled) {
+  background: #EDC7C7;
+  color: #8E1721;
+}
+.panel.dia button.destructive-action:not(:disabled):hover { background: #E5B6B6; }
+
+/* ================= EL TESTIGO DE AIRE =================
+   Va al final a propósito: es lo único que NO cambia con el acabado, y tiene
+   que ganarle a la regla apagada de cada paleta. Empatan en especificidad, así
+   que lo que decide es el orden — no hay que moverlo más arriba.
+   Lo único que cambia entre día y noche es el halo: de día una lámpara
+   encendida casi no tiñe la sala. */
+.panel .testigo.al-aire {
+  background: radial-gradient(circle at 34% 30%, #FFB9A2, #FF3B21 55%, #B81E0B);
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF6A4D,
+              0 0 26px 8px rgba(255,59,33,.42), 0 0 60px 18px rgba(255,59,33,.20);
+}
+.panel.dia .testigo.al-aire {
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #D8442A,
+              0 0 14px 3px rgba(255,59,33,.28);
+}
+.panel .testigo.al-aire.late { animation: latido 3.4s ease-in-out infinite; }
+@keyframes latido {
+  0%,100% { box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF6A4D,
+                        0 0 26px 8px rgba(255,59,33,.42),
+                        0 0 60px 18px rgba(255,59,33,.20); }
+  50%     { box-shadow: inset 0 1px 2px rgba(0,0,0,.35), 0 0 0 1px #FF8368,
+                        0 0 34px 11px rgba(255,59,33,.60),
+                        0 0 74px 24px rgba(255,59,33,.28); }
+}
+/* El latido de día late igual, pero sin encender media sala. */
+.panel.dia .testigo.al-aire.late { animation: latido-dia 3.4s ease-in-out infinite; }
+@keyframes latido-dia {
+  0%,100% { box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #D8442A,
+                        0 0 14px 3px rgba(255,59,33,.28); }
+  50%     { box-shadow: inset 0 1px 2px rgba(0,0,0,.30), 0 0 0 1px #F05335,
+                        0 0 20px 5px rgba(255,59,33,.42); }
+}
