@@ -14,6 +14,7 @@ from aiohttp.test_utils import make_mocked_request
 from core import api
 from core.dj import DJ
 from core.feeds import FeedCache
+from core.resolver import Resolver
 from core.salud import Salud
 
 
@@ -214,10 +215,26 @@ async def test_el_estado_incluye_la_antiguedad_de_yt_dlp():
     assert datos["ytdlp"] == {"version": "2026.07.04", "dias": 55, "viejo": True}
 
 
+async def test_el_estado_trae_el_cliente_de_youtube_que_usa_el_resolver_de_verdad():
+    """Los paneles avisan del cambio comparando `cliente` con `cliente_configurado`."""
+    bot = FakeBot(FakeCog())
+    bot.resolver = Resolver(cliente="android")
+    bot.resolver.cliente = "android_vr"      # lo que hace el sondeo al rotar
+
+    datos = cuerpo(await api.handle_status(pedido("GET", "/api/status", bot)))
+
+    assert datos["ytdlp"]["cliente"] == "android_vr"
+    assert datos["ytdlp"]["cliente_configurado"] == "android"
+
+
 async def test_sin_resolver_en_el_bot_el_estado_de_yt_dlp_conserva_su_forma():
     """El panel web lee `ytdlp.version` sin comprobar nada: no puede faltar."""
     datos = cuerpo(await api.handle_status(pedido("GET", "/api/status")))
-    assert datos["ytdlp"] == {"version": None, "dias": None, "viejo": False}
+    assert datos["ytdlp"] == {
+        "version": None, "dias": None, "viejo": False,
+        "cliente": None, "cliente_configurado": None,
+    }
+    assert set(datos["ytdlp"]) == set(Resolver().estado_ytdlp())
 
 
 async def test_sin_cog_cargado_el_estado_no_revienta():

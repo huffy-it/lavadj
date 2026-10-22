@@ -33,14 +33,23 @@ le pide— está en `Resolver` y no en variables del módulo. Así cada test arm
 suyo sin limpiar el de otro, y el cliente se puede cambiar en caliente cuando el
 actual deja de funcionar, sin reiniciar el bot. Las funciones que solo leen sus
 argumentos se quedan sueltas en el módulo.
+
+**Lo que se arregla solo.** Si `direct_url` falla varias veces seguidas por motivos
+que no son del video, se sondean en segundo plano los demás clientes y se pasa al
+primero que entrega audio; si ninguno sirve, o yt-dlp está viejo, se actualiza. El
+cliente cambiado así dura hasta reiniciar: para fijarlo va en `YTDLP_PLAYER_CLIENT`.
 """
 
 import asyncio
 import copy
 import datetime
 import logging
+import os
+import sys
 import time
 from collections import OrderedDict
+from collections.abc import Callable
+from typing import NamedTuple
 from urllib.parse import parse_qs, urlparse
 
 import wavelink
@@ -114,6 +123,23 @@ MARGEN_DE_VENCIMIENTO = 10 * 60
 # versión es una fecha, así que la antigüedad se calcula sin pedirle nada a la
 # red: si quedó viejo, se ve en el panel.
 DIAS_PARA_QUE_ESTE_VIEJO = 30
+
+# El video con el que se prueba un cliente: uno estable, para que si falla sea culpa del cliente.
+VIDEO_DE_PRUEBA = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+# Uno o dos fallos son normales (un 400 suelto); tres seguidos ya parecen un cliente cerrado.
+FALLOS_PARA_SONDEAR = 3
+
+# Un sondeo cuesta varias llamadas a yt-dlp: si YouTube cae para todos, no se repite cada canción.
+SONDEO_CADA = 10 * 60
+
+TIMEOUT_DE_ACTUALIZACION = 180
+
+# Haya salido bien o no: si yt-dlp no se deja actualizar, no se reintenta en bucle.
+ACTUALIZAR_CADA = 6 * 3600
+
+# El bot puede pasar semanas arriba y el aviso de "viejo" tiene que llegar a verse.
+REVISAR_CADA = 24 * 3600
 
 
 def _clasificar(error: str) -> str | None:
@@ -246,16 +272,26 @@ def _con_la_cara_del_original(
     return wavelink.Playable(datos)
 
 
+class _Intento(NamedTuple):
+    """Cómo le fue a una llamada a yt-dlp que pedía la URL de un video."""
+
+    url: str | None
+    # De quién es la falta si no hubo URL: "cliente" (error sin motivo claro o salida sin URL),
+    # "video" (motivo definitivo) o "entorno" (no se pudo lanzar o se pasó de tiempo: red o binario).
+    culpa: str | None = None
+    motivo: str | None = None
+
+
 class Resolver:
     """Le pide a yt-dlp el audio de YouTube y lleva la cuenta de cómo le va.
 
     Hay una sola instancia por bot (`bot.resolver`), compartida por el cog y por
     los players de cada servidor. Lo que se recuerda aquí —qué videos no van a
-    sonar, qué versión de yt-dlp hay— tiene que ser visto por todos, y por eso
-    no se crea una por player.
+    sonar, qué versión de yt-dlp hay, qué cliente de YouTube se usa— tiene que ser
+    visto por todos, y por eso no se crea una por player.
 
     Los parámetros en `None` toman el valor de `core.config` al construir, no al
-    importar el módulo.
+    importar el módulo. `reloj` da la hora monotónica de los plazos (inyectable en tests).
     """
 
     def __init__(
@@ -264,12 +300,20 @@ class Resolver:
         binario: str | None = None,
         cliente: str | None = None,
         timeout: int | None = None,
+        clientes: tuple[str, ...] | None = None,
+        autoactualizar: bool | None = None,
+        reloj: Callable[[], float] | None = None,
     ):
         self.binario = config.YTDLP_BIN if binario is None else binario
         # Público y modificable: cuando YouTube cierra un cliente, quien lo note
         # puede pasar a otro y la siguiente llamada a yt-dlp ya lo usa.
         self.cliente = config.YTDLP_PLAYER_CLIENT if cliente is None else cliente
+        # Con el que arrancó: los paneles lo comparan con `cliente` para avisar del cambio.
+        self.cliente_configurado = self.cliente
+        self.clientes = tuple(config.YTDLP_CLIENTES if clientes is None else clientes)
+        self.autoactualizar = config.YTDLP_AUTOACTUALIZAR if autoactualizar is None else autoactualizar
         self.timeout = config.YTDLP_TIMEOUT if timeout is None else timeout
+        self._reloj = reloj or time.monotonic
         # Los videos que ya sabemos que no van a funcionar, por uri de YouTube.
         self._sin_caso: "OrderedDict[str, str]" = OrderedDict()
         self._estado_ytdlp: dict = {"version": None, "dias": None, "viejo": False}
@@ -278,14 +322,28 @@ class Resolver:
         # esperar a una que sigue en curso. También son la única referencia fuerte
         # a esas tareas: el loop solo guarda débiles y se las llevaría el GC.
         self._precargas: "OrderedDict[str, asyncio.Task]" = OrderedDict()
+        # Fallos pasajeros de `direct_url` desde el último éxito.
+        self._fallos_seguidos = 0
+        # Referencia fuerte al sondeo en curso: el loop solo guarda débiles.
+        self._sondeo: asyncio.Task | None = None
+        # Hora de `_reloj` del último sondeo y del último intento de actualizar (None = ninguno).
+        self._ultimo_sondeo: float | None = None
+        self._ultima_actualizacion: float | None = None
+        # Libre salvo durante la actualización. Evento y no lock: fuera de ella las resoluciones van en paralelo.
+        self._ytdlp_libre = asyncio.Event()
+        self._ytdlp_libre.set()
+        # Llamadas a yt-dlp en curso: en Windows pip no puede reemplazar un .exe que sigue corriendo.
+        self._llamadas = 0
+        self._sin_llamadas = asyncio.Event()
+        self._sin_llamadas.set()
 
-    def _extractor_args(self) -> str:
-        """El cliente de YouTube que se le pide a yt-dlp, leído en cada llamada.
+    def _extractor_args(self, cliente: str) -> str:
+        """El cliente de YouTube que se le pide a yt-dlp; quien llama lo lee de `self.cliente` en cada llamada.
 
         Sin esto yt-dlp usa sus clientes por defecto y se come el mismo "Sign in
         to confirm you're not a bot" que tumbó al plugin.
         """
-        return f"youtube:player_client={self.cliente}"
+        return f"youtube:player_client={cliente}"
 
     def olvidar_motivos(self) -> None:
         """Vacía la tabla de videos sin caso."""
@@ -301,10 +359,44 @@ class Resolver:
         return self._sin_caso.get(uri)
 
     async def direct_url(self, webpage_url: str) -> str | None:
-        """La URL directa del audio, o None si yt-dlp no pudo."""
+        """La URL directa del audio, o None si yt-dlp no pudo.
+
+        Cuenta los fallos del cliente: un éxito la pone a cero y solo suman los pasajeros.
+        """
         if not webpage_url:
             return None
+        cliente = self.cliente
+        intento = await self._pedir_url(webpage_url, cliente)
+        if intento.url:
+            self._fallos_seguidos = 0
+            return intento.url
+        if intento.culpa == "video":
+            self._anotar_sin_caso(webpage_url, intento.motivo)
+        # Si el cliente cambió mientras corría, el fallo es de uno que ya no se usa.
+        elif intento.culpa == "cliente" and cliente == self.cliente:
+            self._contar_fallo()
+        return None
 
+    def _anotar_sin_caso(self, webpage_url: str, motivo: str | None) -> None:
+        self._sin_caso[webpage_url] = motivo
+        self._sin_caso.move_to_end(webpage_url)
+        while len(self._sin_caso) > RECUERDO_MAXIMO:
+            self._sin_caso.popitem(last=False)
+
+    async def _pedir_url(self, webpage_url: str, cliente: str) -> _Intento:
+        """Una llamada a yt-dlp pidiendo la URL de audio con ese cliente; no toca contador ni tabla sin caso."""
+        # Con una actualización en curso, yt-dlp puede estar a medio instalar.
+        await self._ytdlp_libre.wait()
+        self._llamadas += 1
+        self._sin_llamadas.clear()
+        try:
+            return await self._llamar_ytdlp(webpage_url, cliente)
+        finally:
+            self._llamadas -= 1
+            if not self._llamadas:
+                self._sin_llamadas.set()
+
+    async def _llamar_ytdlp(self, webpage_url: str, cliente: str) -> _Intento:
         # Nunca por shell: los títulos y las URLs vienen de YouTube y no son de fiar.
         try:
             proceso = await asyncio.create_subprocess_exec(
@@ -312,7 +404,7 @@ class Resolver:
                 "--no-warnings",
                 "--skip-download",
                 "--no-playlist",
-                "--extractor-args", self._extractor_args(),
+                "--extractor-args", self._extractor_args(cliente),
                 "-f", FORMATO,
                 "--get-url",
                 webpage_url,
@@ -321,18 +413,16 @@ class Resolver:
             )
         except OSError as error:
             # No existe (FileNotFoundError) o no se puede ejecutar (PermissionError).
-            # Se devuelve None y `resolve()` cae a la pista original, como promete.
+            # Sin URL, y `resolve()` cae a la pista original, como promete.
             log.error("No pude lanzar yt-dlp (%s): %s", self.binario, error)
-            return None
+            return _Intento(None, "entorno")
         try:
-            salida, error = await asyncio.wait_for(
-                proceso.communicate(), timeout=self.timeout
-            )
+            salida, error = await asyncio.wait_for(proceso.communicate(), timeout=self.timeout)
         except asyncio.TimeoutError:
             proceso.kill()
             await proceso.wait()
-            log.warning("yt-dlp se pasó de %ss con %s", self.timeout, webpage_url)
-            return None
+            log.warning("yt-dlp se pasó de %ss con %s (cliente %s)", self.timeout, webpage_url, cliente)
+            return _Intento(None, "entorno")
         except asyncio.CancelledError:
             # Una precarga descartada se cancela en plena resolución: sin esto el
             # yt-dlp seguiría corriendo huérfano hasta terminar solo.
@@ -341,27 +431,176 @@ class Resolver:
             except ProcessLookupError:
                 pass
             raise
-
         if proceso.returncode != 0:
             detalle = error.decode(errors="replace").strip()[:200]
-            log.warning("yt-dlp no pudo con %s: %s", webpage_url, detalle)
+            log.warning("yt-dlp no pudo con %s (cliente %s): %s", webpage_url, cliente, detalle)
             motivo = _clasificar(detalle)
-            if motivo:
-                self._sin_caso[webpage_url] = motivo
-                self._sin_caso.move_to_end(webpage_url)
-                while len(self._sin_caso) > RECUERDO_MAXIMO:
-                    self._sin_caso.popitem(last=False)
-            return None
-
+            return _Intento(None, "video", motivo) if motivo else _Intento(None, "cliente")
         # `--get-url` imprime una línea por formato; con un formato pedido es una.
         for linea in salida.decode(errors="replace").splitlines():
             linea = linea.strip()
             if linea.startswith("http"):
-                return linea
-        return None
+                return _Intento(linea)
+        return _Intento(None, "cliente")
+
+    def _contar_fallo(self) -> None:
+        """Suma un fallo pasajero y, con `FALLOS_PARA_SONDEAR` seguidos, lanza el sondeo suelto.
+
+        La resolución en curso no lo espera, no hay dos a la vez y entre uno y otro pasa `SONDEO_CADA`.
+        """
+        self._fallos_seguidos += 1
+        if self._fallos_seguidos < FALLOS_PARA_SONDEAR:
+            return
+        if self._sondeo is not None and not self._sondeo.done():
+            return
+        ahora = self._reloj()
+        if self._ultimo_sondeo is not None and ahora - self._ultimo_sondeo < SONDEO_CADA:
+            return
+        self._ultimo_sondeo = ahora
+        log.warning(
+            "yt-dlp falló %s veces seguidas con el cliente %r: pruebo los demás en segundo plano",
+            self._fallos_seguidos, self.cliente,
+        )
+        self._sondeo = asyncio.create_task(self._sondear())
+
+    async def _sondear(self) -> None:
+        """Busca un cliente que dé audio; si ninguno, actualiza yt-dlp y prueba otra vez, empezando por el actual.
+
+        Corre suelta: lo que pase se queda en el log, no se pierde como tarea sin recuperar.
+        """
+        try:
+            if await self._rotar_cliente():
+                return
+            log.error(
+                "Ningún cliente de YouTube entregó audio (el actual es %r y probé: %s)",
+                self.cliente, ", ".join(c for c in self.clientes if c != self.cliente) or "ninguno",
+            )
+            if not self.autoactualizar:
+                log.error("La actualización automática está apagada (YTDLP_AUTOACTUALIZAR): actualiza yt-dlp a mano.")
+            elif await self.actualizar_ytdlp() and not await self._rotar_cliente(con_el_actual=True):
+                log.error("Con yt-dlp actualizado sigue sin sonar ningún cliente: diagnostícalo a mano (ver AGENTS.md).")
+        except Exception:  # noqa: BLE001
+            log.exception("Falló el sondeo de clientes de YouTube")
+
+    async def _rotar_cliente(self, *, con_el_actual: bool = False) -> bool:
+        """Se pasa al primer cliente de `self.clientes` que entregue URL del video de prueba.
+
+        Salta el actual, salvo con `con_el_actual`, que lo prueba primero. Las pruebas no cuentan
+        como fallos ni éxitos de `direct_url`.
+        """
+        candidatos = [c for c in self.clientes if c != self.cliente]
+        if con_el_actual:
+            candidatos.insert(0, self.cliente)
+        for candidato in candidatos:
+            log.info("Probando el cliente de YouTube %r", candidato)
+            if not (await self._pedir_url(VIDEO_DE_PRUEBA, candidato)).url:
+                continue
+            anterior, self.cliente = self.cliente, candidato
+            # Al cliente nuevo no se le heredan los fallos del anterior.
+            self._fallos_seguidos = 0
+            if anterior == candidato:
+                log.info("El cliente de YouTube %r vuelve a dar audio", candidato)
+            else:
+                log.warning(
+                    "El cliente de YouTube %r dejó de dar audio: paso a %r. Dura hasta que "
+                    "reinicies el bot; para que quede fijo pon YTDLP_PLAYER_CLIENT=%s en el .env.",
+                    anterior, candidato, candidato,
+                )
+            return True
+        return False
+
+    def _comando_de_actualizacion(self) -> list[str]:
+        """pip si el binario está junto al python del bot (el venv); si no, `-U` del propio binario.
+
+        Las rutas se comparan sin `resolve()`: en Linux el python del venv es un symlink al del sistema.
+        """
+        def carpeta(ruta: str) -> str:
+            return os.path.normcase(os.path.dirname(os.path.abspath(ruta)))
+        if carpeta(self.binario) == carpeta(sys.executable):
+            return [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"]
+        return [self.binario, "-U"]
+
+    async def actualizar_ytdlp(self) -> bool:
+        """Actualiza yt-dlp y devuelve si salió bien.
+
+        Entre intentos pasa al menos `ACTUALIZAR_CADA`, salga como salga. Mientras corre, `_pedir_url` espera.
+        """
+        ahora = self._reloj()
+        if self._ultima_actualizacion is not None and ahora - self._ultima_actualizacion < ACTUALIZAR_CADA:
+            log.info("No actualizo yt-dlp: el último intento fue hace %.0f min", (ahora - self._ultima_actualizacion) / 60)
+            return False
+        # Se anota antes de empezar: con dos llamadas a la vez, la segunda no lanza otro pip.
+        self._ultima_actualizacion = ahora
+        comando = self._comando_de_actualizacion()
+        antes = self._estado_ytdlp["version"]
+        log.info("Actualizando yt-dlp (era %s): %s", antes or "desconocido", " ".join(comando))
+        self._ytdlp_libre.clear()
+        try:
+            try:
+                await asyncio.wait_for(self._sin_llamadas.wait(), timeout=self.timeout + 5)
+            except asyncio.TimeoutError:
+                log.warning("Sigue corriendo un yt-dlp: actualizo igual")
+            salio_bien = await self._correr_actualizacion(comando)
+        finally:
+            # Aun cancelada: dejarlo cerrado colgaría para siempre las resoluciones.
+            self._ytdlp_libre.set()
+        if not salio_bien:
+            return False
+        despues = (await self.revisar_ytdlp())["version"]
+        if despues == antes:
+            log.info("yt-dlp ya estaba en la última versión (%s)", despues)
+        else:
+            log.info("yt-dlp actualizado: %s -> %s", antes or "desconocido", despues)
+        return True
+
+    async def _correr_actualizacion(self, comando: list[str]) -> bool:
+        """Corre el comando, sin shell y con tiempo límite."""
+        try:
+            proceso = await asyncio.create_subprocess_exec(
+                *comando, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        except OSError as error:
+            log.error("No pude lanzar la actualización de yt-dlp (%s): %s", comando[0], error)
+            return False
+        try:
+            salida, _ = await asyncio.wait_for(proceso.communicate(), timeout=TIMEOUT_DE_ACTUALIZACION)
+        except asyncio.TimeoutError:
+            proceso.kill()
+            await proceso.wait()
+            log.error("La actualización de yt-dlp se pasó de %ss: la corté", TIMEOUT_DE_ACTUALIZACION)
+            return False
+        except asyncio.CancelledError:
+            # El bot se cierra: no se deja pip corriendo huérfano.
+            try:
+                proceso.kill()
+            except ProcessLookupError:
+                pass
+            raise
+        if proceso.returncode != 0:
+            # Lo que importa del error está al final.
+            detalle = salida.decode(errors="replace").strip()[-300:]
+            log.error("No pude actualizar yt-dlp (%s salió con %s): %s", comando[0], proceso.returncode, detalle)
+            return False
+        return True
+
+    async def mantener_al_dia(self) -> None:
+        """Revisa la versión de yt-dlp al arrancar y cada `REVISAR_CADA`, y la actualiza si está vieja.
+
+        Con `autoactualizar` apagado solo avisa. Se cancela al cerrar el bot.
+        """
+        while True:
+            try:
+                await self.revisar_ytdlp()
+                if self.autoactualizar and self._estado_ytdlp["viejo"]:
+                    await self.actualizar_ytdlp()
+            except Exception:  # noqa: BLE001
+                # Si la tarea muriera, nadie volvería a mirar la versión.
+                log.exception("Falló la revisión de yt-dlp")
+            await asyncio.sleep(REVISAR_CADA)
 
     async def revisar_ytdlp(self) -> dict:
         """Le pregunta la versión a yt-dlp y la deja anotada para el panel."""
+        await self._ytdlp_libre.wait()
         version = None
         proceso = None
         try:
@@ -390,8 +629,8 @@ class Resolver:
         return dict(self._estado_ytdlp)
 
     def estado_ytdlp(self) -> dict:
-        """Lo último que se supo de yt-dlp. Lo lee la API para el panel."""
-        return dict(self._estado_ytdlp)
+        """Lo último que se supo de yt-dlp y del cliente (actual y configurado). Lo lee la API para el panel."""
+        return {**self._estado_ytdlp, "cliente": self.cliente, "cliente_configurado": self.cliente_configurado}
 
     async def resolve(self, pista: wavelink.Playable) -> wavelink.Playable:
         """La pista lista para reproducir. Si algo falla, devuelve la original.

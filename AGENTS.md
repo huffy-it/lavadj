@@ -81,9 +81,11 @@ cambias esa ruta hay que cambiarla en los dos lados o el DJ se queda mudo.
 arregle —1.18.2 es la última publicada—, así que el bot le pide la URL directa a
 yt-dlp y se la pasa a Lavalink por su fuente `http`. Lavalink sigue haciendo lo
 que hace bien (transcodificar y mandar a Discord) y la parte que YouTube rompe
-seguido queda en yt-dlp, que saca versión nueva apenas YouTube cambia algo. No se
-actualiza solo: el bot avisa en el log y en los paneles cuando la versión instalada
-tiene más de 30 días.
+seguido queda en yt-dlp, que saca versión nueva apenas YouTube cambia algo. El bot
+lo actualiza solo (`Resolver.mantener_al_dia`): revisa la versión al arrancar y cada
+24 h y, si tiene más de 30 días, la actualiza (pip si el binario está junto al python
+del bot, `-U` si no), como mucho cada 6 h. `YTDLP_AUTOACTUALIZAR=false` lo apaga y
+solo avisa en el log y en los paneles.
 
 Tres cosas que hay que respetar si tocas esto:
 - **La URL se pide al reproducir, nunca al encolar.** Las de googlevideo caducan
@@ -108,13 +110,13 @@ esa carpeta se monta en el contenedor de solo lectura; ya no hay volumen de
 plugins. Para cambiar de versión: versión y hash en los dos scripts, el nombre del
 jar en `lavalink.ps1`, y borrar el jar viejo para que no se carguen los dos.
 
-## Cuando YouTube deja de sonar
-
 **Si la cola se queda muda** (el AutoPlay de wavelink se frena tras errores seguidos y
 nada suena con temas esperando), el vigilante del cog lo destraba: cada `VIGILAR_CADA`
 (20 s) revisa cada player, y si lo ve dos veces seguidas conectado, sin pausa, sin
 sonar ni resolver y con algo en `queue` o `auto_queue`, arranca el siguiente por el
 mismo camino que `!play`. Solo el vigilante arranca temas del `auto_queue`.
+
+## Cuando YouTube deja de sonar
 
 **El síntoma engaña.** La búsqueda sigue funcionando y solo se cae al resolver el
 formato, así que desde Discord parece "no carga ninguna canción". Separa las dos
@@ -130,6 +132,17 @@ curl -H "Authorization: youshallnotpass" \
 # 2. ¿Reproduce? El error real sale aquí, no en logs/bot.log.
 podman logs lavadj-lavalink 2>&1 | grep -iE "failed|AllClientsFailed"
 ```
+
+**El bot ya intenta arreglarlo solo** (`core/resolver.py`). Tras 3 fallos pasajeros
+seguidos de yt-dlp (error sin motivo definitivo o salida sin URL; los videos
+bloqueados y los timeouts no cuentan) sondea en segundo plano los clientes de
+`YTDLP_CLIENTES` contra `dQw4w9WgXcQ` y se pasa al primero que entrega URL, con un
+`warning` en el log. Si ninguno funciona y `YTDLP_AUTOACTUALIZAR` está encendido,
+actualiza yt-dlp y sondea una vez más, empezando por el cliente actual. Hay un
+sondeo cada 10 min como máximo. **El cliente cambiado solo dura hasta reiniciar**:
+para fijarlo, cópialo del log a `YTDLP_PLAYER_CLIENT` en el `.env`; los paneles
+muestran el cambio mientras tanto. Lo de abajo sigue siendo el diagnóstico cuando
+eso no alcanza: busca en el log el `error` "Ningún cliente de YouTube entregó audio".
 
 **El arreglo casi nunca está en el yml.** Si el audio ya no sale, lo primero es
 saber quién falló, porque el bot tiene dos caminos: yt-dlp (el normal) y el

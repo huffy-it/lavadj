@@ -72,16 +72,8 @@ def test_el_bot_trae_su_resolver_desde_el_import(bot_mod):
     assert isinstance(bot_mod.bot.resolver, Resolver)
 
 
-async def test_al_arrancar_se_revisa_yt_dlp_con_el_resolver_del_bot(bot_mod, monkeypatch):
-    class Fin(Exception):
-        pass
-
-    revisadas = []
-
-    async def _revisar():
-        revisadas.append("yt-dlp")
-        return {}
-
+def _arrancar_sin_red(bot_mod, monkeypatch, durante_el_arranque):
+    """`main()` sin red: `bot.start` da un turno al loop, llama a `durante_el_arranque` y corta con `Fin`."""
     async def _start_server(bot, apagar):
         return type("Runner", (), {"cleanup": staticmethod(_nada)})()
 
@@ -90,6 +82,7 @@ async def test_al_arrancar_se_revisa_yt_dlp_con_el_resolver_del_bot(bot_mod, mon
 
     async def _start(token):
         await asyncio.sleep(0)      # deja correr las tareas que `main()` dejó creadas
+        await durante_el_arranque()
         raise Fin()
 
     monkeypatch.setattr(bot_mod, "start_server", _start_server)
@@ -97,12 +90,55 @@ async def test_al_arrancar_se_revisa_yt_dlp_con_el_resolver_del_bot(bot_mod, mon
     monkeypatch.setattr(bot_mod, "esperar_orden_de_apagado", lambda apagar: _nada())
     monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
     monkeypatch.setattr(bot_mod.bot, "start", _start)
-    monkeypatch.setattr(bot_mod.bot.resolver, "revisar_ytdlp", _revisar)
 
+
+class Fin(Exception):
+    pass
+
+
+async def test_al_arrancar_se_mantiene_yt_dlp_con_el_resolver_del_bot(bot_mod, monkeypatch):
+    mantenidas = []
+
+    async def _mantener():
+        mantenidas.append("yt-dlp")
+        await asyncio.sleep(3600)
+
+    _arrancar_sin_red(bot_mod, monkeypatch, _nada)
+    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _mantener)
     with pytest.raises(Fin):
         await bot_mod.main()
+    assert mantenidas == ["yt-dlp"]
 
-    assert revisadas == ["yt-dlp"]
+
+async def test_al_cerrar_el_bot_se_cancela_el_mantenimiento_de_yt_dlp(bot_mod, monkeypatch):
+    estado = []
+
+    async def _mantener():
+        estado.append("corriendo")
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            estado.append("cancelada")
+            raise
+
+    _arrancar_sin_red(bot_mod, monkeypatch, _nada)
+    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _mantener)
+    with pytest.raises(Fin):
+        await bot_mod.main()
+    assert estado == ["corriendo", "cancelada"]
+
+
+async def test_cerrar_sin_haber_llegado_a_lanzar_el_mantenimiento_no_estorba(bot_mod, monkeypatch):
+    async def _start_server(bot, apagar):
+        return type("Runner", (), {"cleanup": staticmethod(_nada)})()
+
+    async def _load_extension(nombre):
+        raise Fin()
+
+    monkeypatch.setattr(bot_mod, "start_server", _start_server)
+    monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
+    with pytest.raises(Fin):
+        await bot_mod.main()
 
 
 # --- Lista blanca de servidores ----------------------------------------------
@@ -156,6 +192,41 @@ def test_sin_la_variable_no_hay_restriccion(monkeypatch):
     monkeypatch.delenv("SERVIDORES_PERMITIDOS", raising=False)
 
     assert config._lista_de_ids("SERVIDORES_PERMITIDOS") == (frozenset(), ())
+
+
+POR_DEFECTO = ("android", "ios")
+
+
+@pytest.mark.parametrize("crudo, esperado", [
+    ("mweb,web", ("mweb", "web")),
+    (" mweb , web ,, ", ("mweb", "web")),
+    ("web,mweb,web", ("web", "mweb")),
+    ("", POR_DEFECTO),
+    (" , ,", POR_DEFECTO),
+])
+def test_la_lista_de_clientes_se_parsea(monkeypatch, crudo, esperado):
+    monkeypatch.setenv("YTDLP_CLIENTES", crudo)
+    assert config._lista_de_texto("YTDLP_CLIENTES", POR_DEFECTO) == esperado
+
+
+def test_sin_la_variable_de_clientes_se_usan_los_de_siempre(monkeypatch):
+    monkeypatch.delenv("YTDLP_CLIENTES", raising=False)
+    assert config._lista_de_texto("YTDLP_CLIENTES", POR_DEFECTO) == POR_DEFECTO
+
+
+@pytest.mark.parametrize("valor, esperado", [
+    (None, True),
+    ("true", True),
+    ("false", False),
+    ("0", False),
+    ("no", False),
+])
+def test_la_actualizacion_automatica_se_apaga_con_false(monkeypatch, valor, esperado):
+    if valor is None:
+        monkeypatch.delenv("YTDLP_AUTOACTUALIZAR", raising=False)
+    else:
+        monkeypatch.setenv("YTDLP_AUTOACTUALIZAR", valor)
+    assert config._booleano("YTDLP_AUTOACTUALIZAR", True) is esperado
 
 
 def test_servidor_permitido(bot_mod):

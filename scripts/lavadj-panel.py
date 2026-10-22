@@ -890,6 +890,11 @@ class Panel(Adw.ApplicationWindow):
             texto, clase = "YT-DLP", "aviso"
             detalle = (f"yt-dlp está en {ytdlp.get('version')}, "
                        f"hace {ytdlp.get('dias')} días. Conviene actualizarlo.")
+        elif ytdlp.get("cliente") and ytdlp.get("cliente") != ytdlp.get("cliente_configurado"):
+            texto, clase = "YT-DLP", "aviso"
+            detalle = (f"El bot cambió solo el cliente de YouTube de "
+                       f"{ytdlp.get('cliente_configurado')} a {ytdlp.get('cliente')}. "
+                       f"Para fijarlo, pon YTDLP_PLAYER_CLIENT={ytdlp.get('cliente')} en el .env.")
         else:
             self.pulso.set_visible(False)
             return

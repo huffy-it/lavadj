@@ -110,7 +110,10 @@ def _estado_ytdlp(bot) -> dict:
     """
     resolver = getattr(bot, "resolver", None)
     if resolver is None:
-        return {"version": None, "dias": None, "viejo": False}
+        return {
+            "version": None, "dias": None, "viejo": False,
+            "cliente": None, "cliente_configurado": None,
+        }
     return resolver.estado_ytdlp()
 
 

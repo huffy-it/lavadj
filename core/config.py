@@ -31,6 +31,12 @@ def _booleano(nombre: str, por_defecto: bool) -> bool:
     return valor.strip().lower() in ("1", "true", "si", "sí", "on", "yes")
 
 
+def _lista_de_texto(nombre: str, por_defecto: tuple[str, ...]) -> tuple[str, ...]:
+    """Palabras separadas por comas del entorno, sin repetidas y en orden; vacía o ausente, el valor por defecto."""
+    palabras = (p.strip() for p in os.getenv(nombre, "").split(","))
+    return tuple(dict.fromkeys(p for p in palabras if p)) or por_defecto
+
+
 def _lista_de_ids(nombre: str) -> tuple[frozenset[int], tuple[str, ...]]:
     """IDs numéricos del entorno, separados por comas y/o espacios.
 
@@ -87,9 +93,18 @@ def _buscar_ytdlp() -> str:
 
 YTDLP_BIN = os.getenv("YTDLP_BIN") or _buscar_ytdlp()
 
-# El único cliente de YouTube que hoy entrega audio sin credenciales. Si vuelve
-# a caerse, se sondean los otros (ver AGENTS.md) y se cambia esto.
+# El único cliente de YouTube que hoy entrega audio sin credenciales. Si se cae, el bot
+# cambia solo de cliente, pero hasta reiniciar: lo fijo es lo que se ponga aquí.
 YTDLP_PLAYER_CLIENT = os.getenv("YTDLP_PLAYER_CLIENT", "android")
+
+# Los clientes que se prueban, en este orden, cuando el actual deja de dar audio (la lista de AGENTS.md).
+YTDLP_CLIENTES = _lista_de_texto(
+    "YTDLP_CLIENTES",
+    ("android", "android_vr", "ios", "mweb", "web", "tv_simply", "web_embedded"),
+)
+
+# El bot actualiza yt-dlp cuando lo ve viejo o ningún cliente suena; YTDLP_AUTOACTUALIZAR=false lo apaga.
+YTDLP_AUTOACTUALIZAR = _booleano("YTDLP_AUTOACTUALIZAR", True)
 
 # Cuánto se le aguanta a yt-dlp por canción antes de darla por perdida.
 YTDLP_TIMEOUT = _entero("YTDLP_TIMEOUT", 30)

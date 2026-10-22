@@ -79,9 +79,10 @@ Instala además, con el gestor de tu distribución, `podman`, `espeak-ng` y
 PATH, en el venv o en `~/.local/bin/yt-dlp` (o apunta a otro sitio con
 `YTDLP_BIN`).
 
-YouTube cambia seguido y yt-dlp **no se actualiza solo**: mantenlo al día
-(`.venv/bin/python -m pip install -U yt-dlp`). El bot avisa en el log cuando la
-versión tiene más de 30 días, y los paneles lo muestran.
+YouTube cambia seguido, así que el bot mantiene yt-dlp al día: lo revisa al
+arrancar y cada 24 horas, y lo actualiza si tiene más de 30 días o ningún cliente
+de YouTube consigue audio. Para actualizarlo tú, pon `YTDLP_AUTOACTUALIZAR=false`
+en el `.env`: el bot solo avisa en el log y en los paneles.
 
 Para arrancar (la primera vez, `start-lavalink.sh` baja el plugin de YouTube a
 `lavalink/plugins/` y lo monta en el contenedor de solo lectura):
@@ -152,6 +153,8 @@ en `.gitignore`).
 | `DJ_VOLUME` | `100` | Volumen inicial de la voz del DJ (0-200) |
 | `YTDLP_BIN` | autodetectado | Ruta a `yt-dlp` |
 | `YTDLP_PLAYER_CLIENT` | `android` | Cliente de YouTube que usa yt-dlp |
+| `YTDLP_CLIENTES` | `android,android_vr,ios,mweb,web,tv_simply,web_embedded` | Clientes que el bot prueba, en ese orden, cuando el actual deja de dar audio |
+| `YTDLP_AUTOACTUALIZAR` | `true` | Actualizar yt-dlp solo cuando está viejo o ningún cliente suena; `false` para hacerlo tú |
 | `YTDLP_TIMEOUT` | `30` | Segundos que se le aguantan a yt-dlp por canción |
 | `SILENCIO_PARA_MUDO` | `300` | Segundos al aire, con cola y sin sonar nada, para dar el bot por mudo |
 
@@ -285,7 +288,11 @@ absoluta** que usa el bot. Si mueves el proyecto de carpeta, reinicia Lavalink.
 El audio de YouTube lo resuelve **yt-dlp** (`core/resolver.py`) y Lavalink solo
 reproduce la URL; el plugin de YouTube de Lavalink queda como respaldo. Si
 `!play` encuentra el tema pero no suena, casi siempre es yt-dlp desactualizado o
-un cliente de YouTube que YouTube cerró:
+un cliente de YouTube que YouTube cerró. El bot lo intenta arreglar solo: tras
+varios fallos seguidos prueba los clientes de `YTDLP_CLIENTES` y se pasa al primero
+que suena, y si ninguno sirve actualiza yt-dlp. Todo queda en `logs/bot.log`. El
+cambio de cliente dura hasta reiniciar: para fijarlo, ponlo en `YTDLP_PLAYER_CLIENT`
+del `.env`. Si aun así no suena:
 
 1. Actualiza yt-dlp.
 2. Prueba otro cliente y ponlo en `YTDLP_PLAYER_CLIENT` dentro de `.env`

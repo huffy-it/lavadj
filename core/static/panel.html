@@ -78,7 +78,10 @@ async function actualizar() {
     $('bot').textContent = (e.listo ? 'listo' : 'arrancando') + ' · ' + dur(Math.floor(e.uptime));
     $('lava').textContent = e.lavalink.conectado ? 'conectado' : 'DESCONECTADO';
     $('salud').textContent = e.salud ? e.salud.estado + (e.salud.motivo ? ' – ' + e.salud.motivo : '') : '–';
-    $('ytdlp').textContent = e.ytdlp.version ? e.ytdlp.version + (e.ytdlp.viejo ? ' (viejo)' : '') : 'no encontrado';
+    const y = e.ytdlp;
+    let textoYtdlp = y.version ? y.version + (y.viejo ? ' (viejo)' : '') : 'no encontrado';
+    if (y.cliente && y.cliente !== y.cliente_configurado) textoYtdlp += ' · cliente ' + y.cliente + ' (cambiado solo)';
+    $('ytdlp').textContent = textoYtdlp;
     $('servidores').textContent = e.servidores;
     $('voz').innerHTML = e.voz.length ? e.voz.map(v =>
       `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.sonando ? '▶ ' + esc(v.cancion || '') : 'quieto'} · ${v.en_cola} en cola</span></div>`).join('') : 'Nada.';

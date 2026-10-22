@@ -7,7 +7,10 @@ tumbe la reproducción: ante la duda, se devuelve la pista original.
 
 import asyncio
 import gc
+import os
+import sys
 import time
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -404,7 +407,8 @@ async def test_revisar_ytdlp_deja_el_estado_a_mano_del_panel(res, monkeypatch):
 
     await res.revisar_ytdlp()
 
-    assert res.estado_ytdlp() == {"version": "2026.07.04", "dias": 55, "viejo": True}
+    estado = res.estado_ytdlp()
+    assert (estado["version"], estado["dias"], estado["viejo"]) == ("2026.07.04", 55, True)
 
 
 def test_la_pista_resuelta_se_presenta_como_de_youtube(monkeypatch):
@@ -673,8 +677,10 @@ async def test_dos_resolvers_no_comparten_el_estado_de_yt_dlp(monkeypatch):
 
     await uno.revisar_ytdlp()
 
-    assert uno.estado_ytdlp() == {"version": "2026.07.04", "dias": 55, "viejo": True}
-    assert otro.estado_ytdlp() == {"version": None, "dias": None, "viejo": False}
+    assert uno.estado_ytdlp()["version"] == "2026.07.04"
+    assert uno.estado_ytdlp()["viejo"] is True
+    assert otro.estado_ytdlp()["version"] is None
+    assert otro.estado_ytdlp()["viejo"] is False
 
 
 def test_el_estado_de_yt_dlp_se_entrega_como_copia(res):
@@ -1079,3 +1085,708 @@ async def test_resolve_sin_precarga_sigue_siendo_igual(res, monkeypatch):
     assert pedidas == [pista.uri]
     assert datos["encoded"] == "encoded-http"
     assert res._precargas == {}
+
+
+# --- yt-dlp que se cuida solo: rotar de cliente y actualizarse -----------------------
+
+ERROR_PASAJERO = b"ERROR: unable to download video data: HTTP Error 400: Bad Request"
+ERROR_DEFINITIVO = b"ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"
+URL_DE_AUDIO = "https://rr4.googlevideo.com/v"
+CLIENTES = ("android", "android_vr", "ios", "mweb")
+
+
+class Reloj:
+    """La hora monotónica de mentira: solo avanza si el test la mueve."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class _Proceso:
+    """Un proceso hijo de mentira; con `frenar`, no contesta hasta que lo suelten."""
+
+    def __init__(self, salida=b"", error=b"", codigo=0, frenar=None, al_terminar=None):
+        self.salida, self.error, self.returncode = salida, error, codigo
+        self.frenar, self.al_terminar = frenar, al_terminar
+        self.matado = False
+
+    async def communicate(self):
+        if self.frenar is not None:
+            await self.frenar.wait()
+        if self.al_terminar is not None:
+            self.al_terminar()
+        return self.salida, self.error
+
+    def kill(self):
+        self.matado = True
+
+    async def wait(self):
+        return self.returncode
+
+
+class YtDlpFalso:
+    """Un `create_subprocess_exec` que contesta según lo que le pidan.
+
+    `--get-url` da una URL si el cliente está en `funcionan` y un error pasajero si no;
+    `--version` da `version`; cualquier otra cosa es la actualización.
+    """
+
+    def __init__(self, funcionan=(), *, version="2026.10.01", actualizacion=0,
+                 error=ERROR_PASAJERO, error_de_prueba=None, colgar=(),
+                 frenar_pruebas=None, frenar_pedidas=None, frenar_actualizacion=None,
+                 al_actualizar=None):
+        self.funcionan, self.version, self.actualizacion = set(funcionan), version, actualizacion
+        self.error, self.error_de_prueba, self.colgar = error, error_de_prueba, set(colgar)
+        self.frenar_pruebas, self.frenar_pedidas = frenar_pruebas, frenar_pedidas
+        self.frenar_actualizacion, self.al_actualizar = frenar_actualizacion, al_actualizar
+        self.llamadas, self.orden, self.pedidas, self.actualizaciones, self.procesos = [], [], [], [], []
+
+    @property
+    def pruebas(self):
+        return [c for c, url in self.pedidas if url == resolver.VIDEO_DE_PRUEBA]
+
+    @property
+    def versiones_pedidas(self):
+        return self.orden.count("version")
+
+    def de(self, tipo):
+        return [p for t, p in self.procesos if t == tipo]
+
+    def _terminar_actualizacion(self):
+        self.orden.append("actualizada")
+        if self.al_actualizar is not None:
+            self.al_actualizar(self)
+
+    async def __call__(self, *args, **kwargs):
+        self.llamadas.append(list(args))
+        if "--get-url" in args:
+            tipo = "pedir"
+            cliente, url = args[args.index("--extractor-args") + 1].split("=", 1)[1], args[-1]
+            self.pedidas.append((cliente, url))
+            es_prueba = url == resolver.VIDEO_DE_PRUEBA
+            frenar = self.frenar_pruebas if es_prueba else self.frenar_pedidas
+            if cliente in self.colgar:
+                proceso = _Proceso(frenar=asyncio.Event())
+            elif cliente in self.funcionan:
+                proceso = _Proceso(salida=(URL_DE_AUDIO + "\n").encode(), frenar=frenar)
+            else:
+                error = self.error_de_prueba if es_prueba and self.error_de_prueba else self.error
+                proceso = _Proceso(error=error, codigo=1, frenar=frenar)
+        elif "--version" in args:
+            tipo = "version"
+            proceso = _Proceso(salida=(self.version + "\n").encode())
+        else:
+            tipo = "actualizar"
+            self.actualizaciones.append(list(args))
+            proceso = _Proceso(
+                salida=b"Successfully installed yt-dlp", codigo=self.actualizacion,
+                frenar=self.frenar_actualizacion,
+                al_terminar=self._terminar_actualizacion if self.actualizacion == 0 else None,
+            )
+        self.orden.append(tipo)
+        self.procesos.append((tipo, proceso))
+        return proceso
+
+
+def _yt_dlp(monkeypatch, funcionan=(), **kwargs):
+    falso = YtDlpFalso(funcionan, **kwargs)
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", falso)
+    return falso
+
+
+def _resolver_que_rota(**kwargs):
+    """Cuatro clientes, sin autoactualizar y con reloj propio; el binario no es el del venv, así que actualizar es `-U`."""
+    kwargs.setdefault("cliente", "android")
+    kwargs.setdefault("clientes", CLIENTES)
+    kwargs.setdefault("autoactualizar", False)
+    kwargs.setdefault("reloj", Reloj())
+    return resolver.Resolver(binario="/otro/yt-dlp", **kwargs)
+
+
+async def _fallar(res, veces, url="https://www.youtube.com/watch?v=abc"):
+    for _ in range(veces):
+        assert await res.direct_url(url) is None
+
+
+async def _dejar_correr():
+    for _ in range(30):
+        await asyncio.sleep(0)
+
+
+async def _terminar_sondeo(res):
+    if res._sondeo is not None:
+        await res._sondeo
+
+
+async def _cancelar(tarea):
+    """Cancela hasta que muere: en 3.11 `wait_for` puede tragarse una cancelación que llega justo al terminar."""
+    while not tarea.done():
+        tarea.cancel()
+        await asyncio.sleep(0.001)
+    with pytest.raises(asyncio.CancelledError):
+        await tarea
+
+
+# --- el contador de fallos ----------------------------------------------------------
+
+async def test_los_fallos_pasajeros_seguidos_se_cuentan(monkeypatch):
+    _yt_dlp(monkeypatch)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR - 1)
+    assert res._fallos_seguidos == resolver.FALLOS_PARA_SONDEAR - 1
+    assert res._sondeo is None
+
+
+async def test_una_salida_sin_url_cuenta_como_fallo_pasajero(monkeypatch):
+    _falso_proceso(monkeypatch, salida=b"\n", codigo=0)
+    res = _resolver_que_rota()
+    assert await res.direct_url("https://youtu.be/abc") is None
+    assert res._fallos_seguidos == 1
+
+
+async def test_los_videos_bloqueados_no_cuentan_contra_el_cliente(monkeypatch):
+    _yt_dlp(monkeypatch, error=ERROR_DEFINITIVO)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR + 2)
+    assert res._fallos_seguidos == 0
+    assert res._sondeo is None
+    assert res._sin_caso
+
+
+async def test_un_timeout_no_cuenta_contra_el_cliente(monkeypatch):
+    _yt_dlp(monkeypatch, colgar={"android"})
+    res = _resolver_que_rota(timeout=0.01)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR + 2)
+    assert res._fallos_seguidos == 0
+    assert res._sondeo is None
+
+
+async def test_un_yt_dlp_que_no_se_puede_lanzar_no_cuenta_contra_el_cliente(monkeypatch):
+    async def _exec(*args, **kwargs):
+        raise FileNotFoundError("no existe")
+
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR + 2)
+    assert res._fallos_seguidos == 0
+    assert res._sondeo is None
+
+
+async def test_un_exito_pone_el_contador_en_cero(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR - 1)
+    falso.funcionan.add("android")
+    assert await res.direct_url("https://youtu.be/abc") == URL_DE_AUDIO
+    assert res._fallos_seguidos == 0
+    falso.funcionan.clear()
+    await _fallar(res, 1)
+    assert res._fallos_seguidos == 1
+    assert res._sondeo is None
+
+
+async def test_un_video_bloqueado_en_medio_ni_suma_ni_resetea(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR - 1)
+    falso.error = ERROR_DEFINITIVO
+    await _fallar(res, 1)
+    assert res._fallos_seguidos == resolver.FALLOS_PARA_SONDEAR - 1
+    assert res._sondeo is None
+    falso.error = ERROR_PASAJERO
+    await _fallar(res, 1)
+    assert res._sondeo is not None
+    await _terminar_sondeo(res)
+
+
+async def test_un_fallo_de_una_llamada_que_arranco_con_otro_cliente_no_cuenta(monkeypatch):
+    falso = _yt_dlp(monkeypatch, frenar_pedidas=asyncio.Event())
+    res = _resolver_que_rota()
+    llamada = asyncio.create_task(res.direct_url("https://youtu.be/abc"))
+    await _dejar_correr()
+    res.cliente = "ios"
+    falso.frenar_pedidas.set()
+    assert await llamada is None
+    assert res._fallos_seguidos == 0
+
+
+# --- el sondeo: cuándo se lanza ------------------------------------------------------
+
+async def test_al_tercer_fallo_pasajero_se_lanza_un_sondeo_y_no_dos(monkeypatch):
+    falso = _yt_dlp(monkeypatch, frenar_pruebas=asyncio.Event())
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR - 1)
+    assert res._sondeo is None
+    await _fallar(res, 1)
+    sondeo = res._sondeo
+    assert sondeo is not None and not sondeo.done()
+    await _fallar(res, 3)
+    assert res._sondeo is sondeo
+    falso.frenar_pruebas.set()
+    await sondeo
+    assert falso.pruebas == ["android_vr", "ios", "mweb"]
+
+
+async def test_la_resolucion_que_dispara_el_sondeo_no_lo_espera(monkeypatch):
+    falso = _yt_dlp(monkeypatch, frenar_pruebas=asyncio.Event())
+    res = _resolver_que_rota()
+    await asyncio.wait_for(_fallar(res, resolver.FALLOS_PARA_SONDEAR), timeout=1)
+    assert not res._sondeo.done()
+    falso.frenar_pruebas.set()
+    await res._sondeo
+
+
+async def test_entre_un_sondeo_y_el_siguiente_pasa_al_menos_sondeo_cada(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    reloj = Reloj()
+    res = _resolver_que_rota(reloj=reloj)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    primero = res._sondeo
+    await primero
+    por_pasada = len(falso.pruebas)
+    assert por_pasada == len(CLIENTES) - 1
+    reloj.t += resolver.SONDEO_CADA - 1
+    await _fallar(res, 2)
+    assert res._sondeo is primero
+    assert len(falso.pruebas) == por_pasada
+    reloj.t += 1
+    await _fallar(res, 1)
+    assert res._sondeo is not primero
+    await res._sondeo
+    assert len(falso.pruebas) == 2 * por_pasada
+
+
+# --- el sondeo: qué hace --------------------------------------------------------------
+
+async def test_el_sondeo_se_queda_con_el_primer_cliente_que_funciona_y_se_salta_el_actual(monkeypatch, caplog):
+    falso = _yt_dlp(monkeypatch, funcionan={"ios", "mweb"})
+    res = _resolver_que_rota(cliente="android_vr")
+    with caplog.at_level("WARNING", logger="resolver"):
+        await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+        await _terminar_sondeo(res)
+    assert falso.pruebas == ["android", "ios"]
+    assert res.cliente == "ios"
+    assert res.cliente_configurado == "android_vr"
+    assert "android_vr" in caplog.text and "ios" in caplog.text
+    assert "YTDLP_PLAYER_CLIENT=ios" in caplog.text
+
+
+async def test_tras_rotar_las_resoluciones_usan_el_cliente_nuevo(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"ios"})
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert await res.direct_url("https://youtu.be/abc") == URL_DE_AUDIO
+    assert falso.pedidas[-1] == ("ios", "https://youtu.be/abc")
+    assert res._fallos_seguidos == 0
+
+
+async def test_el_sondeo_pide_lo_mismo_que_direct_url_con_el_cliente_a_probar(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"android_vr"})
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert res.cliente == "android_vr"
+    await res.direct_url("https://youtu.be/abc")
+    prueba = next(a for a in falso.llamadas if a[-1] == resolver.VIDEO_DE_PRUEBA and "android_vr" in a[a.index("--extractor-args") + 1])
+    assert prueba[:-1] == falso.llamadas[-1][:-1]
+    assert prueba[0] == "/otro/yt-dlp"
+    assert resolver.FORMATO in prueba and "--get-url" in prueba and "--no-playlist" in prueba
+
+
+async def test_una_prueba_del_sondeo_que_se_pasa_del_timeout_se_mata_y_se_sigue(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"ios"}, colgar={"android_vr"})
+    res = _resolver_que_rota(timeout=0.01)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert falso.pruebas == ["android_vr", "ios"]
+    assert res.cliente == "ios"
+    assert falso.de("pedir")[resolver.FALLOS_PARA_SONDEAR].matado
+
+
+async def test_el_sondeo_no_toca_el_contador_ni_la_tabla_de_videos_sin_caso(monkeypatch):
+    falso = _yt_dlp(monkeypatch, error_de_prueba=ERROR_DEFINITIVO)
+    res = _resolver_que_rota()
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert falso.pruebas == ["android_vr", "ios", "mweb"]
+    assert res._fallos_seguidos == resolver.FALLOS_PARA_SONDEAR
+    assert res._sin_caso == {}
+    assert res.cliente == "android"
+
+
+async def test_sin_ningun_cliente_que_funcione_queda_un_error_en_el_log(monkeypatch, caplog):
+    _yt_dlp(monkeypatch)
+    res = _resolver_que_rota()
+    with caplog.at_level("ERROR", logger="resolver"):
+        await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+        await _terminar_sondeo(res)
+    assert "Ningún cliente de YouTube" in caplog.text
+    assert res.cliente == "android"
+
+
+async def test_sin_actualizacion_automatica_el_sondeo_no_actualiza_nada(monkeypatch, caplog):
+    falso = _yt_dlp(monkeypatch)
+    res = _resolver_que_rota(autoactualizar=False)
+    with caplog.at_level("ERROR", logger="resolver"):
+        await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+        await _terminar_sondeo(res)
+    assert falso.actualizaciones == []
+    assert "YTDLP_AUTOACTUALIZAR" in caplog.text
+
+
+async def test_si_un_cliente_sirve_no_se_actualiza_nada(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"mweb"})
+    res = _resolver_que_rota(autoactualizar=True)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert res.cliente == "mweb"
+    assert falso.actualizaciones == []
+
+
+async def test_sin_ninguno_que_funcione_actualiza_y_vuelve_a_sondear_empezando_por_el_actual(monkeypatch):
+    falso = _yt_dlp(monkeypatch, al_actualizar=lambda f: f.funcionan.add("android"))
+    res = _resolver_que_rota(autoactualizar=True)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert falso.actualizaciones == [["/otro/yt-dlp", "-U"]]
+    assert falso.pruebas == ["android_vr", "ios", "mweb", "android"]
+    orden = [t for t in falso.orden if t in ("pedir", "actualizar", "actualizada")]
+    assert orden == ["pedir"] * (resolver.FALLOS_PARA_SONDEAR + 3) + ["actualizar", "actualizada", "pedir"]
+    assert res.cliente == "android"
+    assert res._fallos_seguidos == 0
+
+
+async def test_el_resondeo_tras_actualizar_ocurre_una_sola_vez(monkeypatch, caplog):
+    falso = _yt_dlp(monkeypatch)
+    res = _resolver_que_rota(autoactualizar=True)
+    with caplog.at_level("ERROR", logger="resolver"):
+        await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+        await _terminar_sondeo(res)
+    assert len(falso.actualizaciones) == 1
+    assert falso.pruebas == ["android_vr", "ios", "mweb", "android", "android_vr", "ios", "mweb"]
+    assert "sigue sin sonar" in caplog.text
+
+
+async def test_si_la_actualizacion_falla_no_se_vuelve_a_sondear(monkeypatch):
+    falso = _yt_dlp(monkeypatch, actualizacion=1)
+    res = _resolver_que_rota(autoactualizar=True)
+    await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+    await _terminar_sondeo(res)
+    assert len(falso.actualizaciones) == 1
+    assert falso.pruebas == ["android_vr", "ios", "mweb"]
+
+
+async def test_un_sondeo_que_revienta_no_escapa_como_tarea_no_recuperada(monkeypatch, caplog):
+    sin_atender = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, contexto: sin_atender.append(contexto))
+    _yt_dlp(monkeypatch)
+    res = _resolver_que_rota()
+
+    async def _revienta(**kwargs):
+        raise RuntimeError("algo que nadie previó")
+
+    monkeypatch.setattr(res, "_rotar_cliente", _revienta)
+    with caplog.at_level("ERROR", logger="resolver"):
+        await _fallar(res, resolver.FALLOS_PARA_SONDEAR)
+        await _terminar_sondeo(res)
+        gc.collect()
+        await asyncio.sleep(0)
+    assert sin_atender == []
+    assert "Falló el sondeo" in caplog.text
+
+
+# --- actualizar yt-dlp -----------------------------------------------------------------
+
+async def test_el_yt_dlp_del_venv_se_actualiza_con_pip(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    res = resolver.Resolver(binario=os.path.join(os.path.dirname(sys.executable), "yt-dlp"), reloj=Reloj())
+    assert await res.actualizar_ytdlp() is True
+    assert falso.actualizaciones == [[sys.executable, "-m", "pip", "install", "-U", "yt-dlp"]]
+
+
+def test_la_comparacion_de_carpetas_no_resuelve_symlinks(monkeypatch):
+    monkeypatch.setattr(resolver.sys, "executable", "/proyecto/.venv/bin/python")
+    venv = resolver.Resolver(binario="/proyecto/.venv/bin/yt-dlp")
+    otro = resolver.Resolver(binario="/usr/local/bin/yt-dlp")
+    assert venv._comando_de_actualizacion() == ["/proyecto/.venv/bin/python", "-m", "pip", "install", "-U", "yt-dlp"]
+    assert otro._comando_de_actualizacion() == ["/usr/local/bin/yt-dlp", "-U"]
+
+
+async def test_cualquier_otro_yt_dlp_se_actualiza_a_si_mismo(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    assert await _resolver_que_rota().actualizar_ytdlp() is True
+    assert falso.actualizaciones == [["/otro/yt-dlp", "-U"]]
+
+
+async def test_tras_actualizar_se_vuelve_a_leer_la_version(monkeypatch, caplog):
+    monkeypatch.setattr(resolver, "_hoy", lambda: date(2026, 10, 22))
+    falso = _yt_dlp(monkeypatch, version="2026.07.04")
+    res = _resolver_que_rota()
+    await res.revisar_ytdlp()
+    assert res.estado_ytdlp()["viejo"] is True
+    falso.al_actualizar = lambda f: setattr(f, "version", "2026.10.20")
+    with caplog.at_level("INFO", logger="resolver"):
+        assert await res.actualizar_ytdlp() is True
+    assert falso.orden[-2:] == ["actualizada", "version"]
+    assert res.estado_ytdlp()["version"] == "2026.10.20"
+    assert res.estado_ytdlp()["viejo"] is False
+    assert "2026.07.04 -> 2026.10.20" in caplog.text
+
+
+async def test_si_la_actualizacion_sale_con_error_se_devuelve_false_y_queda_en_el_log(monkeypatch, caplog):
+    falso = _yt_dlp(monkeypatch, actualizacion=1)
+    res = _resolver_que_rota()
+    with caplog.at_level("ERROR", logger="resolver"):
+        assert await res.actualizar_ytdlp() is False
+    assert "No pude actualizar yt-dlp" in caplog.text
+    assert "Successfully installed" in caplog.text
+    assert falso.versiones_pedidas == 0
+    assert res._ytdlp_libre.is_set()
+
+
+async def test_si_no_se_puede_lanzar_la_actualizacion_se_devuelve_false(monkeypatch, caplog):
+    async def _exec(*args, **kwargs):
+        raise FileNotFoundError("no existe")
+
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+    res = _resolver_que_rota()
+    with caplog.at_level("ERROR", logger="resolver"):
+        assert await res.actualizar_ytdlp() is False
+    assert "No pude lanzar la actualización" in caplog.text
+    assert res._ytdlp_libre.is_set()
+
+
+async def test_una_actualizacion_que_se_pasa_del_tiempo_se_corta(monkeypatch, caplog):
+    monkeypatch.setattr(resolver, "TIMEOUT_DE_ACTUALIZACION", 0.01)
+    falso = _yt_dlp(monkeypatch, frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota()
+    with caplog.at_level("ERROR", logger="resolver"):
+        assert await res.actualizar_ytdlp() is False
+    assert falso.de("actualizar")[0].matado
+    assert "se pasó" in caplog.text
+    assert res._ytdlp_libre.is_set()
+
+
+async def test_entre_un_intento_de_actualizar_y_el_siguiente_pasa_actualizar_cada(monkeypatch):
+    falso = _yt_dlp(monkeypatch)
+    reloj = Reloj()
+    res = _resolver_que_rota(reloj=reloj)
+    assert await res.actualizar_ytdlp() is True
+    reloj.t += resolver.ACTUALIZAR_CADA - 1
+    assert await res.actualizar_ytdlp() is False
+    assert len(falso.actualizaciones) == 1
+    reloj.t += 1
+    assert await res.actualizar_ytdlp() is True
+    assert len(falso.actualizaciones) == 2
+
+
+async def test_un_intento_fallido_tambien_espera_actualizar_cada(monkeypatch):
+    falso = _yt_dlp(monkeypatch, actualizacion=1)
+    res = _resolver_que_rota()
+    assert await res.actualizar_ytdlp() is False
+    assert await res.actualizar_ytdlp() is False
+    assert len(falso.actualizaciones) == 1
+
+
+async def test_dos_actualizaciones_a_la_vez_lanzan_un_solo_comando(monkeypatch):
+    falso = _yt_dlp(monkeypatch, frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota()
+    primera = asyncio.create_task(res.actualizar_ytdlp())
+    await _dejar_correr()
+    assert await res.actualizar_ytdlp() is False
+    falso.frenar_actualizacion.set()
+    assert await primera is True
+    assert len(falso.actualizaciones) == 1
+
+
+async def test_mientras_se_actualiza_direct_url_espera_a_que_termine(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"android"}, frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota()
+    actualizando = asyncio.create_task(res.actualizar_ytdlp())
+    await _dejar_correr()
+    assert len(falso.actualizaciones) == 1
+    pidiendo = asyncio.create_task(res.direct_url("https://youtu.be/abc"))
+    await _dejar_correr()
+    assert not pidiendo.done()
+    assert falso.pedidas == []
+    falso.frenar_actualizacion.set()
+    assert await actualizando is True
+    assert await pidiendo == URL_DE_AUDIO
+    assert falso.orden.index("actualizada") < falso.orden.index("pedir")
+
+
+async def test_la_actualizacion_espera_a_los_yt_dlp_en_curso(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"android"}, frenar_pedidas=asyncio.Event())
+    res = _resolver_que_rota()
+    pidiendo = asyncio.create_task(res.direct_url("https://youtu.be/abc"))
+    await _dejar_correr()
+    actualizando = asyncio.create_task(res.actualizar_ytdlp())
+    await _dejar_correr()
+    assert falso.actualizaciones == []
+    falso.frenar_pedidas.set()
+    assert await pidiendo == URL_DE_AUDIO
+    assert await actualizando is True
+    assert len(falso.actualizaciones) == 1
+
+
+async def test_el_sondeo_tambien_espera_a_que_termine_la_actualizacion(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"ios"}, frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota()
+    actualizando = asyncio.create_task(res.actualizar_ytdlp())
+    await _dejar_correr()
+    res._sondeo = asyncio.create_task(res._sondear())
+    await _dejar_correr()
+    assert falso.pruebas == []
+    falso.frenar_actualizacion.set()
+    await actualizando
+    await _terminar_sondeo(res)
+    assert res.cliente == "ios"
+
+
+async def test_fuera_de_una_actualizacion_las_resoluciones_corren_en_paralelo(monkeypatch):
+    falso = _yt_dlp(monkeypatch, funcionan={"android"}, frenar_pedidas=asyncio.Event())
+    res = _resolver_que_rota()
+    uno = asyncio.create_task(res.direct_url("https://youtu.be/uno"))
+    otro = asyncio.create_task(res.direct_url("https://youtu.be/otro"))
+    await _dejar_correr()
+    assert len(falso.pedidas) == 2
+    falso.frenar_pedidas.set()
+    assert await uno == URL_DE_AUDIO and await otro == URL_DE_AUDIO
+
+
+async def test_cancelar_una_actualizacion_mata_al_comando_y_deja_libre_a_yt_dlp(monkeypatch):
+    falso = _yt_dlp(monkeypatch, frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota()
+    tarea = asyncio.create_task(res.actualizar_ytdlp())
+    await _dejar_correr()
+    assert not res._ytdlp_libre.is_set()
+    await _cancelar(tarea)
+    assert falso.de("actualizar")[0].matado
+    assert res._ytdlp_libre.is_set()
+
+
+# --- mantener_al_dia ---------------------------------------------------------------------
+
+@pytest.fixture
+def hoy(monkeypatch):
+    """Día fijo: `2026.07.04` es viejo (110 días) y `2026.10.20` no."""
+    monkeypatch.setattr(resolver, "_hoy", lambda: date(2026, 10, 22))
+
+
+async def _mantener(res, segundos=0.0):
+    tarea = asyncio.create_task(res.mantener_al_dia())
+    await _dejar_correr()
+    if segundos:
+        await asyncio.sleep(segundos)
+    await _cancelar(tarea)
+
+
+async def test_si_esta_vieja_y_la_opcion_esta_activa_se_actualiza(monkeypatch, hoy):
+    falso = _yt_dlp(monkeypatch, version="2026.07.04", al_actualizar=lambda f: setattr(f, "version", "2026.10.20"))
+    res = _resolver_que_rota(autoactualizar=True)
+    await _mantener(res)
+    assert len(falso.actualizaciones) == 1
+    assert (res.estado_ytdlp()["version"], res.estado_ytdlp()["viejo"]) == ("2026.10.20", False)
+
+
+@pytest.mark.parametrize("version, autoactualizar", [("2026.07.04", False), ("2026.10.20", True)])
+async def test_no_se_actualiza_si_no_esta_vieja_o_la_opcion_esta_apagada(monkeypatch, hoy, version, autoactualizar):
+    falso = _yt_dlp(monkeypatch, version=version)
+    res = _resolver_que_rota(autoactualizar=autoactualizar)
+    await _mantener(res)
+    assert falso.actualizaciones == []
+    assert res.estado_ytdlp()["version"] == version
+
+
+async def test_mantener_al_dia_repite_la_revision_cada_revisar_cada(monkeypatch, hoy):
+    monkeypatch.setattr(resolver, "REVISAR_CADA", 0.01)
+    falso = _yt_dlp(monkeypatch, version="2026.10.20")
+    await _mantener(_resolver_que_rota(), segundos=0.2)
+    assert falso.versiones_pedidas >= 3
+
+
+async def test_si_la_actualizacion_no_arregla_la_version_no_se_reintenta_en_bucle(monkeypatch, hoy):
+    monkeypatch.setattr(resolver, "REVISAR_CADA", 0.01)
+    falso = _yt_dlp(monkeypatch, version="2026.07.04")
+    await _mantener(_resolver_que_rota(autoactualizar=True), segundos=0.2)
+    assert falso.versiones_pedidas >= 3
+    assert len(falso.actualizaciones) == 1
+
+
+async def test_mantener_al_dia_se_cancela_limpio_mientras_duerme(monkeypatch, hoy):
+    _yt_dlp(monkeypatch, version="2026.10.20")
+    tarea = asyncio.create_task(_resolver_que_rota().mantener_al_dia())
+    await _dejar_correr()
+    await _cancelar(tarea)
+    assert tarea.cancelled()
+
+
+async def test_mantener_al_dia_cancelada_en_plena_actualizacion_no_deja_huerfano_a_pip(monkeypatch, hoy):
+    falso = _yt_dlp(monkeypatch, version="2026.07.04", frenar_actualizacion=asyncio.Event())
+    res = _resolver_que_rota(autoactualizar=True)
+    tarea = asyncio.create_task(res.mantener_al_dia())
+    await _dejar_correr()
+    assert not res._ytdlp_libre.is_set()
+    await _cancelar(tarea)
+    assert falso.de("actualizar")[0].matado
+    assert res._ytdlp_libre.is_set()
+
+
+async def test_un_tropiezo_en_la_revision_no_mata_la_tarea(monkeypatch, caplog):
+    monkeypatch.setattr(resolver, "REVISAR_CADA", 0.01)
+    res = _resolver_que_rota()
+    llamadas = []
+
+    async def _revisar():
+        llamadas.append(1)
+        if len(llamadas) == 1:
+            raise RuntimeError("algo que nadie previó")
+        return {}
+
+    monkeypatch.setattr(res, "revisar_ytdlp", _revisar)
+    with caplog.at_level("ERROR", logger="resolver"):
+        await _mantener(res, segundos=0.1)
+    assert len(llamadas) >= 2
+    assert "Falló la revisión de yt-dlp" in caplog.text
+
+
+# --- el estado que ven los paneles -----------------------------------------------------------
+
+def test_el_estado_de_yt_dlp_trae_el_cliente_actual_y_el_configurado():
+    res = resolver.Resolver(cliente="android")
+    assert res.estado_ytdlp() == {
+        "version": None, "dias": None, "viejo": False,
+        "cliente": "android", "cliente_configurado": "android",
+    }
+    res.cliente = "android_vr"
+    assert res.estado_ytdlp()["cliente"] == "android_vr"
+    assert res.estado_ytdlp()["cliente_configurado"] == "android"
+
+
+async def test_el_estado_de_yt_dlp_conserva_lo_de_siempre(monkeypatch, hoy):
+    _yt_dlp(monkeypatch, version="2026.07.04")
+    res = _resolver_que_rota()
+    await res.revisar_ytdlp()
+    estado = res.estado_ytdlp()
+    assert (estado["version"], estado["dias"], estado["viejo"]) == ("2026.07.04", 110, True)
+
+
+def test_sin_argumentos_el_resolver_toma_los_clientes_y_la_actualizacion_de_la_configuracion(monkeypatch):
+    monkeypatch.setattr(resolver.config, "YTDLP_CLIENTES", ("ios", "web"))
+    monkeypatch.setattr(resolver.config, "YTDLP_AUTOACTUALIZAR", False)
+    res = resolver.Resolver()
+    assert res.clientes == ("ios", "web")
+    assert res.autoactualizar is False
+    monkeypatch.setattr(resolver.config, "YTDLP_AUTOACTUALIZAR", True)
+    assert res.autoactualizar is False
+
+
+def test_los_argumentos_del_constructor_ganan_para_los_clientes_y_la_actualizacion(monkeypatch):
+    monkeypatch.setattr(resolver.config, "YTDLP_AUTOACTUALIZAR", False)
+    res = resolver.Resolver(clientes=["web"], autoactualizar=True)
+    assert res.clientes == ("web",)
+    assert res.autoactualizar is True

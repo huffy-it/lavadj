@@ -213,16 +213,20 @@ async def main():
     # Después de bindear el puerto, no antes: si ya hay otro bot corriendo, esto
     # muere aquí con "address in use" sin haberle borrado los clips en uso.
     log.info("Caché limpiada: %s del DJ", purge_dj_cache())
+    mantenimiento = None
     try:
         async with bot:
             await bot.load_extension('cogs.music')
             bot.loop.create_task(conectar_lavalink())
-            # yt-dlp saca todo el audio y nadie mira si quedó viejo. Se pregunta
-            # una vez al arrancar y queda anotado para que lo muestre el panel.
-            bot.loop.create_task(bot.resolver.revisar_ytdlp())
+            # yt-dlp se queda viejo con el bot arriba: se revisa al arrancar y cada día.
+            mantenimiento = bot.loop.create_task(bot.resolver.mantener_al_dia())
             bot.loop.create_task(esperar_orden_de_apagado(apagar))
             await bot.start(config.DISCORD_TOKEN)
     finally:
+        if mantenimiento is not None:
+            # Cancelar corta una actualización a medias. Con plazo: wait_for puede tragarse una cancelación.
+            mantenimiento.cancel()
+            await asyncio.wait([mantenimiento], timeout=5)
         await api_runner.cleanup()
 
 
