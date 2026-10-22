@@ -141,6 +141,102 @@ async def test_cerrar_sin_haber_llegado_a_lanzar_el_mantenimiento_no_estorba(bot
         await bot_mod.main()
 
 
+# --- la cola en disco: retomarla al arrancar y guardarla al cerrar ------------
+
+class CogQueAnota:
+    """De cada llamada que bot.py le hace al cog, solo importa el orden."""
+
+    def __init__(self, orden):
+        self.orden = orden
+
+    async def recuperar_players(self, players):
+        self.orden.append("recuperar")
+
+    async def retomar_guardadas(self):
+        self.orden.append("retomar")
+
+    async def guardar_y_cerrar(self):
+        self.orden.append("guardar")
+
+
+def _nodo_listo(resumed):
+    return SimpleNamespace(resumed=resumed, node=SimpleNamespace(uri="http://127.0.0.1:2333", players={}))
+
+
+def _bot_con(bot_mod, monkeypatch, cog, voice_clients=(), close=None):
+    falso = SimpleNamespace(get_cog=lambda nombre: cog, voice_clients=list(voice_clients), close=close)
+    monkeypatch.setattr(bot_mod, "bot", falso)
+
+
+async def test_lo_guardado_se_retoma_una_sola_vez_aunque_el_nodo_reconecte(bot_mod, monkeypatch):
+    orden = []
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden))
+
+    for _ in range(3):
+        await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
+
+    assert orden == ["recuperar", "retomar", "recuperar", "recuperar"]
+
+
+async def test_una_sesion_reanudada_no_retoma_nada_pero_la_primera_nueva_si(bot_mod, monkeypatch):
+    orden = []
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden))
+
+    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=True))
+    assert orden == []
+
+    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
+    assert orden == ["recuperar", "retomar"]
+
+
+async def test_sin_el_cog_cargado_el_nodo_listo_no_falla(bot_mod, monkeypatch):
+    _bot_con(bot_mod, monkeypatch, None)
+
+    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
+
+
+async def test_al_apagar_se_guarda_antes_de_desconectar_los_players(bot_mod, monkeypatch):
+    orden = []
+
+    class Voz:
+        guild = "servidor"
+
+        async def disconnect(self):
+            orden.append("desconectar")
+
+    async def _cerrar():
+        orden.append("cerrar")
+
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden), [Voz(), Voz()], _cerrar)
+    apagar = asyncio.Event()
+    apagar.set()
+
+    await bot_mod.esperar_orden_de_apagado(apagar)
+
+    assert orden == ["guardar", "desconectar", "desconectar", "cerrar"]
+
+
+async def test_al_apagar_sin_el_cog_cargado_igual_se_desconecta_y_se_cierra(bot_mod, monkeypatch):
+    orden = []
+
+    class Voz:
+        guild = "servidor"
+
+        async def disconnect(self):
+            orden.append("desconectar")
+
+    async def _cerrar():
+        orden.append("cerrar")
+
+    _bot_con(bot_mod, monkeypatch, None, [Voz()], _cerrar)
+    apagar = asyncio.Event()
+    apagar.set()
+
+    await bot_mod.esperar_orden_de_apagado(apagar)
+
+    assert orden == ["desconectar", "cerrar"]
+
+
 # --- Lista blanca de servidores ----------------------------------------------
 
 def _servidor(id_, nombre="Servidor"):

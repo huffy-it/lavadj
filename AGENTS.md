@@ -60,6 +60,7 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/dj.py`, `tts.py`, `feeds.py` | DJ de radio: noticias → espeak-ng → `dj_cache/*.wav` |
 | `core/spotify.py` | Embed público: de Spotify salen **solo nombres**, nunca audio |
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
+| `core/persistencia.py` | La cola de cada servidor en `estado/colas.json` (no se versiona): el cog la guarda sola y el bot la retoma al volver, si hay gente en el canal y no pasaron 6 h |
 | `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte): solo la ventana y el arranque |
 | `scripts/lavadj_panel_logica.py` | Lo del panel sin GTK (API del bot, arranque, textos, ajustes), con tests |
 | `scripts/lavadj-panel.css` | Estilo del panel; si falta, arranca sin estilo y avisa por stderr |

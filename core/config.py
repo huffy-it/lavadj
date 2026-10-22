@@ -142,3 +142,7 @@ INACTIVE_CHANNEL_TOKENS = _entero("INACTIVE_CHANNEL_TOKENS", 3)
 
 # Sin música y sin nadie pidiendo nada, el bot se va del canal.
 IDLE_TIMEOUT = _entero("IDLE_TIMEOUT", 300)
+
+# --- Estado en disco -----------------------------------------------------------
+# La cola de cada servidor, para retomarla si el bot se reinicia (core/persistencia.py).
+ARCHIVO_DE_COLAS = PROJECT_ROOT / "estado" / "colas.json"

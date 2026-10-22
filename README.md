@@ -17,6 +17,9 @@ presenta el tema que viene y lee titulares de noticias con voz sintética.
 - Un **DJ de radio** mete cortes hablados entre canciones (voz de `espeak-ng` con
   filtro de radio vía ffmpeg).
 - **Autoplay**: al acabarse la cola sigue solo con temas parecidos.
+- **Retoma la cola si se reinicia el bot**: la guarda en `estado/colas.json` y, al
+  volver, entra al canal donde haya gente y sigue por donde iba (hasta 6 horas
+  después). Un `!stop` o la salida por inactividad la borran.
 - Dos paneles de control en tu máquina: uno web (cualquier sistema) y uno de
   escritorio GTK4 (solo Linux).
 - Funciona en Linux y en Windows.

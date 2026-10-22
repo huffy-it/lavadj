@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 import wavelink
 
-from core import cola_spotify, config, controller, lyrics, resolver, spotify, tts
+from core import cola_spotify, config, controller, lyrics, persistencia, resolver, spotify, tts
 from core.dj import DJ
 from core.estacion import Estacion
 from core.feeds import FeedCache
@@ -32,6 +32,13 @@ AVISO_NODO_REINICIADO = (
 
 # Se actúa a la segunda revisión atascada: un mudo dura entre 20 y 40 s.
 VIGILAR_CADA = 20
+
+# Cada cuánto se fotografían las colas: es lo máximo que se pierde si el bot se cae de golpe.
+GUARDAR_CADA = 15
+# Aunque nada cambie, se reescribe cada tanto para que la posición y la hora no queden viejas.
+REFRESCAR_CADA = 60
+
+AVISO_RETOMADA = "Volví: sigo con la cola."
 
 
 def en_el_mismo_canal():
@@ -71,6 +78,13 @@ class Music(commands.Cog):
         # referencias débiles y una tarea sin dueño puede recolectarse a medias.
         self._tareas: set[asyncio.Task] = set()
         self._vigilante: asyncio.Task | None = None
+        self._guardador: asyncio.Task | None = None
+        # De lo último escrito en disco, para no reescribirlo si nada cambió.
+        self._huella: str | None = None
+        self._escrita = 0.0
+        # esperando -> retomando -> activa -> cerrada. Solo en `activa` se escribe: antes, una
+        # foto vacía pisaría las guardadas que aún no se leyeron; después de cerrar, también.
+        self._persistencia = "esperando"
         # Cómo viene la transmisión. Lo lee el panel por la API y lo dice el DJ.
         self.salud = Salud()
         self.dj = DJ()
@@ -105,6 +119,7 @@ class Music(commands.Cog):
         else:
             log.info("DJ activo (%s feeds)", len(feed_urls))
         self._vigilante = self._segundo_plano(self._vigilar())
+        self._guardador = self._segundo_plano(self._guardar_en_bucle())
 
     async def cog_unload(self):
         for est in self._estaciones.values():
@@ -182,6 +197,8 @@ class Music(commands.Cog):
             vc.queue.clear()
             vc.auto_queue.clear()
             await vc.disconnect()
+        # Después de desconectar: mientras tanto el guardador aún pudo fotografiar el player.
+        persistencia.borrar(guild.id)
         panel = est.panel
         await self._delete_panel(guild.id)
         self._estaciones.pop(guild.id, None)
@@ -586,6 +603,139 @@ class Music(commands.Cog):
             resolver.titulo_de(proximo(vc)),
         )
         await self._arrancar_si_hace_falta(vc, incluir_autoplay=True)
+
+    # --- colas en disco ------------------------------------------------------
+    def _fotos(self) -> dict[int, dict]:
+        """La foto de cada player conectado que tenga algo que retomar."""
+        fotos = {}
+        for vc in self._players_del_bot():
+            try:
+                if getattr(vc, "guild", None) is None or not vc.connected:
+                    continue
+                foto = persistencia.tomar(
+                    vc, posicion=self._posicion(vc), es_clip=self.locutor.es_clip,
+                    autoplay=self.autoplay_activo(vc.guild.id),
+                )
+            except Exception:  # noqa: BLE001 - un servidor roto no frena a los demás
+                log.exception("No pude fotografiar la cola de %s", getattr(vc, "guild", "?"))
+                continue
+            if foto:
+                fotos[vc.guild.id] = foto
+        return fotos
+
+    def _guardar(self, *, siempre: bool) -> None:
+        """Escribe las colas de los players conectados; sin `siempre`, solo si algo cambió o pasó `REFRESCAR_CADA`."""
+        fotos = self._fotos()
+        huella = persistencia.huella(fotos)
+        ahora = time.monotonic()
+        if siempre or huella != self._huella or (fotos and ahora - self._escrita >= REFRESCAR_CADA):
+            persistencia.guardar(fotos)
+            self._huella, self._escrita = huella, ahora
+
+    async def _guardar_en_bucle(self) -> None:
+        """Fotografía las colas cada `GUARDAR_CADA`, mientras el cog esté cargado."""
+        while True:
+            await asyncio.sleep(GUARDAR_CADA)
+            if self._persistencia != "activa":
+                continue
+            try:
+                self._guardar(siempre=False)
+            except Exception:  # noqa: BLE001 - un tropiezo no puede matar al guardador
+                log.exception("No pude guardar las colas: sigo con la próxima")
+
+    async def guardar_y_cerrar(self) -> None:
+        """Escribe la foto final y deja de escribir.
+
+        Hay que llamarlo antes de desconectar los players: sin ellos, la tarea
+        periódica guardaría una foto vacía y se perdería la cola.
+        """
+        if self._persistencia == "activa":
+            try:
+                self._guardar(siempre=True)
+            except Exception:  # noqa: BLE001 - cerrar tiene que seguir pase lo que pase
+                log.exception("No pude guardar la foto final de las colas")
+        self._persistencia = "cerrada"
+        tarea, self._guardador = self._guardador, None
+        if tarea:
+            tarea.cancel()
+            await asyncio.gather(tarea, return_exceptions=True)
+
+    async def retomar_guardadas(self) -> None:
+        """Retoma las colas que dejó guardadas el bot anterior; una sola vez por arranque."""
+        if self._persistencia != "esperando":
+            return
+        self._persistencia = "retomando"
+        try:
+            # Sin la caché de servidores y canales no hay a dónde entrar.
+            await self.bot.wait_until_ready()
+            for guild_id, foto in persistencia.cargar().items():
+                try:
+                    await self._retomar_guardada(guild_id, foto)
+                except Exception:  # noqa: BLE001 - un servidor roto no frena a los demás
+                    log.exception("No pude retomar la cola de %s", guild_id)
+        finally:
+            if self._persistencia == "retomando":
+                self._persistencia = "activa"
+
+    async def _retomar_guardada(self, guild_id: int, foto: dict) -> None:
+        """Entra al canal de voz de la foto y sigue por donde iba, si hay a quién tocarle."""
+        guild = self.bot.get_guild(guild_id)
+        canal = guild.get_channel(foto["voz"]) if guild else None
+        if config.SERVIDORES_PERMITIDOS and guild_id not in config.SERVIDORES_PERMITIDOS:
+            motivo = "no está en SERVIDORES_PERMITIDOS"
+        elif guild is None:
+            motivo = "el bot ya no está ahí"
+        elif guild.voice_client:
+            motivo = "ya hay una transmisión"
+        elif canal is None:
+            motivo = "el canal de voz ya no existe"
+        elif all(m.bot for m in canal.members):
+            motivo = "no hay nadie en el canal"
+        else:
+            motivo = None
+        if motivo:
+            log.info("No retomo la cola de %s: %s", guild_id, motivo)
+            return
+        vc = await canal.connect(cls=resolver.ResolvingPlayer)
+        try:
+            vc.resolver = self.resolver
+            vc.text_channel = guild.get_channel_or_thread(foto["texto"]) if foto["texto"] else None
+            self._autoplay[guild_id] = foto["autoplay"]
+            self._aplicar_autoplay(vc)
+            vc.queue.mode = wavelink.QueueMode.__members__.get(foto["modo"], wavelink.QueueMode.normal)
+            await vc.set_volume(foto["volumen"])
+            for datos in foto["cola"]:
+                if pista := self._pista(datos):
+                    await vc.queue.put_wait(pista)
+            actual = self._pista(foto["actual"]) if foto["actual"] else None
+            if actual:
+                # Igual que `_retomar`: pasa por `ResolvingPlayer.play`, que pide una URL fresca.
+                await vc.play(actual, start=foto["posicion"], paused=foto["pausado"], add_history=False)
+            else:
+                await self._arrancar_si_hace_falta(vc)
+            if not self._ocupado(vc):
+                raise RuntimeError("no quedó nada que tocar")
+        except Exception:
+            await self.teardown(guild)
+            raise
+        log.info("Retomé la cola de %s (%s temas esperando)", guild, len(vc.queue))
+        if vc.text_channel:
+            try:
+                await vc.text_channel.send(AVISO_RETOMADA)
+            except discord.HTTPException:
+                log.debug("no pude avisar que retomé la cola", exc_info=True)
+
+    @staticmethod
+    def _pista(datos: dict) -> wavelink.Playable | None:
+        """Rearma una pista guardada; None si ya no se puede."""
+        try:
+            pista = wavelink.Playable({k: v for k, v in datos.items() if k != persistencia.PEDIDO_POR})
+        except Exception as error:  # noqa: BLE001 - viene de un archivo, de cualquier versión
+            log.warning("Descarto una pista guardada que no se puede rearmar: %r", error)
+            return None
+        if persistencia.PEDIDO_POR in datos:
+            pista.requester = datos[persistencia.PEDIDO_POR]
+        return pista
 
     @commands.command(name='play', aliases=['p'])
     async def play(self, ctx: commands.Context, *, query: str):

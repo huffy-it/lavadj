@@ -6,6 +6,7 @@ autoplay, y el par de banderas de estado.
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,7 @@ from discord.ext import commands
 
 from cogs import music as music_mod
 from cogs.music import Music
-from core import config
+from core import config, persistencia
 from core.dj import Clip
 from core.locutor import Locutor
 from core.reintentos import CAIDAS_SEGUIDAS_MAX, REINTENTOS_POR_PISTA
@@ -1626,3 +1627,688 @@ async def test_cancelar_la_carga_de_spotify_suelta_la_tarea_de_la_estacion(cog, 
     assert tarea.cancelled()
     assert est.spotify is None
     assert ctx.enviados == []
+
+
+# --- la cola en disco ------------------------------------------------------------------
+
+def _raw(titulo, uri=None):
+    return {
+        "encoded": f"enc-{titulo}",
+        "info": {
+            "identifier": titulo, "isSeekable": True, "author": "alguien", "length": 180_000,
+            "isStream": False, "position": 0, "title": titulo,
+            "uri": uri or f"https://www.youtube.com/watch?v={titulo}", "sourceName": "youtube",
+        },
+        "pluginInfo": {},
+        "userData": {},
+    }
+
+
+def _foto_guardada(**cambios):
+    foto = {
+        "voz": 10, "texto": 20, "actual": _raw("sonando"), "posicion": 95_000,
+        "cola": [_raw("uno"), _raw("dos")], "modo": "loop", "volumen": 55,
+        "pausado": True, "autoplay": False, "hora": time.time(),
+    }
+    return {**foto, **cambios}
+
+
+class ColaConModo(FakeQueue):
+    mode = wavelink.QueueMode.normal
+
+
+class PlayerRetomable(FakePlayer):
+    """Un player de wavelink recién conectado, con lo que `retomar_guardadas` le toca."""
+
+    def __init__(self, guild):
+        super().__init__(guild=guild)
+        self.queue = ColaConModo()
+        self.volume = 100
+        self.current = None
+        self.llamadas = []
+        self.falla_el_play = False
+
+    async def play(self, track, **kwargs):
+        if self.falla_el_play:
+            raise RuntimeError("Lavalink no responde")
+        self.llamadas.append((track, kwargs))
+        self.current = track
+        self.playing = True
+
+    async def set_volume(self, valor):
+        self.volume = valor
+
+    async def disconnect(self):
+        self.connected = False
+        self.guild.voice_client = None
+
+
+class CanalDeVozRetomable:
+    def __init__(self, id_, guild, humanos):
+        self.id = id_
+        self.guild = guild
+        self.members = [SimpleNamespace(bot=False)] * humanos + [SimpleNamespace(bot=True)]
+        self.conexiones = 0
+        self.clase = None
+        self.player = None
+        self.falla_al_conectar = False
+
+    async def connect(self, *, cls):
+        self.conexiones += 1
+        if self.falla_al_conectar:
+            raise RuntimeError("timeout")
+        self.clase = cls
+        self.player = PlayerRetomable(self.guild)
+        self.guild.voice_client = self.player
+        return self.player
+
+
+class ServidorRetomable(FakeGuild):
+    def __init__(self, guild_id):
+        super().__init__(guild_id)
+        self.voice_client = None
+        self.canales = {}
+
+    def get_channel(self, id_):
+        return self.canales.get(id_)
+
+    get_channel_or_thread = get_channel
+
+
+class DiscordFalso:
+    """Lo que el cog le pregunta al bot al retomar: los servidores y cuándo está listo."""
+
+    def __init__(self):
+        self.guilds = {}
+        self.listo = False
+        self.voice_clients = []
+
+    def servidor(self, guild_id, voz=10, texto=20, humanos=1):
+        guild = ServidorRetomable(guild_id)
+        guild.canales[voz] = CanalDeVozRetomable(voz, guild, humanos)
+        guild.canales[texto] = FakeCanalTexto()
+        guild.canales[texto].id = texto
+        self.guilds[guild_id] = guild
+        return guild
+
+    def get_guild(self, guild_id):
+        return self.guilds.get(guild_id)
+
+    async def wait_until_ready(self):
+        self.listo = True
+
+
+@pytest.fixture
+def discord_falso(cog, monkeypatch):
+    monkeypatch.setattr(music_mod.config, "SERVIDORES_PERMITIDOS", frozenset())
+    cog.bot = DiscordFalso()
+    return cog.bot
+
+
+@pytest.fixture
+def ticks(monkeypatch):
+    """`asyncio.sleep` que solo cede el turno: cada vuelta de un bucle es un tick."""
+    esperar = asyncio.sleep
+
+    async def _ceder(_segundos):
+        await esperar(0)
+
+    monkeypatch.setattr(music_mod.asyncio, "sleep", _ceder)
+    return esperar
+
+
+@pytest.fixture
+def escrituras(monkeypatch):
+    """Las fotos que se escriben a disco, una por escritura."""
+    hechas = []
+    original = persistencia.guardar
+
+    def _espia(fotos, *args, **kwargs):
+        hechas.append(fotos)
+        return original(fotos, *args, **kwargs)
+
+    monkeypatch.setattr(persistencia, "guardar", _espia)
+    return hechas
+
+
+async def _correr_ticks(cog, ticks, veces=10):
+    tarea = asyncio.create_task(cog._guardar_en_bucle())
+    for _ in range(veces):
+        await ticks(0)
+    tarea.cancel()
+    await asyncio.gather(tarea, return_exceptions=True)
+
+
+def _player_con_cola(guild_id=1, actual="sonando", cola=("uno", "dos")):
+    """Un player conectado con tema y cola."""
+    vc = PlayerRetomable(FakeGuild(guild_id))
+    vc.channel = SimpleNamespace(id=10)
+    vc.text_channel = SimpleNamespace(id=20)
+    vc.current = wavelink.Playable(_raw(actual)) if actual else None
+    vc.queue.extend(wavelink.Playable(_raw(t)) for t in cola)
+    vc.guild.voice_client = vc
+    return vc
+
+
+@pytest.fixture
+def jugadores(cog):
+    """Los players que el cog ve conectados; los tests los agregan con `.nuevo(...)`."""
+    class Conectados(list):
+        def nuevo(self, *args, **kwargs):
+            self.append(_player_con_cola(*args, **kwargs))
+            return self[-1]
+
+    lista = Conectados()
+    cog._players_del_bot = lambda: list(lista)
+    return lista
+
+
+def _en_disco():
+    return persistencia.cargar()
+
+
+# --- la tarea que fotografía ---------------------------------------------------------------
+
+async def test_la_tarea_de_guardado_arranca_al_cargar_y_se_cancela_al_descargar(cog, monkeypatch):
+    monkeypatch.setattr(music_mod.DJ, "load_feed_urls", staticmethod(lambda: []))
+    await cog.cog_load()
+    guardador = cog._guardador
+    assert guardador is not None and not guardador.done()
+    assert guardador in cog._tareas
+    await cog.cog_unload()
+    await asyncio.wait_for(asyncio.gather(guardador, return_exceptions=True), timeout=1)
+    assert guardador.cancelled()
+
+
+async def test_solo_escribe_cuando_algo_cambio(jugadores, cog, escrituras):
+    vc = jugadores.nuevo()
+
+    cog._guardar(siempre=False)
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 1
+
+    vc.queue.append(wavelink.Playable(_raw("tres")))
+    cog._guardar(siempre=False)
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 2
+    assert [p["info"]["title"] for p in _en_disco()[1]["cola"]] == ["uno", "dos", "tres"]
+
+
+async def test_sin_cambios_igual_reescribe_cada_refrescar_cada(jugadores, cog, escrituras):
+    jugadores.nuevo()
+    cog._guardar(siempre=False)
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 1
+    cog._escrita -= music_mod.REFRESCAR_CADA
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 2
+
+
+def test_una_pista_guardada_conserva_quien_la_pidio():
+    pista = Music._pista({**_raw("tema"), "pedido_por": "ana"})
+    assert pista.requester == "ana"
+    assert pista.title == "tema"
+
+
+async def test_avanzar_el_tema_no_escribe_pero_cambiar_de_tema_si(jugadores, cog, escrituras):
+    vc = jugadores.nuevo()
+    cog._guardar(siempre=False)
+
+    vc._last_update, vc._inicio_ns, vc._last_position = 2, 1, 40_000
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 1
+
+    vc.current = vc.queue.get()
+    cog._guardar(siempre=False)
+    assert len(escrituras) == 2
+
+
+async def test_pausar_o_cambiar_volumen_o_modo_o_autoplay_cuentan_como_cambio(jugadores, cog, escrituras):
+    vc = jugadores.nuevo()
+    cog._guardar(siempre=False)
+
+    vc.paused = True
+    cog._guardar(siempre=False)
+    vc.volume = 30
+    cog._guardar(siempre=False)
+    vc.queue.mode = wavelink.QueueMode.loop
+    cog._guardar(siempre=False)
+    cog._autoplay[1] = not cog.autoplay_activo(1)
+    cog._guardar(siempre=False)
+
+    assert len(escrituras) == 5
+
+
+async def test_los_cortes_del_dj_no_van_al_archivo(jugadores, cog, tmp_path, monkeypatch):
+    monkeypatch.setattr(music_mod.tts, "CACHE_DIR", tmp_path)
+    vc = jugadores.nuevo(cola=())
+    vc.queue.append(wavelink.Playable(_raw("corte", uri=str(tmp_path / "corte.wav"))))
+    vc.queue.append(wavelink.Playable(_raw("tema")))
+
+    cog._guardar(siempre=False)
+
+    assert [p["info"]["title"] for p in _en_disco()[1]["cola"]] == ["tema"]
+
+
+async def test_un_servidor_que_no_se_puede_fotografiar_no_frena_a_los_demas(jugadores, cog, caplog):
+    roto = jugadores.nuevo(guild_id=1)
+    roto.queue.mode = None
+    jugadores.nuevo(guild_id=2)
+
+    with caplog.at_level("ERROR", logger="music"):
+        cog._guardar(siempre=False)
+
+    assert list(_en_disco()) == [2]
+    assert "No pude fotografiar la cola" in caplog.text
+
+
+async def test_un_player_desconectado_o_sin_nada_que_retomar_no_va_al_archivo(jugadores, cog):
+    jugadores.nuevo(guild_id=1).connected = False
+    jugadores.nuevo(guild_id=2, actual=None, cola=())
+    jugadores.nuevo(guild_id=3)
+
+    cog._guardar(siempre=False)
+
+    assert list(_en_disco()) == [3]
+
+
+async def test_el_bucle_escribe_una_vez_y_luego_solo_si_cambia(jugadores, cog, ticks, escrituras):
+    vc = jugadores.nuevo()
+    cog._persistencia = "activa"
+
+    await _correr_ticks(cog, ticks)
+    assert len(escrituras) == 1
+
+    vc.queue.clear()
+    await _correr_ticks(cog, ticks)
+    assert len(escrituras) == 2
+
+
+async def test_un_error_al_escribir_no_mata_el_bucle_y_se_reintenta(jugadores, cog, ticks, monkeypatch, caplog):
+    jugadores.nuevo()
+    cog._persistencia = "activa"
+    fallos = []
+    original = persistencia.guardar
+
+    def _guardar(fotos, *args, **kwargs):
+        if not fallos:
+            fallos.append(1)
+            raise OSError("disco lleno")
+        return original(fotos, *args, **kwargs)
+
+    monkeypatch.setattr(persistencia, "guardar", _guardar)
+    with caplog.at_level("ERROR", logger="music"):
+        await _correr_ticks(cog, ticks)
+
+    assert "No pude guardar las colas" in caplog.text
+    assert list(_en_disco()) == [1]
+
+
+async def test_hasta_retomar_lo_guardado_el_bucle_no_pisa_el_archivo(cog, ticks):
+    persistencia.guardar({7: _foto_guardada()})
+    assert cog._persistencia == "esperando"
+
+    await _correr_ticks(cog, ticks)
+
+    assert list(_en_disco()) == [7]
+
+
+async def test_al_terminar_de_retomar_el_bucle_ya_escribe(cog, ticks, discord_falso):
+    persistencia.guardar({7: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+    await _correr_ticks(cog, ticks)
+
+    assert _en_disco() == {}
+
+
+# --- teardown ----------------------------------------------------------------------------------
+
+async def test_teardown_borra_la_foto_de_ese_servidor(cog):
+    persistencia.guardar({1: _foto_guardada(), 2: _foto_guardada()})
+    vc = PlayerDeSesionVieja(guild=FakeGuild(1))
+
+    await cog.teardown(vc.guild)
+
+    assert list(_en_disco()) == [2]
+
+
+async def test_teardown_sin_player_tambien_borra_la_foto(cog):
+    persistencia.guardar({1: _foto_guardada()})
+    guild = FakeGuild(1)
+    guild.voice_client = None
+
+    await cog.teardown(guild)
+
+    assert _en_disco() == {}
+
+
+async def test_si_el_guardador_fotografia_mientras_se_desconecta_la_foto_igual_se_borra(jugadores, cog):
+    cog._persistencia = "activa"
+    vc = jugadores.nuevo()
+    cog._guardar(siempre=False)
+    assert list(_en_disco()) == [1]
+    desconectar = vc.disconnect
+
+    async def _desconectar_con_guardado_en_medio():
+        cog._guardar(siempre=True)
+        await desconectar()
+
+    vc.disconnect = _desconectar_con_guardado_en_medio
+    await cog.teardown(vc.guild)
+
+    assert _en_disco() == {}
+
+
+# --- guardar_y_cerrar --------------------------------------------------------------------------
+
+async def test_guardar_y_cerrar_escribe_la_foto_final_aunque_nada_haya_cambiado(jugadores, cog, escrituras):
+    vc = jugadores.nuevo()
+    cog._persistencia = "activa"
+    cog._guardar(siempre=False)
+    vc._last_update, vc._inicio_ns, vc._last_position = 2, 1, 61_000
+
+    await cog.guardar_y_cerrar()
+
+    assert len(escrituras) == 2
+    assert _en_disco()[1]["posicion"] == 61_000
+
+
+async def test_guardar_y_cerrar_frena_la_tarea_y_ya_no_se_escribe(jugadores, cog, ticks, escrituras):
+    vc = jugadores.nuevo()
+    cog._persistencia = "activa"
+    guardador = cog._guardador = cog._segundo_plano(cog._guardar_en_bucle())
+    await ticks(0)
+
+    await cog.guardar_y_cerrar()
+
+    assert guardador.cancelled()
+    assert cog._guardador is None
+    assert cog._persistencia == "cerrada"
+    escritas = len(escrituras)
+    # Sin players, otro tick guardaría una cola vacía encima de la buena.
+    vc.connected = False
+    await _correr_ticks(cog, ticks)
+    assert len(escrituras) == escritas
+    assert list(_en_disco()) == [1]
+
+
+async def test_guardar_y_cerrar_dos_veces_no_escribe_la_segunda(jugadores, cog, escrituras):
+    jugadores.nuevo()
+    cog._persistencia = "activa"
+
+    await cog.guardar_y_cerrar()
+    await cog.guardar_y_cerrar()
+
+    assert len(escrituras) == 1
+
+
+async def test_guardar_y_cerrar_antes_de_retomar_no_pisa_lo_guardado(cog):
+    persistencia.guardar({7: _foto_guardada()})
+
+    await cog.guardar_y_cerrar()
+
+    assert list(_en_disco()) == [7]
+    assert cog._persistencia == "cerrada"
+
+
+async def test_guardar_y_cerrar_con_el_disco_roto_no_levanta_nada(jugadores, cog, monkeypatch, caplog):
+    jugadores.nuevo()
+    cog._persistencia = "activa"
+
+    def _falla(*args, **kwargs):
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr(persistencia, "guardar", _falla)
+    with caplog.at_level("ERROR", logger="music"):
+        await cog.guardar_y_cerrar()
+
+    assert cog._persistencia == "cerrada"
+    assert "No pude guardar la foto final" in caplog.text
+
+
+async def test_cerrar_a_mitad_de_retomar_no_reactiva_el_guardado(cog):
+    persistencia.guardar({7: _foto_guardada()})
+
+    class BotQueCierra(DiscordFalso):
+        async def wait_until_ready(self):
+            await cog.guardar_y_cerrar()
+
+    cog.bot = BotQueCierra()
+    await cog.retomar_guardadas()
+
+    assert cog._persistencia == "cerrada"
+
+
+# --- retomar_guardadas -------------------------------------------------------------------------
+
+async def test_retomar_conecta_carga_la_cola_y_toca_desde_la_posicion(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+
+    canal, texto = guild.canales[10], guild.canales[20]
+    vc = canal.player
+    assert discord_falso.listo
+    assert canal.clase is music_mod.resolver.ResolvingPlayer
+    assert vc.resolver is cog.resolver
+    assert vc.text_channel is texto
+    assert [p.title for p in vc.queue] == ["uno", "dos"]
+    [(actual, kwargs)] = vc.llamadas
+    assert actual.title == "sonando"
+    assert kwargs == {"start": 95_000, "paused": True, "add_history": False}
+    assert vc.volume == 55
+    assert vc.queue.mode is wavelink.QueueMode.loop
+    assert cog.autoplay_activo(1) is False
+    assert vc.autoplay is wavelink.AutoPlayMode.partial
+    assert texto.enviados == [music_mod.AVISO_RETOMADA]
+    assert cog._persistencia == "activa"
+
+
+async def test_retomar_respeta_la_lista_blanca(cog, discord_falso, monkeypatch):
+    uno, dos = discord_falso.servidor(1), discord_falso.servidor(2)
+    persistencia.guardar({1: _foto_guardada(), 2: _foto_guardada()})
+    monkeypatch.setattr(music_mod.config, "SERVIDORES_PERMITIDOS", frozenset({2}))
+
+    await cog.retomar_guardadas()
+
+    assert uno.canales[10].conexiones == 0
+    assert dos.canales[10].conexiones == 1
+
+
+async def test_retomar_con_la_lista_blanca_vacia_acepta_cualquier_servidor(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 1
+
+
+async def test_retomar_no_entra_a_un_canal_sin_humanos(cog, discord_falso, caplog):
+    guild = discord_falso.servidor(1, humanos=0)
+    persistencia.guardar({1: _foto_guardada()})
+
+    with caplog.at_level("INFO", logger="music"):
+        await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 0
+    assert "no hay nadie en el canal" in caplog.text
+
+
+async def test_retomar_no_cuenta_a_los_bots_como_gente(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    guild.canales[10].members = [SimpleNamespace(bot=True), SimpleNamespace(bot=True)]
+    persistencia.guardar({1: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 0
+
+
+async def test_retomar_no_toca_una_foto_vencida(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(hora=time.time() - persistencia.VIGENCIA - 60)})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 0
+
+
+async def test_retomar_se_salta_el_servidor_donde_el_bot_ya_no_esta(cog, discord_falso):
+    otro = discord_falso.servidor(2)
+    persistencia.guardar({1: _foto_guardada(), 2: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+
+    assert otro.canales[10].conexiones == 1
+
+
+async def test_retomar_se_salta_el_canal_que_ya_no_existe(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(voz=999)})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 0
+
+
+async def test_retomar_no_pisa_una_transmision_que_ya_existe(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    guild.voice_client = object()
+    persistencia.guardar({1: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 0
+
+
+async def test_un_servidor_que_falla_al_conectar_no_frena_a_los_otros(cog, discord_falso, caplog):
+    roto, bueno = discord_falso.servidor(1), discord_falso.servidor(2)
+    roto.canales[10].falla_al_conectar = True
+    persistencia.guardar({1: _foto_guardada(), 2: _foto_guardada()})
+
+    with caplog.at_level("ERROR", logger="music"):
+        await cog.retomar_guardadas()
+
+    assert bueno.canales[10].player.llamadas
+    assert "No pude retomar la cola de 1" in caplog.text
+    assert cog._persistencia == "activa"
+
+
+async def test_un_servidor_que_falla_al_tocar_se_corta_y_no_frena_a_los_otros(cog, discord_falso, caplog, monkeypatch):
+    roto, bueno = discord_falso.servidor(1), discord_falso.servidor(2)
+    conectar = CanalDeVozRetomable.connect
+
+    async def _conectar_roto(self, *, cls):
+        vc = await conectar(self, cls=cls)
+        vc.falla_el_play = self.guild.id == 1
+        return vc
+
+    monkeypatch.setattr(CanalDeVozRetomable, "connect", _conectar_roto)
+    persistencia.guardar({1: _foto_guardada(), 2: _foto_guardada()})
+
+    with caplog.at_level("ERROR", logger="music"):
+        await cog.retomar_guardadas()
+
+    assert not roto.canales[10].player.connected
+    assert bueno.canales[10].player.llamadas
+    assert "No pude retomar la cola de 1" in caplog.text
+
+
+async def test_retomar_solo_corre_una_vez(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada()})
+
+    await cog.retomar_guardadas()
+    guild.voice_client = None
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].conexiones == 1
+
+
+async def test_sin_nada_guardado_retomar_deja_el_guardado_activo(cog, discord_falso):
+    await cog.retomar_guardadas()
+
+    assert cog._persistencia == "activa"
+
+
+async def test_con_el_archivo_roto_retomar_no_levanta_nada(cog, discord_falso, archivo_de_colas):
+    archivo_de_colas.parent.mkdir(parents=True)
+    archivo_de_colas.write_text("{roto")
+
+    await cog.retomar_guardadas()
+
+    assert cog._persistencia == "activa"
+
+
+async def test_sin_tema_en_curso_empieza_por_la_cola(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(actual=None, posicion=0)})
+
+    await cog.retomar_guardadas()
+
+    vc = guild.canales[10].player
+    [(primero, kwargs)] = vc.llamadas
+    assert primero.title == "uno"
+    assert kwargs == {}
+    assert [p.title for p in vc.queue] == ["dos"]
+
+
+async def test_una_pista_guardada_que_no_se_puede_rearmar_se_salta(cog, discord_falso, caplog):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(cola=[{"encoded": "roto"}, _raw("buena")])})
+
+    with caplog.at_level("WARNING", logger="music"):
+        await cog.retomar_guardadas()
+
+    assert [p.title for p in guild.canales[10].player.queue] == ["buena"]
+    assert "no se puede rearmar" in caplog.text
+
+
+async def test_un_modo_de_cola_desconocido_vuelve_a_normal(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(modo="de_otra_version")})
+
+    await cog.retomar_guardadas()
+
+    assert guild.canales[10].player.queue.mode is wavelink.QueueMode.normal
+
+
+async def test_si_no_queda_nada_que_tocar_se_corta_en_vez_de_quedarse_mudo(cog, discord_falso, caplog):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(actual={"encoded": "roto"}, cola=[])})
+
+    with caplog.at_level("ERROR", logger="music"):
+        await cog.retomar_guardadas()
+
+    assert not guild.canales[10].player.connected
+    assert "no quedó nada que tocar" in caplog.text
+
+
+async def test_sin_canal_de_texto_retoma_igual_y_no_avisa_a_nadie(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada(texto=None)})
+
+    await cog.retomar_guardadas()
+
+    vc = guild.canales[10].player
+    assert vc.text_channel is None
+    assert vc.llamadas
+    assert guild.canales[20].enviados == []
+
+
+async def test_si_el_aviso_no_sale_la_cola_sigue_sonando(cog, discord_falso):
+    guild = discord_falso.servidor(1)
+    persistencia.guardar({1: _foto_guardada()})
+
+    async def _prohibido(contenido=None, **kwargs):
+        raise music_mod.discord.Forbidden(SimpleNamespace(status=403, reason="x"), "sin permiso")
+
+    guild.canales[20].send = _prohibido
+    await cog.retomar_guardadas()
+
+    vc = guild.canales[10].player
+    assert vc.connected
+    assert vc.llamadas

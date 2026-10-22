@@ -27,6 +27,8 @@ bot = commands.Bot(command_prefix=config.PREFIX, intents=intents)
 # Una sola para todo el bot: el cog y los players de cada servidor la comparten,
 # así lo que uno aprende de yt-dlp (videos bloqueados, versión) lo ven todos.
 bot.resolver = Resolver()
+# Lo guardado en disco se retoma solo cuando el nodo queda listo por primera vez.
+guardadas_retomadas = False
 
 
 class ServidorNoPermitido(commands.CheckFailure):
@@ -107,6 +109,7 @@ async def solo_servidores_permitidos(ctx: commands.Context) -> bool:
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    global guardadas_retomadas
     log.info('Nodo Lavalink conectado: %s', payload.node.uri)
     # `resumed=False` es una sesión nueva: si ya había players, Lavalink los
     # perdió (reinicio del nodo) y el cog tiene que rehacerlos. En el primer
@@ -114,6 +117,9 @@ async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
     cog = bot.get_cog("Music")
     if cog and not payload.resumed:
         await cog.recuperar_players(list(payload.node.players.values()))
+        if not guardadas_retomadas:
+            guardadas_retomadas = True
+            await cog.retomar_guardadas()
 
 
 @bot.event
@@ -189,6 +195,10 @@ async def esperar_orden_de_apagado(apagar: asyncio.Event) -> None:
     """Cierra el bot cuando lo pide la API (o un SIGTERM), sin cortar de golpe."""
     await apagar.wait()
     log.info("Cerrando: me despido de los canales de voz")
+    # Antes de desconectar: sin players, la foto que se escribiera quedaría vacía.
+    cog = bot.get_cog("Music")
+    if cog:
+        await cog.guardar_y_cerrar()
     # El audio lo emite Lavalink, no este proceso: si solo se cierra el bot, el
     # player sigue vivo en el nodo y la música no para. Hay que destruirlo ahí.
     for vc in list(bot.voice_clients):
