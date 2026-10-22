@@ -153,3 +153,10 @@ class PlayerPanel(discord.ui.View):
         await interaction.response.send_message(
             "🎙️ El DJ habla en el próximo corte.", ephemeral=True
         )
+
+    # Con rótulo: el 🎤 se parece demasiado al 🎙️ del DJ.
+    @discord.ui.button(emoji="🎤", label="Letra", style=discord.ButtonStyle.secondary, row=1)
+    async def letra_en_vivo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            await self.cog.alternar_letra(interaction.guild), ephemeral=True
+        )

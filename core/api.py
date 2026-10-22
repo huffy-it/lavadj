@@ -61,12 +61,7 @@ def _estado_lavalink() -> dict:
     }
 
 
-def _id_de_pista(pista) -> str:
-    """Identidad estable de una pista: el id de YouTube (el mismo en cada resolución de la URL), si no su uri, si no título y autor."""
-    return (
-        resolver.id_de_cancion(pista) or getattr(pista, "uri", "")
-        or f"{getattr(pista, 'title', '')}|{getattr(pista, 'author', '')}"
-    )
+id_de_pista = resolver.clave_de_pista
 
 
 def _posicion_ms(bot, vc) -> int:
@@ -84,7 +79,7 @@ def _reproduccion(bot, vc) -> dict:
     return {
         "pausado": bool(getattr(vc, "paused", False)),
         "dj": dj,
-        "pista": _id_de_pista(actual) if actual is not None and not dj else None,
+        "pista": id_de_pista(actual) if actual is not None and not dj else None,
         "posicion_ms": min(posicion, largo) if largo else posicion,
         "duracion_ms": largo,
     }
@@ -249,8 +244,10 @@ async def handle_letra(request: web.Request) -> web.Response:
     actual = vc.current
     titulo = resolver.titulo_de(actual)
     buscar = partial(_buscar_letra, bot, titulo, getattr(actual, "author", "") or "", antes["duracion_ms"])
+    # La caché es la del cog, la misma de la letra en vivo de Discord: así no se busca dos veces.
+    letras = getattr(bot.get_cog(COG), "letras", None) or request.app["letras"]
     try:
-        letra = await request.app["letras"].obtener(antes["pista"], buscar)
+        letra = await letras.obtener(antes["pista"], buscar)
     except Exception:
         log.exception("API: error buscando la letra de %r", titulo)
         return _letra_json("error", cancion=titulo, pista=antes["pista"], **base)

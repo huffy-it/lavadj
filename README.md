@@ -227,6 +227,7 @@ ofrece hasta 25 temas (con una URL pegada no hace falta elegir nada).
 | `!volume <0-100>` | `!vol` | Ajusta el volumen |
 | `!remove <posición>` | `!rm` | Saca de la cola la canción en esa posición |
 | `!lyrics [artista - canción]` | `!ly` | Letra de la canción actual, o de la que indiques |
+| `!letra [on\|off]` | | Letra en vivo: un mensaje que se edita línea a línea mientras suena el tema (sin argumento, alterna) |
 | `!dj` | | El DJ habla en el próximo corte |
 | `!dj on\|off` | | Enciende o apaga el DJ |
 | `!dj vol [0-200]` | | Muestra o ajusta el volumen de la voz del DJ (0 = mudo) |
@@ -239,8 +240,14 @@ con la lista vacía, de forma global, y esto puede tardar en verse. El log dice
 cuántos registró y dónde.
 
 Los comandos de música no funcionan por mensaje directo. Pausa, reanudar, saltar,
-parar, loop, shuffle, volumen y quitar exigen estar en el mismo canal de voz que
+parar, loop, shuffle, volumen, quitar y letra exigen estar en el mismo canal de voz que
 el bot, igual que los botones del panel del chat.
+
+**Letra en vivo.** `/letra` (o `!letra`, o el botón **🎤 Letra** del panel) enciende un
+mensaje debajo del panel que se edita línea a línea al compás del tema: la actual en
+negrita, la anterior en gris y las dos que siguen. Necesita una letra de LRCLIB con
+tiempos; si el tema no la trae, el mensaje lo dice y queda `/lyrics`, que manda la letra
+entera. Se vuelve a publicar con cada tema y se apaga con `!stop` o al acabarse la cola.
 
 **Spotify.** Acepta temas, álbumes y playlists (también `spotify:...`). De cada
 tema se toma "Artista - Título" y se busca en YouTube. Los nombres salen del

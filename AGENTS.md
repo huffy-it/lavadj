@@ -64,6 +64,7 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/guionista.py` | Guionista opcional del DJ (`frases` \| `claude` \| `ollama`, `DJ_GUIONISTA`): escribe la presentación de cada tema; si falla devuelve `None` y el DJ cae a sus frases. Claude va por el SDK `anthropic`; se cambia en caliente con `elegir()` |
 | `core/spotify.py` | Embed público: de Spotify salen **solo nombres**, nunca audio |
 | `core/lyrics.py` | Letras (LRCLIB con tiempos, lyrics.ovh de respaldo) para `!lyrics` y `/api/letra`, con caché por canción |
+| `core/letra_en_vivo.py` | Letra en vivo en Discord (`/letra` y botón 🎤 del panel, apagada por defecto): `LetraEnVivo`, una por `Estacion` con su tarea y su mensaje, edita línea a línea. `indice_de` y `armar_texto` son puras (escapan el markdown de la letra, tope de 2000). Solo edita al cambiar de línea y cada `EDITAR_CADA` como mucho, y no en pausa; con letra sin tiempos o ausente avisa y no hay bucle. El cog la republica debajo del panel con cada tema y la apaga en `teardown` y al acabarse la cola. Comparte con `/api/letra` la caché `Music.letras` (clave `api.id_de_pista`) |
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
 | `core/persistencia.py` | La cola de cada servidor en `estado/colas.json` (no se versiona): el cog la guarda sola y el bot la retoma al volver, si hay gente en el canal y no pasaron 6 h |
 | `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte): solo la ventana y el arranque |

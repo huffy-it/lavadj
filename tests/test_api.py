@@ -13,6 +13,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
+from cogs.music import Music
 from core import ajustes, api, config, lyrics, resolver, tts, voces
 from core.dj import DJ
 from core.feeds import FeedCache
@@ -385,6 +386,39 @@ def test_letra_el_estado_pausado_viaja(busqueda):
     datos = cuerpo(letra(bot_con(sala(pista(), posicion=42_000, pausado=True), cog=FakeCog())))
 
     assert datos["pausado"] is True and datos["posicion_ms"] == 42_000
+
+
+def test_letra_usa_la_cache_del_cog_si_el_cog_la_tiene(busqueda):
+    del_cog, de_la_app = lyrics.Letras(), lyrics.Letras()
+    cog = FakeCog()
+    cog.letras = del_cog
+    bot = bot_con(sala(pista(), posicion=1_000), cog=cog)
+
+    letra(bot, letras=de_la_app)
+    letra(bot, letras=de_la_app)
+
+    assert len(busqueda.llamadas) == 1
+    assert list(del_cog._datos) == ["dQw4w9WgXcQ"] and list(de_la_app._datos) == []
+
+
+@pytest.mark.parametrize("cog", [FakeCog(), None])
+def test_letra_sin_cache_en_el_cog_cae_a_la_de_la_app(busqueda, cog):
+    de_la_app = lyrics.Letras()
+
+    letra(bot_con(sala(pista()), cog=cog), letras=de_la_app)
+
+    assert list(de_la_app._datos) == ["dQw4w9WgXcQ"]
+
+
+def test_lo_que_ya_busco_la_letra_en_vivo_de_discord_no_se_busca_otra_vez_para_el_panel_web(busqueda):
+    cog = Music(bot=None)
+    actual = pista()
+    asyncio.run(cog._buscar_letra(actual)())
+
+    datos = cuerpo(letra(bot_con(sala(actual, posicion=3_000), cog=cog)))
+
+    assert len(busqueda.llamadas) == 1
+    assert datos["motivo"] is None and datos["lineas"][0] == {"ms": 1000, "texto": "uno"}
 
 
 async def test_la_ruta_de_la_letra_existe_y_pasa_por_la_proteccion():

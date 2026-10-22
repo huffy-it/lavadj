@@ -17,9 +17,11 @@ from discord.ext import commands
 
 from cogs import music as music_mod
 from cogs.music import Music
-from core import config, persistencia
+from core import api, config, persistencia
 from core.dj import Clip
+from core.letra_en_vivo import HABLA_EL_DJ, SIN_TIEMPOS, armar_texto
 from core.locutor import Locutor
+from core.lyrics import Letra
 from core.reintentos import CAIDAS_SEGUIDAS_MAX, REINTENTOS_POR_PISTA
 from core.resolver import Resolver
 from core.salud import Salud
@@ -94,6 +96,7 @@ class FakeCtx:
         self.guild = guild or (vc.guild if vc else FakeGuild())
         self.interaction = interaction
         self.enviados = []
+        self.opciones = []
         self.eventos = []
 
     def typing(self):
@@ -104,6 +107,7 @@ class FakeCtx:
 
     async def send(self, contenido=None, **kwargs):
         self.enviados.append(contenido)
+        self.opciones.append(kwargs)
         return contenido
 
     @property
@@ -2663,9 +2667,9 @@ def test_un_reporte_del_tema_anterior_no_cuenta(monkeypatch):
 
 HIBRIDOS = {
     "play", "playnext", "autoplay", "pause", "resume", "skip", "stop", "queue", "nowplaying",
-    "panel", "loop", "shuffle", "volume", "remove", "dj", "lyrics",
+    "panel", "loop", "shuffle", "volume", "remove", "dj", "lyrics", "letra",
 }
-CON_CONTROL = ("pause", "resume", "skip", "stop", "loop", "shuffle", "volume", "remove")
+CON_CONTROL = ("pause", "resume", "skip", "stop", "loop", "shuffle", "volume", "remove", "letra")
 ALIAS = {
     "p": "play", "pn": "playnext", "next": "playnext", "ap": "autoplay", "r": "resume", "s": "skip",
     "q": "queue", "np": "nowplaying", "l": "loop", "vol": "volume", "rm": "remove", "ly": "lyrics",
@@ -3037,3 +3041,310 @@ async def test_el_autocompletado_no_busca_para_un_servidor_ajeno_ni_por_privado(
 
     assert await cog.autocompletar_busqueda(SimpleNamespace(guild_id=guild_id), "never gonna") == []
     assert consultas == []
+
+
+# --- la letra en vivo -----------------------------------------------------------------
+
+LETRA_EN_VIVO = Letra(True, [(0, "uno"), (5000, "dos"), (9000, "tres")])
+
+
+class MensajeDeLetra:
+    def __init__(self, canal, contenido):
+        self.canal, self.contenido, self.borrado = canal, contenido, False
+
+    async def edit(self, *, content, **kwargs):
+        self.contenido = content
+        self.canal.registro.append(("edita", content))
+
+    async def delete(self):
+        self.borrado = True
+        self.canal.registro.append(("borra", self.contenido))
+
+
+class CanalDeLetra:
+    """El canal de texto del player: lo que publica el panel y lo que hace la letra queda en un mismo registro."""
+
+    def __init__(self, registro):
+        self.registro, self.mensajes = registro, []
+
+    async def send(self, contenido=None, **kwargs):
+        self.mensajes.append(MensajeDeLetra(self, contenido))
+        self.registro.append(("publica", contenido))
+        return self.mensajes[-1]
+
+    @property
+    def vivos(self):
+        return [m for m in self.mensajes if not m.borrado]
+
+
+@pytest.fixture
+async def en_vivo(cog, monkeypatch):
+    """El cog con el panel y la búsqueda de letras de mentira, y la posición quieta en el segundo 0."""
+    registro, busquedas = [], []
+
+    async def _panel(self, guild, vc):
+        registro.append("panel")
+
+    async def _encontrar(session, titulo, artista, cancion, duracion_ms=0):
+        busquedas.append((titulo, artista, cancion, duracion_ms))
+        return en_vivo.letra
+
+    async def _sin_desconexion(self, guild, vc):
+        return None
+
+    monkeypatch.setattr(Music, "_post_panel", _panel)
+    monkeypatch.setattr(Music, "_schedule_idle_disconnect", _sin_desconexion)
+    monkeypatch.setattr(music_mod.lyrics, "find_synced", _encontrar)
+    cog.posicion_viva = lambda vc: vc.pos
+    en_vivo = SimpleNamespace(registro=registro, busquedas=busquedas, letra=LETRA_EN_VIVO)
+    yield en_vivo
+    for est in cog._estaciones.values():
+        est.letra.cancelar()
+
+
+def _sonando(en_vivo, titulo="Tema A", con_canal=True):
+    vc = FakePlayer(playing=True)
+    vc.guild.voice_client = vc
+    vc.current = FakeTrack(titulo)
+    vc.pos = 0
+    vc.text_channel = CanalDeLetra(en_vivo.registro) if con_canal else None
+    return vc
+
+
+async def _esperar(condicion, vueltas=1000):
+    for _ in range(vueltas):
+        if condicion():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("no llegó a pasar lo esperado")
+
+
+async def _arranca(cog, vc, pista=None):
+    """Arranca un tema como lo hace Lavalink: `vc.current` ya es el tema cuando llega el evento."""
+    vc.current = pista or vc.current
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, vc.current))
+
+
+async def _publicada(vc, cantidad=1):
+    await _esperar(lambda: len(vc.text_channel.mensajes) >= cantidad)
+
+
+@pytest.mark.parametrize("modo, esperado", [("", [True, False, True]), ("on", [True, True, True]), ("off", [False, False, False])])
+async def test_letra_alterna_o_fija_el_estado_y_responde_en_privado(cog, en_vivo, modo, esperado):
+    ctx = FakeCtx(_sonando(en_vivo))
+    estados = []
+
+    for _ in esperado:
+        await cog.letra_cmd(cog, ctx, modo)
+        estados.append(cog.estacion(1).letra.activa)
+
+    assert estados == esperado
+    assert ctx.opciones == [{"ephemeral": True}] * 3
+
+
+async def test_letra_encendida_lo_dice_y_sigue_el_tema_desde_donde_va(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    ctx = FakeCtx(vc)
+
+    await cog.letra_cmd(cog, ctx, "on")
+    await _publicada(vc)
+
+    assert "encendida" in ctx.ultimo and cog.estacion(1).letra.tarea is not None
+    assert vc.text_channel.mensajes[0].contenido == armar_texto("Tema A", LETRA_EN_VIVO.lineas, 0)
+
+
+async def test_letra_apagada_borra_el_mensaje_y_corta_la_tarea(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    ctx = FakeCtx(vc)
+    await cog.letra_cmd(cog, ctx, "on")
+    await _publicada(vc)
+    tarea = cog.estacion(1).letra.tarea
+
+    await cog.letra_cmd(cog, ctx, "off")
+
+    est = cog.estacion(1)
+    assert "apagada" in ctx.ultimo and not est.letra.activa and est.letra.mensaje is None
+    assert vc.text_channel.vivos == []
+    await asyncio.gather(tarea, return_exceptions=True)
+    assert tarea.cancelled()
+
+
+async def test_letra_encendida_otra_vez_vuelve_a_publicar_el_mensaje_al_final_del_chat(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    ctx = FakeCtx(vc)
+    await cog.letra_cmd(cog, ctx, "on")
+    await _publicada(vc)
+
+    await cog.letra_cmd(cog, ctx, "on")
+    await _publicada(vc, 2)
+
+    assert [m.borrado for m in vc.text_channel.mensajes] == [True, False]
+
+
+@pytest.mark.parametrize("modo", ["", "on", "off"])
+@pytest.mark.parametrize("falta", ["voz", "tema"])
+async def test_letra_sin_el_bot_sonando_avisa_y_no_cambia_nada(cog, en_vivo, modo, falta):
+    vc = _sonando(en_vivo)
+    if falta == "voz":
+        vc.guild.voice_client = None
+    else:
+        vc.current = None
+    ctx = FakeCtx(vc)
+
+    await cog.letra_cmd(cog, ctx, modo)
+
+    assert ctx.ultimo == "No hay nada reproduciendo."
+    assert not cog.estacion(1).letra.activa and cog.estacion(1).letra.tarea is None
+    assert vc.text_channel.mensajes == []
+
+
+async def test_letra_sin_canal_de_texto_no_se_enciende(cog, en_vivo):
+    ctx = FakeCtx(_sonando(en_vivo, con_canal=False))
+
+    await cog.letra_cmd(cog, ctx, "on")
+
+    assert "canal de texto" in ctx.ultimo and not cog.estacion(1).letra.activa
+
+
+@pytest.mark.parametrize("modo, activa", [("ON", True), ("Off", False)])
+async def test_letra_no_distingue_mayusculas(cog, en_vivo, modo, activa):
+    cog.estacion(1).letra.activa = not activa
+
+    await cog.letra_cmd(cog, FakeCtx(_sonando(en_vivo)), modo)
+
+    assert cog.estacion(1).letra.activa is activa
+
+
+async def test_letra_con_un_argumento_raro_explica_el_uso_y_no_cambia_nada(cog, en_vivo):
+    ctx = FakeCtx(_sonando(en_vivo))
+
+    await cog.letra_cmd(cog, ctx, "quizas")
+
+    assert "Uso:" in ctx.ultimo and not cog.estacion(1).letra.activa
+
+
+async def test_letra_encendida_mientras_habla_el_dj_solo_avisa_que_habla(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    vc.current = _clip_del_dj()
+    vc.current.uri = f"{music_mod.tts.CACHE_DIR}/dj_abc.wav"
+
+    await cog.letra_cmd(cog, FakeCtx(vc), "on")
+
+    assert [m.contenido for m in vc.text_channel.mensajes] == [HABLA_EL_DJ]
+    assert cog.estacion(1).letra.tarea is None and en_vivo.busquedas == []
+
+
+async def test_sin_pista_no_se_pone_la_letra(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    cog.estacion(1).letra.activa = True
+
+    await cog._poner_letra(vc, None, es_clip=False)
+
+    assert cog.estacion(1).letra.tarea is None
+
+
+async def test_con_la_letra_prendida_cada_tema_la_publica_debajo_del_panel_y_borra_la_anterior(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    cog.estacion(1).letra.activa = True
+
+    await _arranca(cog, vc)
+    await _publicada(vc)
+    await _arranca(cog, vc, FakeTrack("Tema B"))
+    await _publicada(vc, 2)
+
+    texto_a, texto_b = (armar_texto(t, LETRA_EN_VIVO.lineas, 0) for t in ("Tema A", "Tema B"))
+    assert en_vivo.registro == ["panel", ("publica", texto_a), ("borra", texto_a), "panel", ("publica", texto_b)]
+    assert [m.contenido for m in vc.text_channel.vivos] == [texto_b]
+
+
+async def test_con_la_letra_apagada_el_cambio_de_tema_no_publica_nada(cog, en_vivo):
+    vc = _sonando(en_vivo)
+
+    await _arranca(cog, vc)
+    await _arranca(cog, vc, FakeTrack("Tema B"))
+    await asyncio.sleep(0)
+
+    assert en_vivo.registro == ["panel", "panel"] and vc.text_channel.mensajes == [] and en_vivo.busquedas == []
+
+
+async def test_la_letra_se_busca_una_vez_y_queda_en_la_cache_que_comparte_con_la_api(cog, en_vivo):
+    vc = _sonando(en_vivo, "Rick Astley - Never Gonna Give You Up")
+    vc.current.author, vc.current.identifier = "Rick Astley - Topic", "dQw4w9WgXcQ"
+    cog.estacion(1).letra.activa = True
+
+    await _arranca(cog, vc)
+    await _publicada(vc)
+    await _arranca(cog, vc)         # el mismo tema otra vez (loop): ya no se busca
+    await _publicada(vc, 2)
+
+    assert en_vivo.busquedas == [("Rick Astley - Never Gonna Give You Up", "Rick Astley", "Never Gonna Give You Up", 180_000)]
+    assert list(cog.letras._datos) == [music_mod.resolver.clave_de_pista(vc.current)]
+
+
+async def test_si_habla_el_dj_la_letra_lo_dice_y_el_tema_que_sigue_la_vuelve_a_publicar(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    cog.estacion(1).letra.activa = True
+    await _arranca(cog, vc)
+    await _publicada(vc)
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, _clip_del_dj()))
+
+    assert en_vivo.registro[-1] == ("edita", HABLA_EL_DJ) and cog.estacion(1).letra.tarea is None
+    await _arranca(cog, vc, FakeTrack("Tema B"))
+    await _publicada(vc, 2)
+    texto_b = armar_texto("Tema B", LETRA_EN_VIVO.lineas, 0)
+    assert en_vivo.registro[-3:] == [("borra", HABLA_EL_DJ), "panel", ("publica", texto_b)]
+    assert [m.contenido for m in vc.text_channel.vivos] == [texto_b]
+
+
+async def test_un_tema_sin_tiempos_se_publica_con_el_aviso_debajo_del_panel(cog, en_vivo):
+    en_vivo.letra = Letra(False, [(None, "uno"), (None, "dos")])
+    vc = _sonando(en_vivo)
+    cog.estacion(1).letra.activa = True
+
+    await _arranca(cog, vc)
+    await _publicada(vc)
+
+    assert en_vivo.registro == ["panel", ("publica", SIN_TIEMPOS)]
+
+
+async def test_sin_canal_de_texto_el_tema_arranca_sin_letra(cog, en_vivo):
+    vc = _sonando(en_vivo, con_canal=False)
+    cog.estacion(1).letra.activa = True
+
+    await _arranca(cog, vc)
+
+    assert cog.estacion(1).letra.tarea is None and en_vivo.busquedas == []
+
+
+async def test_al_acabarse_la_cola_la_letra_se_apaga_y_su_mensaje_se_borra(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    cog.estacion(1).letra.activa = True
+    await _arranca(cog, vc)
+    await _publicada(vc)
+    tarea = cog.estacion(1).letra.tarea
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, vc.current))
+
+    est = cog.estacion(1)
+    assert not est.letra.activa and est.letra.mensaje is None and vc.text_channel.vivos == []
+    await asyncio.gather(tarea, return_exceptions=True)
+    assert tarea.cancelled()
+
+
+@pytest.mark.parametrize("motivo, queda_en_cola", [("finished", True), ("replaced", False)])
+async def test_si_la_transmision_sigue_la_letra_sigue_prendida(cog, en_vivo, motivo, queda_en_cola):
+    vc = _sonando(en_vivo)
+    if queda_en_cola:
+        vc.queue.append(FakeTrack("Tema B"))
+    cog.estacion(1).letra.activa = True
+    await _arranca(cog, vc)
+    await _publicada(vc)
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, vc.current, reason=motivo))
+
+    assert cog.estacion(1).letra.activa and len(vc.text_channel.vivos) == 1
+
+
+def test_la_cache_de_letras_es_una_por_cog():
+    assert Music(bot=None).letras is not Music(bot=None).letras

@@ -391,3 +391,61 @@ async def test_cog_unload_corta_los_vigias(cog):
 
     await _terminadas(vigia)
     assert vigia.cancelled()
+
+
+# --- la letra en vivo ----------------------------------------------------------------------
+
+def test_una_estacion_nueva_tiene_la_letra_apagada_y_cada_una_la_suya():
+    a, b = Estacion(), Estacion()
+    assert a.letra.activa is False and a.letra.tarea is None and a.letra.mensaje is None
+    a.letra.activa = True
+    assert b.letra.activa is False and a.letra is not b.letra
+
+
+async def test_cancelar_tareas_corta_tambien_la_letra_en_vivo():
+    est = Estacion()
+    est.letra.tarea = tarea = await _tarea_en_marcha()
+
+    est.cancelar_tareas()
+
+    await _terminadas(tarea)
+    assert tarea.cancelled() and est.letra.tarea is None
+
+
+async def test_teardown_apaga_la_letra_y_borra_su_mensaje(cog):
+    vc = FakePlayer()
+    est = await _estacion_cargada(cog)
+    est.letra.activa = True
+    est.letra.mensaje = mensaje = FakeMensaje()
+    est.letra.tarea = tarea = await _tarea_en_marcha()
+
+    await cog.teardown(vc.guild)
+
+    await _terminadas(tarea)
+    assert tarea.cancelled() and mensaje.borrado
+    assert est.letra.activa is False and est.letra.mensaje is None
+    # Lo que se pida después arranca de cero: apagada.
+    assert cog.estacion(1).letra.activa is False
+
+
+async def test_teardown_no_toca_la_letra_de_los_otros_servidores(cog):
+    vc = FakePlayer(guild=FakeGuild(1))
+    otra = await _estacion_cargada(cog, 2)
+    otra.letra.activa = True
+    otra.letra.mensaje = mensaje = FakeMensaje()
+    otra.letra.tarea = await _tarea_en_marcha()
+
+    await cog.teardown(vc.guild)
+
+    assert otra.letra.activa and not mensaje.borrado and not otra.letra.tarea.cancelled()
+    otra.cancelar_tareas()
+
+
+async def test_cog_unload_corta_la_tarea_de_la_letra(cog):
+    est = cog.estacion(1)
+    est.letra.tarea = tarea = await _tarea_en_marcha()
+
+    await cog.cog_unload()
+
+    await _terminadas(tarea)
+    assert tarea.cancelled()

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 import discord
 
+from core.letra_en_vivo import LetraEnVivo
 from core.panel import PlayerPanel
 
 
@@ -18,6 +19,7 @@ class Estacion:
     arranque: asyncio.Lock = field(default_factory=asyncio.Lock)   # un arranque a la vez
     atascado: bool = False                  # la revisión anterior lo vio atascado
     segmentos: list[asyncio.Task] = field(default_factory=list)     # vigías de las partes que no son música del tema en curso
+    letra: LetraEnVivo = field(default_factory=LetraEnVivo)         # la letra en vivo: si está prendida, su tarea y su mensaje
 
     def cancelar_idle(self) -> None:
         if self.idle:
@@ -38,3 +40,4 @@ class Estacion:
         self.cancelar_idle()
         self.cancelar_spotify()
         self.cancelar_segmentos()
+        self.letra.cancelar()

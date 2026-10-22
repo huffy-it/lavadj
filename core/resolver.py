@@ -206,6 +206,14 @@ def id_de_cancion(pista: wavelink.Playable) -> str:
     return _origen(pista).get("identifier") or getattr(pista, "identifier", "")
 
 
+def clave_de_pista(pista) -> str:
+    """Identidad estable para cachés: el id de YouTube, si no la uri, si no título y autor."""
+    return (
+        id_de_cancion(pista) or getattr(pista, "uri", "")
+        or f"{getattr(pista, 'title', '')}|{getattr(pista, 'author', '')}"
+    )
+
+
 def _pagina_de(pista: wavelink.Playable) -> str:
     """La página de YouTube de la que sale esta pista; vacío si no es de YouTube.
 

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from functools import partial
 
 import aiohttp
 import discord
@@ -126,6 +127,8 @@ class Music(commands.Cog):
         self.salud = Salud()
         self.dj = DJ()
         self.locutor = Locutor(self.dj)
+        # Una para todo el bot: la letra en vivo de Discord y `/api/letra` del panel web no buscan dos veces la misma.
+        self.letras = lyrics.Letras()
         # La del bot, para que el player y el cog vean los mismos videos sin caso.
         # Los tests construyen el cog con `bot=None` y así cada uno tiene la suya.
         self.resolver = getattr(bot, "resolver", None) or resolver.Resolver()
@@ -239,6 +242,7 @@ class Music(commands.Cog):
         persistencia.borrar(guild.id)
         panel = est.panel
         await self._delete_panel(guild.id)
+        await est.letra.apagar()
         self._estaciones.pop(guild.id, None)
         if note and panel:
             await panel[0].channel.send(note)
@@ -461,6 +465,7 @@ class Music(commands.Cog):
         # una transición, y no tiene que medirse contra este final.
         self.salud.sin_siguiente(vc.guild.id)
         await self._delete_panel(vc.guild.id)
+        await self.estacion(vc.guild.id).letra.apagar()
         self.dj.drop(vc.guild.id)
         await self._schedule_idle_disconnect(vc.guild, vc)
 
@@ -551,7 +556,8 @@ class Music(commands.Cog):
         if not vc or not vc.guild:
             return
 
-        self.estacion(vc.guild.id).cancelar_idle()
+        est = self.estacion(vc.guild.id)
+        est.cancelar_idle()
         vc._inicio_ns = time.monotonic_ns()
 
         # Mientras habla el DJ no se toca el panel: el que manda es el tema.
@@ -579,6 +585,7 @@ class Music(commands.Cog):
         self._precargar_siguiente(vc)
 
         if es_clip:
+            await self._poner_letra(vc, sonando, es_clip=True)
             return
 
         # Que arranque una canción es la única prueba de que esto funciona. El corte
@@ -587,7 +594,10 @@ class Music(commands.Cog):
 
         self._programar_saltos(vc, sonando)
 
+        # La letra se publica debajo del panel nuevo: el del tema anterior sale antes, para que no se quede arriba.
+        await est.letra.parar()
         await self._post_panel(vc.guild, vc)
+        await self._poner_letra(vc, sonando, es_clip=False)
 
         # El corte del próximo cambio se prepara ahora, con la canción sonando:
         # sintetizar la voz toma su tiempo y así llega listo.
@@ -595,6 +605,44 @@ class Music(commands.Cog):
             siguiente = proximo(vc)
             if siguiente is not None and not getattr(siguiente, "is_dj_clip", False):
                 self._segundo_plano(self.locutor.encolar(vc, siguiente, self._session))
+
+    # --- letra en vivo -------------------------------------------------------
+    def _buscar_letra(self, pista: wavelink.Playable):
+        """Lo que la letra en vivo llama para traer la de `pista`, por la caché que comparte con `/api/letra`."""
+        titulo = resolver.titulo_de(pista)
+        artista, cancion = lyrics.artist_and_song(titulo, getattr(pista, "author", "") or "")
+        largo = int(getattr(pista, "length", 0) or 0)
+        buscar = partial(lyrics.find_synced, self._session, titulo, artista, cancion, largo)
+        return lambda: self.letras.obtener(resolver.clave_de_pista(pista), buscar)
+
+    async def _poner_letra(self, vc: wavelink.Player, pista: wavelink.Playable, *, es_clip: bool) -> None:
+        """Pone la letra en vivo al día con lo que suena: la del tema, o el aviso si habla el DJ. Apagada, no hace nada."""
+        est = self.estacion(vc.guild.id)
+        canal = getattr(vc, "text_channel", None)
+        if not est.letra.activa or canal is None or pista is None:
+            return
+        if es_clip:
+            await est.letra.dj(canal)
+        else:
+            est.letra.seguir(
+                vc, pista, canal, titulo=resolver.titulo_de(pista), posicion=self.posicion_viva, obtener=self._buscar_letra(pista),
+            )
+
+    async def alternar_letra(self, guild: discord.Guild, modo: bool | None = None) -> str:
+        """Enciende o apaga la letra en vivo (sin `modo`, alterna) y devuelve el aviso para quien lo pidió."""
+        vc: wavelink.Player = guild.voice_client
+        if not vc or not vc.current:
+            return "No hay nada reproduciendo."
+        est = self.estacion(guild.id)
+        if not (modo if modo is not None else not est.letra.activa):
+            await est.letra.apagar()
+            return "🎤 Letra en vivo apagada."
+        if getattr(vc, "text_channel", None) is None:
+            return "No tengo un canal de texto donde publicar la letra."
+        est.letra.activa = True
+        await est.letra.parar()     # si ya estaba prendida, el mensaje vuelve a salir al final del chat
+        await self._poner_letra(vc, vc.current, es_clip=self.locutor.es_clip(vc.current))
+        return "🎤 Letra en vivo encendida: la voy editando en el chat línea a línea."
 
     # --- helpers -------------------------------------------------------------
     async def _connect_voice(self, ctx: commands.Context) -> wavelink.Player | None:
@@ -1279,6 +1327,17 @@ class Music(commands.Cog):
             return await ctx.send(f"Voz del DJ al **{aplicado}%** 🎚️ (se escucha desde el próximo corte).")
 
         await ctx.send("Uso: `!dj`, `!dj on|off`, `!dj vol 0-200`")
+
+    @en_el_mismo_canal()
+    @commands.hybrid_command(name='letra', description="Muestra la letra en vivo en el chat, línea a línea, mientras suena el tema")
+    @app_commands.describe(modo="on u off; vacío alterna")
+    @app_commands.choices(modo=[app_commands.Choice(name="Encender", value="on"), app_commands.Choice(name="Apagar", value="off")])
+    async def letra_cmd(self, ctx: commands.Context, modo: str = ""):
+        """La letra en vivo: `!letra` alterna, `!letra on|off` la enciende o la apaga. `!lyrics` manda la letra entera."""
+        modo = modo.lower()
+        if modo not in ("", "on", "off"):
+            return await ctx.send("Uso: `!letra`, `!letra on` o `!letra off`.", ephemeral=True)
+        await ctx.send(await self.alternar_letra(ctx.guild, {"on": True, "off": False}.get(modo)), ephemeral=True)
 
     @commands.hybrid_command(name='lyrics', aliases=['ly'], description="Busca la letra de la canción actual o de la que indiques")
     @app_commands.describe(query="Artista - canción; vacío busca la que está sonando")
