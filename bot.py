@@ -26,10 +26,80 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=config.PREFIX, intents=intents)
 
 
+class ServidorNoPermitido(commands.CheckFailure):
+    """El comando vino de un servidor fuera de la lista blanca.
+
+    Es una `CheckFailure` para que el check global corte antes de cualquier otro,
+    pero `on_command_error` la trata aparte: no se le contesta a nadie.
+    """
+
+
+def servidor_permitido(guild_id: int | None, permitidos: frozenset[int]) -> bool:
+    """¿Puede este servidor usar el bot? Lista vacía = cualquiera.
+
+    Sin servidor (`None`, un mensaje directo) siempre pasa: no hay a quién
+    restringir, y de lo que se pueda hacer por privado ya se encarga cada comando
+    (la música lo rechaza en `cog_check`).
+    """
+    return guild_id is None or not permitidos or guild_id in permitidos
+
+
+def avisar_lista_blanca(guilds) -> None:
+    """Deja en el log cómo quedó la lista blanca frente a los servidores actuales.
+
+    Solo avisa: no saca al bot de nada. Un ID mal escrito en el `.env` haría que el
+    bot abandonara el servidor del dueño, y volver exige reinvitarlo. Salir solo
+    se justifica con un servidor nuevo (`on_guild_join`).
+    """
+    if config.SERVIDORES_INVALIDOS:
+        log.warning(
+            "SERVIDORES_PERMITIDOS: descarté entradas que no son un ID numérico: %s. "
+            "Corrígelas en el .env o ese servidor quedará fuera.",
+            ", ".join(config.SERVIDORES_INVALIDOS),
+        )
+    if not config.SERVIDORES_PERMITIDOS:
+        log.warning(
+            "SERVIDORES_PERMITIDOS está vacía: el bot acepta cualquier servidor. "
+            "Configura SERVIDORES_PERMITIDOS en el .env para limitarlo a los tuyos."
+        )
+        return
+    for guild in guilds:
+        if not servidor_permitido(guild.id, config.SERVIDORES_PERMITIDOS):
+            log.warning(
+                "El servidor %s (ID: %s) no está en SERVIDORES_PERMITIDOS: ahí los "
+                "comandos se ignoran. Saca al bot desde Discord o agrega el ID a "
+                "la lista.",
+                guild.name, guild.id,
+            )
+
+
 @bot.event
 async def on_ready():
     log.info('Bot listo: %s (ID: %s)', bot.user, bot.user.id)
     print(f'Bot listo: {bot.user} (ID: {bot.user.id})')
+    avisar_lista_blanca(bot.guilds)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Una invitación nueva a un servidor fuera de la lista: se rechaza yéndose."""
+    if servidor_permitido(guild.id, config.SERVIDORES_PERMITIDOS):
+        return
+    log.warning(
+        "Me invitaron a %s (ID: %s), que no está en SERVIDORES_PERMITIDOS: me voy",
+        guild.name, guild.id,
+    )
+    await guild.leave()
+
+
+@bot.check
+async def solo_servidores_permitidos(ctx: commands.Context) -> bool:
+    """Check global: en un servidor fuera de la lista no responde ningún comando."""
+    if not servidor_permitido(
+        ctx.guild.id if ctx.guild else None, config.SERVIDORES_PERMITIDOS
+    ):
+        raise ServidorNoPermitido()
+    return True
 
 
 @bot.event
@@ -65,6 +135,10 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         await ctx.send(f"Falta un argumento: `{error.param.name}`")
     elif isinstance(error, commands.BadArgument):
         await ctx.send(f"Argumento inválido: {error}")
+    elif isinstance(error, ServidorNoPermitido):
+        # En silencio y antes de la rama de CheckFailure, que sí contesta: a un
+        # servidor ajeno no hay nada que explicarle, y contestar sería hacer ruido.
+        return
     elif isinstance(error, (commands.NoPrivateMessage, commands.CheckFailure)):
         # El texto lo pone quien rechaza (cog_check, en_el_mismo_canal): son
         # mensajes escritos para que los lea un humano.

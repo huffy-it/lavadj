@@ -31,9 +31,33 @@ def _booleano(nombre: str, por_defecto: bool) -> bool:
     return valor.strip().lower() in ("1", "true", "si", "sí", "on", "yes")
 
 
+def _lista_de_ids(nombre: str) -> tuple[frozenset[int], tuple[str, ...]]:
+    """IDs numéricos del entorno, separados por comas y/o espacios.
+
+    Devuelve (válidos, inválidos). Lo que no es un número se descarta, pero no en
+    silencio: se entrega aparte para que quien arranca el bot lo avise en el log.
+    Un ID mal escrito que desaparece sin dejar rastro deja a ese servidor fuera (o,
+    si era el único, deja el bot sin ninguna restricción) y nadie se entera.
+    """
+    validos: set[int] = set()
+    invalidos: list[str] = []
+    for entrada in os.getenv(nombre, "").replace(",", " ").split():
+        # `isdigit` solo no basta: acepta dígitos como "²" que `int` rechaza.
+        if entrada.isascii() and entrada.isdigit():
+            validos.add(int(entrada))
+        else:
+            invalidos.append(entrada)
+    return frozenset(validos), tuple(invalidos)
+
+
 # --- Discord -----------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 PREFIX = os.getenv("PREFIX", "!")
+
+# Lista blanca de servidores. Vacía = sin restricción (lo de siempre): quien no
+# tiene la variable en su `.env` no debe notar ningún cambio. Con entradas, el bot
+# se va de los servidores nuevos que no estén y en los demás ignora los comandos.
+SERVIDORES_PERMITIDOS, SERVIDORES_INVALIDOS = _lista_de_ids("SERVIDORES_PERMITIDOS")
 
 # --- Lavalink ----------------------------------------------------------------
 # El nodo de audio lo levanta scripts/lavalink/start-lavalink.sh (contenedor

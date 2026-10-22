@@ -136,6 +136,7 @@ en `.gitignore`).
 | `PREFIX` | `!` | Prefijo de los comandos |
 | `LAVALINK_URI` / `LAVALINK_PASSWORD` | `http://127.0.0.1:2333`, `youshallnotpass` | El nodo de audio |
 | `API_PORT` | `9876` | Puerto de la API y del panel web |
+| `SERVIDORES_PERMITIDOS` | vacía | IDs de los servidores autorizados, separados por comas o espacios. Vacía = sin restricción |
 | `QUEUE_LIMIT` | `500` | Tope duro de la cola |
 | `PLAYLIST_LIMIT` | `100` | Cuántos temas se toman de una playlist de una vez |
 | `AUTOPLAY_DEFAULT` | `true` | Autoplay al vaciarse la cola |
@@ -165,6 +166,17 @@ Windows lo fuerza `lavalink.ps1`).
 
 El bot no usa ningún otro intent privilegiado (solo los intents por defecto más
 el contenido de mensajes).
+
+**Para que solo funcione en tus servidores**, pon sus IDs en
+`SERVIDORES_PERMITIDOS` (activa el modo desarrollador de Discord y usa *Copiar ID
+del servidor*). Con la lista llena, el bot se va de cualquier servidor nuevo que
+no esté en ella y ignora los comandos en los demás; a los servidores donde ya
+estaba no los abandona, solo avisa en el log para que lo resuelvas tú. Con la
+lista vacía, el bot acepta cualquier servidor. Desactiva además **Public Bot** en
+la pestaña **Bot** del portal: así nadie más puede invitarlo con el ID de tu
+aplicación. Si el portal no te deja apagarlo, primero pon **Install Link** en
+*None* en la pestaña **Installation**: una aplicación privada no puede tener
+enlace de instalación.
 
 ## Comandos de Discord
 

@@ -1,11 +1,14 @@
-"""El arranque de bot.py: lo que importa es el orden de las cosas en `main()`."""
+"""El arranque de bot.py (el orden de las cosas en `main()`) y la lista blanca de servidores."""
 
 import importlib
+import logging
 import sys
+from types import SimpleNamespace
 
 import pytest
+from discord.ext import commands
 
-from core import tts
+from core import config, tts
 
 
 @pytest.fixture
@@ -60,3 +63,177 @@ async def test_si_el_puerto_esta_ocupado_no_se_purga_nada(bot_mod, monkeypatch):
         await bot_mod.main()
 
     assert bot_mod.orden == []
+
+
+# --- Lista blanca de servidores ----------------------------------------------
+
+def _servidor(id_, nombre="Servidor"):
+    """Un servidor de mentira cuyo `leave` anota que lo llamaron."""
+    salidas = []
+
+    async def leave():
+        salidas.append(id_)
+
+    return SimpleNamespace(id=id_, name=nombre, leave=leave, salidas=salidas)
+
+
+def _ctx(guild_id):
+    """Un contexto de mentira: `guild_id=None` es un mensaje directo."""
+    enviados = []
+
+    async def send(texto):
+        enviados.append(texto)
+
+    guild = None if guild_id is None else SimpleNamespace(id=guild_id)
+    return SimpleNamespace(guild=guild, send=send, enviados=enviados)
+
+
+@pytest.mark.parametrize("crudo, validos, invalidos", [
+    ("", set(), ()),
+    ("   ", set(), ()),
+    ("123", {123}, ()),
+    ("123,456,789", {123, 456, 789}, ()),
+    ("123 456  789", {123, 456, 789}, ()),
+    ("123, 456 ,789,, ", {123, 456, 789}, ()),
+    ("123\t456", {123, 456}, ()),
+    ("123,123 123", {123}, ()),
+    # Lo que no es número se descarta, pero queda a la vista para el aviso.
+    ("123, abc 456 12x -5 +7 4.5 ²", {123, 456}, ("abc", "12x", "-5", "+7", "4.5", "²")),
+    ("solo,basura", set(), ("solo", "basura")),
+])
+def test_la_lista_de_servidores_se_parsea(monkeypatch, crudo, validos, invalidos):
+    monkeypatch.setenv("SERVIDORES_PERMITIDOS", crudo)
+
+    resultado, descartados = config._lista_de_ids("SERVIDORES_PERMITIDOS")
+
+    assert resultado == frozenset(validos)
+    assert isinstance(resultado, frozenset)
+    assert descartados == invalidos
+
+
+def test_sin_la_variable_no_hay_restriccion(monkeypatch):
+    """Quien no la tiene en su `.env` sigue como antes: lista vacía y nada que avisar."""
+    monkeypatch.delenv("SERVIDORES_PERMITIDOS", raising=False)
+
+    assert config._lista_de_ids("SERVIDORES_PERMITIDOS") == (frozenset(), ())
+
+
+def test_servidor_permitido(bot_mod):
+    permitidos = frozenset({1, 2})
+
+    assert bot_mod.servidor_permitido(1, permitidos)
+    assert bot_mod.servidor_permitido(2, permitidos)
+    assert not bot_mod.servidor_permitido(3, permitidos)
+
+
+def test_lista_vacia_permite_cualquier_servidor(bot_mod):
+    assert bot_mod.servidor_permitido(3, frozenset())
+
+
+def test_los_mensajes_directos_no_se_restringen(bot_mod):
+    """Sin servidor no hay a quién restringir, con lista o sin ella."""
+    assert bot_mod.servidor_permitido(None, frozenset({1}))
+    assert bot_mod.servidor_permitido(None, frozenset())
+
+
+async def test_sale_de_un_servidor_nuevo_que_no_esta_en_la_lista(bot_mod, monkeypatch, caplog):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    guild = _servidor(2, "Ajeno")
+
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        await bot_mod.on_guild_join(guild)
+
+    assert guild.salidas == [2]
+    assert "Ajeno" in caplog.text and "2" in caplog.text
+
+
+async def test_no_sale_de_un_servidor_de_la_lista(bot_mod, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    guild = _servidor(1)
+
+    await bot_mod.on_guild_join(guild)
+
+    assert guild.salidas == []
+
+
+async def test_con_la_lista_vacia_no_sale_de_ningun_servidor(bot_mod, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
+    guild = _servidor(2)
+
+    await bot_mod.on_guild_join(guild)
+
+    assert guild.salidas == []
+
+
+async def test_el_check_rechaza_los_comandos_de_un_servidor_ajeno(bot_mod, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+
+    with pytest.raises(bot_mod.ServidorNoPermitido):
+        await bot_mod.bot.can_run(_ctx(2))
+
+
+async def test_el_check_deja_pasar_servidores_de_la_lista_y_mensajes_directos(bot_mod, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+
+    assert await bot_mod.bot.can_run(_ctx(1))
+    assert await bot_mod.bot.can_run(_ctx(None))
+
+
+async def test_el_check_no_restringe_con_la_lista_vacia(bot_mod, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
+
+    assert await bot_mod.bot.can_run(_ctx(2))
+
+
+async def test_un_servidor_no_permitido_no_recibe_respuesta(bot_mod):
+    ctx = _ctx(2)
+
+    await bot_mod.on_command_error(ctx, bot_mod.ServidorNoPermitido())
+
+    assert ctx.enviados == []
+
+
+async def test_otros_check_failure_siguen_contestando(bot_mod):
+    """La excepción nueva es una `CheckFailure`: las demás no pueden quedar mudas."""
+    ctx = _ctx(1)
+
+    await bot_mod.on_command_error(ctx, commands.CheckFailure("Entra a un canal de voz."))
+
+    assert ctx.enviados == ["Entra a un canal de voz."]
+
+
+def test_on_ready_avisa_si_la_lista_esta_vacia(bot_mod, monkeypatch, caplog):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
+
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([_servidor(1)])
+
+    assert "cualquier servidor" in caplog.text
+    assert "SERVIDORES_PERMITIDOS" in caplog.text
+
+
+def test_on_ready_avisa_de_las_entradas_invalidas(bot_mod, monkeypatch, caplog):
+    """Un ID mal escrito no puede perderse en silencio, aunque la lista tenga otros."""
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ("12x", "abc"))
+
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([_servidor(1)])
+
+    assert "12x, abc" in caplog.text
+    assert "cualquier servidor" not in caplog.text
+
+
+def test_on_ready_avisa_de_los_servidores_ajenos_sin_salirse(bot_mod, monkeypatch, caplog):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
+    propio, ajeno = _servidor(1, "Propio"), _servidor(2, "Ajeno")
+
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([propio, ajeno])
+
+    assert "Ajeno" in caplog.text and "(ID: 2)" in caplog.text
+    assert "Propio" not in caplog.text
+    # Un ID mal escrito no puede hacer que el bot abandone el servidor del dueño.
+    assert propio.salidas == [] and ajeno.salidas == []
