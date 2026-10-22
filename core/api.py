@@ -1,7 +1,7 @@
 """API HTTP local de control: es como los paneles (GTK y web) hablan con el bot.
 
-El bot expone unos pocos endpoints en localhost (estado, log, titulares, volumen
-del DJ, refrescar noticias y apagar) y sirve el panel web en `/`; los paneles son
+El bot expone unos pocos endpoints en localhost (estado, log, titulares, letra,
+volumen del DJ, refrescar noticias y apagar) y sirve el panel web en `/`; los paneles son
 clientes HTTP comunes y corrientes.
 
 Solo escucha en 127.0.0.1: no hay autenticación a propósito, porque nada de
@@ -14,12 +14,14 @@ import asyncio
 import logging
 import time
 from collections import deque
+from functools import partial
 from pathlib import Path
 
+import aiohttp
 import wavelink
 from aiohttp import web
 
-from core import ajustes, config, tts, voces
+from core import ajustes, config, lyrics, resolver, tts, voces
 from core.feeds import invalidate_all as invalidate_feeds
 from core.feeds import refresh_all as refresh_feeds
 from core.guionista import CLAUDE, FRASES, NOMBRES, OLLAMA
@@ -59,6 +61,35 @@ def _estado_lavalink() -> dict:
     }
 
 
+def _id_de_pista(pista) -> str:
+    """Identidad estable de una pista: el id de YouTube (el mismo en cada resolución de la URL), si no su uri, si no título y autor."""
+    return (
+        resolver.id_de_cancion(pista) or getattr(pista, "uri", "")
+        or f"{getattr(pista, 'title', '')}|{getattr(pista, 'author', '')}"
+    )
+
+
+def _posicion_ms(bot, vc) -> int:
+    """Por dónde va el tema. wavelink arrastra la del tema anterior hasta el primer reporte de Lavalink; el cog ya lo corrige."""
+    viva = getattr(bot.get_cog(COG), "posicion_viva", None)
+    return int(viva(vc) if viva else getattr(vc, "position", 0) or 0)
+
+
+def _reproduccion(bot, vc) -> dict:
+    """Dónde va la pista en curso, lo que el panel necesita para seguir la letra. `dj`: es un corte del locutor, no una canción."""
+    actual = getattr(vc, "current", None)
+    dj = bool(getattr(actual, "is_dj_clip", False))
+    largo = int(getattr(actual, "length", 0) or 0)
+    posicion = _posicion_ms(bot, vc) if actual is not None else 0
+    return {
+        "pausado": bool(getattr(vc, "paused", False)),
+        "dj": dj,
+        "pista": _id_de_pista(actual) if actual is not None and not dj else None,
+        "posicion_ms": min(posicion, largo) if largo else posicion,
+        "duracion_ms": largo,
+    }
+
+
 def _estado_voz(bot) -> list[dict]:
     salas = []
     for guild in bot.guilds:
@@ -67,11 +98,13 @@ def _estado_voz(bot) -> list[dict]:
             continue
         actual = getattr(vc, "current", None)
         salas.append({
+            "id": str(guild.id),    # texto: un id de Discord no cabe en un número de JavaScript
             "servidor": guild.name,
             "canal": vc.channel.name if vc.channel else None,
             "sonando": bool(getattr(vc, "playing", False)),
             "cancion": actual.title if actual else None,
             "en_cola": len(vc.queue) if hasattr(vc, "queue") else 0,
+            **_reproduccion(bot, vc),
         })
     return salas
 
@@ -169,6 +202,67 @@ async def handle_headlines(request: web.Request) -> web.Response:
     if not cog:
         return _sin_cog()
     return web.json_response(_foto_de_titulares(cog.dj))
+
+
+def _letra_json(motivo: str | None, **campos) -> web.Response:
+    """La respuesta de `/api/letra`. Sin letra sale vacía con el `motivo`; `ahora_ms` es la hora del servidor."""
+    return web.json_response({
+        "servidor": None, "cancion": None, "pista": None, "sincronizada": False, "lineas": [],
+        "posicion_ms": 0, "pausado": False, "duracion_ms": 0, "dj": False,
+        "ahora_ms": int(time.time() * 1000), "motivo": motivo, **campos,
+    })
+
+
+def _sala_sonando(bot, servidor: str | None):
+    """El servidor pedido, o el primero, con algo sonando; None si no hay."""
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        if vc and getattr(vc, "playing", False) and (not servidor or str(guild.id) == servidor):
+            return guild
+    return None
+
+
+async def _buscar_letra(bot, titulo: str, autor: str, duracion_ms: int):
+    """Busca con la sesión del cog o, si no la hay, con una propia."""
+    artista, cancion = lyrics.artist_and_song(titulo, autor)
+    session = getattr(bot.get_cog(COG), "_session", None)
+    if session is not None:
+        return await lyrics.find_synced(session, titulo, artista, cancion, duracion_ms)
+    async with aiohttp.ClientSession() as propia:
+        return await lyrics.find_synced(propia, titulo, artista, cancion, duracion_ms)
+
+
+async def handle_letra(request: web.Request) -> web.Response:
+    """La letra de lo que suena, con tiempos si los hay. `?servidor=<id>`; sin él, el primero que tenga algo sonando.
+
+    Que no haya letra no es un error: sale vacía con el `motivo` (`nada_sonando`,
+    `dj`, `sin_letra`, `cambio` si la pista cambió mientras se buscaba, `error`).
+    """
+    bot = request.app["bot"]
+    guild = _sala_sonando(bot, request.query.get("servidor"))
+    if guild is None:
+        return _letra_json("nada_sonando")
+    vc, base = guild.voice_client, {"servidor": str(guild.id)}
+    antes = _reproduccion(bot, vc)
+    if antes["dj"] or antes["pista"] is None:
+        return _letra_json("dj" if antes["dj"] else "nada_sonando", dj=antes["dj"], **base)
+    actual = vc.current
+    titulo = resolver.titulo_de(actual)
+    buscar = partial(_buscar_letra, bot, titulo, getattr(actual, "author", "") or "", antes["duracion_ms"])
+    try:
+        letra = await request.app["letras"].obtener(antes["pista"], buscar)
+    except Exception:
+        log.exception("API: error buscando la letra de %r", titulo)
+        return _letra_json("error", cancion=titulo, pista=antes["pista"], **base)
+    # La búsqueda pudo tardar segundos: la posición se mide después, y si el tema cambió, no vale.
+    ahora = _reproduccion(bot, vc)
+    if ahora["pista"] != antes["pista"]:
+        return _letra_json("cambio", **base)
+    datos = {**base, **ahora, "cancion": titulo}
+    if letra is None:
+        return _letra_json("sin_letra", **datos)
+    lineas = [{"ms": ms, "texto": texto} if letra.sincronizada else {"texto": texto} for ms, texto in letra.lineas]
+    return _letra_json(None, **datos, sincronizada=letra.sincronizada, lineas=lineas)
 
 
 async def handle_dj_volume(request: web.Request) -> web.Response:
@@ -362,11 +456,13 @@ def crear_app(bot, apagar: asyncio.Event, puerto: int) -> web.Application:
     app["bot"] = bot
     app["apagar"] = apagar
     app["arranque"] = time.monotonic()
+    app["letras"] = lyrics.Letras()
     app.add_routes([
         web.get("/", handle_pagina),
         web.get("/api/log", handle_log),
         web.get("/api/status", handle_status),
         web.get("/api/headlines", handle_headlines),
+        web.get("/api/letra", handle_letra),
         web.get("/api/dj_volume", handle_dj_volume),
         web.post("/api/dj_volume", handle_dj_volume),
         web.get("/api/voces", handle_voces),

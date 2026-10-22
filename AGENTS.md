@@ -63,6 +63,7 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/ajustes.py` | Ajustes persistentes de los paneles en `estado/ajustes.json` (`voz`, `filtro_radio`); escritura atómica |
 | `core/guionista.py` | Guionista opcional del DJ (`frases` \| `claude` \| `ollama`, `DJ_GUIONISTA`): escribe la presentación de cada tema; si falla devuelve `None` y el DJ cae a sus frases. Claude va por el SDK `anthropic`; se cambia en caliente con `elegir()` |
 | `core/spotify.py` | Embed público: de Spotify salen **solo nombres**, nunca audio |
+| `core/lyrics.py` | Letras (LRCLIB con tiempos, lyrics.ovh de respaldo) para `!lyrics` y `/api/letra`, con caché por canción |
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
 | `core/persistencia.py` | La cola de cada servidor en `estado/colas.json` (no se versiona): el cog la guarda sola y el bot la retoma al volver, si hay gente en el canal y no pasaron 6 h |
 | `scripts/lavadj-panel.py` | Panel GTK4 (proceso aparte): solo la ventana y el arranque |
@@ -86,10 +87,10 @@ cambias esa ruta hay que cambiarla en los dos lados o el DJ se queda mudo.
    (ya hubo una caída por eso: el panel pisaba `View._refresh()`).
 4. Los tests son async (`asyncio_mode = auto` en `pytest.ini`); no hace falta
    decorar cada test con `@pytest.mark.asyncio`.
-
 5. **Los comandos de música son híbridos** (`!` y `/`): `description` y
    `app_commands.describe` en español (100 caracteres como máximo), `await ctx.defer()`
    al empezar si buscan o resuelven (Discord da 3 s) y toda ruta termina en un mensaje.
+
 ## De dónde sale el audio de YouTube
 
 **Lo resuelve yt-dlp, no Lavalink** (`core/resolver.py`). El plugin

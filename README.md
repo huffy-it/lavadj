@@ -254,7 +254,7 @@ Ambos son clientes HTTP de la API del bot; ninguno comparte proceso con él.
 
 **Panel web.** Con el bot en marcha, abre <http://127.0.0.1:9876/> (el puerto es
 `API_PORT`). Muestra el estado del bot, de Lavalink y de yt-dlp, qué suena en
-cada servidor, el volumen y la voz del DJ (se elige entre las de Piper), los titulares pendientes, el log
+cada servidor y su letra (al compás si LRCLIB trae los tiempos), el volumen y la voz del DJ (se elige entre las de Piper), los titulares pendientes, el log
 reciente y un botón para apagar el bot. Funciona en cualquier sistema.
 
 **Panel de escritorio GTK4 (solo Linux).** `scripts/lavadj-panel.py`. Enciende y
@@ -276,6 +276,7 @@ que no sea `127.0.0.1`, `localhost` o `[::1]` con su puerto, y los POST cuyo
 | `/api/status` | GET | Estado del bot, Lavalink, voz, salud de la transmisión y yt-dlp |
 | `/api/log` | GET | Últimas líneas de `bot.log` (`?lineas=1-500`) |
 | `/api/headlines` | GET | Titulares que el DJ tiene en cola |
+| `/api/letra` | GET | Letra de lo que suena, con tiempos si los hay, y por dónde va (`?servidor=<id>`; sin él, el primero que suene) |
 | `/api/dj_volume` | GET/POST | Lee o fija el volumen del DJ (`?valor=0-200`) |
 | `/api/voces` | GET | Catálogo de voces con su estado, la voz en uso y el filtro de radio |
 | `/api/voces/muestra` | GET | Frase de muestra en `audio/wav` (`?voz=<id>`) |

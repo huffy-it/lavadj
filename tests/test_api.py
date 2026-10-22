@@ -8,14 +8,16 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
-from core import ajustes, api, config, tts, voces
+from core import ajustes, api, config, lyrics, resolver, tts, voces
 from core.dj import DJ
 from core.feeds import FeedCache
 from core.guionista import Guionista
+from core.lyrics import Letra
 from core.resolver import Resolver
 from core.salud import Salud
 
@@ -40,11 +42,12 @@ class FakeBot:
         return True
 
 
-def pedido(metodo, ruta, bot=None):
+def pedido(metodo, ruta, bot=None, letras=None):
     app = web.Application()
     app["bot"] = bot if bot is not None else FakeBot(FakeCog())
     app["apagar"] = asyncio.Event()
     app["arranque"] = 0.0
+    app["letras"] = letras if letras is not None else lyrics.Letras()
     return make_mocked_request(metodo, ruta, app=app)
 
 
@@ -100,6 +103,297 @@ def test_post_dj_volume_con_basura_es_400():
 def test_dj_volume_sin_cog_es_503():
     respuesta = asyncio.run(api.handle_dj_volume(pedido("GET", "/api/dj_volume", FakeBot(None))))
     assert respuesta.status == 503
+
+
+# --- estado de voz y letra --------------------------------------------------
+
+SNOWFLAKE = 1234567890123456789      # no cabe en un número de JavaScript: tiene que viajar como texto
+
+
+def pista(titulo="Never Gonna Give You Up", autor="Rick Astley - Topic", id="dQw4w9WgXcQ", largo=213_000, **extra):
+    atributos = dict(
+        title=titulo, author=autor, identifier=id, uri=f"https://www.youtube.com/watch?v={id}", length=largo, extras={},
+    )
+    return SimpleNamespace(**{**atributos, **extra})
+
+
+def sala(actual=None, posicion=0, pausado=False, id=SNOWFLAKE, nombre="Servidor"):
+    """Un servidor con su voice_client de mentira; sin `actual` no suena nada."""
+    vc = SimpleNamespace(
+        current=actual, playing=actual is not None, paused=pausado, position=posicion, queue=[1, 2],
+        channel=SimpleNamespace(name="General"),
+    )
+    guild = SimpleNamespace(id=id, name=nombre, voice_client=vc)
+    vc.guild = guild
+    return guild
+
+
+def bot_con(*salas, cog=None):
+    bot = FakeBot(cog)
+    bot.guilds = list(salas)
+    return bot
+
+
+def test_el_estado_de_voz_trae_la_posicion_el_id_y_la_pista():
+    bot = bot_con(sala(pista(), posicion=65_000), cog=FakeCog())
+
+    (voz,) = api._estado_voz(bot)
+
+    assert voz == {
+        "id": str(SNOWFLAKE), "servidor": "Servidor", "canal": "General", "sonando": True,
+        "cancion": "Never Gonna Give You Up", "en_cola": 2,
+        "posicion_ms": 65_000, "pausado": False, "duracion_ms": 213_000, "pista": "dQw4w9WgXcQ", "dj": False,
+    }
+    assert json.dumps(voz)    # tiene que serializarse tal cual
+
+
+def test_el_estado_de_voz_con_el_tema_en_pausa():
+    (voz,) = api._estado_voz(bot_con(sala(pista(), posicion=30_000, pausado=True)))
+
+    assert voz["pausado"] is True and voz["posicion_ms"] == 30_000
+
+
+def test_el_estado_de_voz_sin_nada_sonando_va_en_ceros():
+    (voz,) = api._estado_voz(bot_con(sala()))
+
+    assert voz["sonando"] is False and voz["cancion"] is None
+    assert (voz["pista"], voz["posicion_ms"], voz["duracion_ms"], voz["dj"]) == (None, 0, 0, False)
+
+
+def test_el_estado_de_voz_no_pasa_de_la_duracion():
+    (voz,) = api._estado_voz(bot_con(sala(pista(largo=200_000), posicion=999_000)))
+
+    assert voz["posicion_ms"] == 200_000
+
+
+def test_la_pista_es_el_id_de_youtube_aunque_la_url_resuelta_cambie():
+    """Cada resolución trae otra URL de googlevideo y otro `identifier`; el origen guardado no cambia."""
+    resuelta = pista(id="https://rr1.googlevideo.com/videoplayback?x=1", extras={
+        resolver.CLAVE_ORIGEN: {"identifier": "dQw4w9WgXcQ", "uri": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+    })
+
+    (voz,) = api._estado_voz(bot_con(sala(resuelta)))
+
+    assert voz["pista"] == "dQw4w9WgXcQ"
+
+
+def test_un_corte_del_dj_se_marca_y_no_lleva_pista():
+    (voz,) = api._estado_voz(bot_con(sala(pista(id="C:/dj_cache/clip.wav", is_dj_clip=True))))
+
+    assert voz["dj"] is True and voz["pista"] is None
+
+
+def test_el_estado_de_voz_toma_la_posicion_del_cog_si_la_sabe():
+    """wavelink arrastra la posición del tema anterior hasta el primer reporte de Lavalink; el cog lo corrige."""
+    class CogConPosicion(FakeCog):
+        @staticmethod
+        def posicion_viva(vc):
+            return 4_000
+
+    (voz,) = api._estado_voz(bot_con(sala(pista(), posicion=180_000), cog=CogConPosicion()))
+
+    assert voz["posicion_ms"] == 4_000
+
+
+def test_el_estado_de_voz_sin_cog_usa_la_posicion_de_wavelink():
+    (voz,) = api._estado_voz(bot_con(sala(pista(), posicion=7_000), cog=None))
+
+    assert voz["posicion_ms"] == 7_000
+
+
+def test_el_status_incluye_los_campos_nuevos():
+    bot = bot_con(sala(pista(), posicion=1_000), cog=FakeCog())
+
+    respuesta = asyncio.run(api.handle_status(pedido("GET", "/api/status", bot)))
+
+    assert cuerpo(respuesta)["voz"][0]["pista"] == "dQw4w9WgXcQ"
+
+
+@pytest.fixture
+def busqueda(monkeypatch):
+    """`lyrics.find_synced` de mentira: anota cada llamada y contesta `.letra` (o lanza `.error`)."""
+    b = SimpleNamespace(letra=Letra(True, [(1000, "uno"), (5000, "dos & <b>tres</b>")]), error=None, llamadas=[], durante=None)
+
+    async def falsa(session, titulo, artista, cancion, duracion_ms=0):
+        b.llamadas.append((session, titulo, artista, cancion, duracion_ms))
+        if b.durante:
+            b.durante()
+        if b.error:
+            raise b.error
+        return b.letra
+
+    monkeypatch.setattr(lyrics, "find_synced", falsa)
+    return b
+
+
+def letra(bot, ruta="/api/letra", letras=None):
+    return asyncio.run(api.handle_letra(pedido("GET", ruta, bot, letras=letras)))
+
+
+def test_letra_sincronizada_trae_las_lineas_con_tiempo_y_la_posicion(busqueda):
+    respuesta = letra(bot_con(sala(pista(), posicion=65_000), cog=FakeCog()))
+
+    assert respuesta.status == 200
+    datos = cuerpo(respuesta)
+    assert isinstance(datos.pop("ahora_ms"), int)
+    assert datos == {
+        "servidor": str(SNOWFLAKE), "cancion": "Never Gonna Give You Up", "pista": "dQw4w9WgXcQ", "motivo": None,
+        "sincronizada": True, "lineas": [{"ms": 1000, "texto": "uno"}, {"ms": 5000, "texto": "dos & <b>tres</b>"}],
+        "posicion_ms": 65_000, "pausado": False, "duracion_ms": 213_000, "dj": False,
+    }
+
+
+def test_letra_busca_con_la_sesion_del_cog_el_titulo_el_artista_del_canal_y_la_duracion(busqueda):
+    letra(bot_con(sala(pista()), cog=FakeCog(session="la sesión")))
+
+    assert busqueda.llamadas == [("la sesión", "Never Gonna Give You Up", "Rick Astley", "Never Gonna Give You Up", 213_000)]
+
+
+def test_letra_saca_el_artista_del_titulo_si_lo_trae(busqueda):
+    letra(bot_con(sala(pista("Soda Stereo - De Música Ligera (Official Video)", "SodaStereoVEVO")), cog=FakeCog()))
+
+    assert busqueda.llamadas[0][2:4] == ("Soda Stereo", "De Música Ligera")
+
+
+def test_letra_sin_sesion_del_cog_usa_una_propia(busqueda):
+    letra(bot_con(sala(pista()), cog=FakeCog(session=None)))
+    letra(bot_con(sala(pista(id="otra")), cog=None))
+
+    assert len(busqueda.llamadas) == 2
+    assert all(isinstance(llamada[0], aiohttp.ClientSession) for llamada in busqueda.llamadas)
+
+
+def test_letra_sin_sincronizar_trae_solo_texto(busqueda):
+    busqueda.letra = Letra(False, [(None, "uno"), (None, ""), (None, "dos")])
+
+    datos = cuerpo(letra(bot_con(sala(pista()), cog=FakeCog())))
+
+    assert datos["sincronizada"] is False and datos["motivo"] is None
+    assert datos["lineas"] == [{"texto": "uno"}, {"texto": ""}, {"texto": "dos"}]
+
+
+def test_letra_que_no_existe_sale_vacia_con_el_motivo_y_sin_ser_un_error(busqueda):
+    busqueda.letra = None
+
+    respuesta = letra(bot_con(sala(pista(), posicion=9_000), cog=FakeCog()))
+
+    assert respuesta.status == 200
+    datos = cuerpo(respuesta)
+    assert datos["motivo"] == "sin_letra" and datos["lineas"] == [] and datos["sincronizada"] is False
+    assert datos["cancion"] == "Never Gonna Give You Up" and datos["pista"] == "dQw4w9WgXcQ" and datos["posicion_ms"] == 9_000
+
+
+def test_letra_si_la_busqueda_revienta_sale_vacia_con_motivo_error(busqueda):
+    busqueda.error = RuntimeError("bug")
+
+    respuesta = letra(bot_con(sala(pista()), cog=FakeCog()))
+
+    assert respuesta.status == 200
+    datos = cuerpo(respuesta)
+    assert datos["motivo"] == "error" and datos["lineas"] == [] and datos["pista"] == "dQw4w9WgXcQ"
+
+
+@pytest.mark.parametrize("salas", [[], [sala()]], ids=["sin servidores", "servidor en silencio"])
+def test_letra_sin_nada_sonando_sale_vacia_con_motivo(busqueda, salas):
+    respuesta = letra(bot_con(*salas, cog=FakeCog()))
+
+    assert respuesta.status == 200
+    datos = cuerpo(respuesta)
+    assert datos["motivo"] == "nada_sonando" and datos["lineas"] == []
+    assert datos["cancion"] is None and datos["servidor"] is None and datos["pista"] is None
+    assert busqueda.llamadas == []
+
+
+def test_letra_con_el_dj_hablando_no_busca_nada(busqueda):
+    datos = cuerpo(letra(bot_con(sala(pista(id="C:/dj_cache/clip.wav", is_dj_clip=True)), cog=FakeCog())))
+
+    assert datos["motivo"] == "dj" and datos["dj"] is True and datos["lineas"] == []
+    assert busqueda.llamadas == []
+
+
+def test_letra_sin_servidor_es_la_del_primero_que_suena(busqueda):
+    bot = bot_con(sala(), sala(pista("Primera"), id=2), sala(pista("Segunda"), id=3), cog=FakeCog())
+
+    datos = cuerpo(letra(bot))
+
+    assert datos["servidor"] == "2" and datos["cancion"] == "Primera"
+
+
+def test_letra_con_servidor_es_la_de_ese_servidor(busqueda):
+    bot = bot_con(sala(pista("Primera", id="a"), id=2), sala(pista("Segunda", id="b"), id=SNOWFLAKE), cog=FakeCog())
+
+    datos = cuerpo(letra(bot, f"/api/letra?servidor={SNOWFLAKE}"))
+
+    assert datos["servidor"] == str(SNOWFLAKE) and datos["cancion"] == "Segunda"
+    assert [llamada[1] for llamada in busqueda.llamadas] == ["Segunda"]
+
+
+@pytest.mark.parametrize("servidor", ["999", "abc", "../../etc", "3"])
+def test_letra_de_un_servidor_que_no_suena_o_no_existe_sale_vacia(busqueda, servidor):
+    bot = bot_con(sala(pista(), id=2), sala(id=3), cog=FakeCog())
+
+    respuesta = letra(bot, f"/api/letra?servidor={servidor}")
+
+    assert respuesta.status == 200 and cuerpo(respuesta)["motivo"] == "nada_sonando"
+    assert busqueda.llamadas == []
+
+
+def test_letra_se_busca_una_sola_vez_por_pista_aunque_el_panel_pregunte_otra_vez(busqueda):
+    letras, guild = lyrics.Letras(), sala(pista(), posicion=1_000)
+    bot = bot_con(guild, cog=FakeCog())
+
+    primera = cuerpo(letra(bot, letras=letras))
+    guild.voice_client.position = 20_000
+    segunda = cuerpo(letra(bot, letras=letras))
+
+    assert len(busqueda.llamadas) == 1
+    assert primera["lineas"] == segunda["lineas"]
+    assert (primera["posicion_ms"], segunda["posicion_ms"]) == (1_000, 20_000)      # la posición sí se mide cada vez
+
+
+def test_letra_que_no_se_encontro_tampoco_se_vuelve_a_buscar(busqueda):
+    busqueda.letra = None
+    letras, bot = lyrics.Letras(), bot_con(sala(pista()), cog=FakeCog())
+
+    letra(bot, letras=letras)
+    letra(bot, letras=letras)
+
+    assert len(busqueda.llamadas) == 1
+
+
+def test_letra_de_otra_pista_se_busca_de_nuevo(busqueda):
+    letras, guild = lyrics.Letras(), sala(pista(id="a"))
+    bot = bot_con(guild, cog=FakeCog())
+
+    letra(bot, letras=letras)
+    guild.voice_client.current = pista(id="b")
+    letra(bot, letras=letras)
+
+    assert len(busqueda.llamadas) == 2
+
+
+def test_letra_si_la_pista_cambia_mientras_se_busca_no_vale(busqueda):
+    guild = sala(pista(id="a"), posicion=500)
+    busqueda.durante = lambda: setattr(guild.voice_client, "current", pista(id="b"))
+
+    datos = cuerpo(letra(bot_con(guild, cog=FakeCog())))
+
+    assert datos["motivo"] == "cambio" and datos["lineas"] == []
+
+
+def test_letra_el_estado_pausado_viaja(busqueda):
+    datos = cuerpo(letra(bot_con(sala(pista(), posicion=42_000, pausado=True), cog=FakeCog())))
+
+    assert datos["pausado"] is True and datos["posicion_ms"] == 42_000
+
+
+async def test_la_ruta_de_la_letra_existe_y_pasa_por_la_proteccion():
+    async def prueba(cliente, puerto, app):
+        r = await cliente.get("/api/letra")
+        assert r.status == 200 and (await r.json())["motivo"] == "nada_sonando"
+        assert (await cliente.get("/api/letra", headers={"Host": "evil.example.com"})).status == 403
+
+    await _con_servidor(prueba)
 
 
 # --- titulares --------------------------------------------------------------
@@ -582,6 +876,12 @@ def test_la_pagina_del_panel_trae_la_seccion_de_voces():
 def test_la_pagina_del_panel_trae_la_seccion_del_guionista():
     pagina = asyncio.run(api.handle_pagina(pedido("GET", "/"))).text
     for pieza in ("api('guionista", "Guionista del DJ", "Frases fijas", "Claude (API, cobra por uso)", "Ollama (local)", "esc("):
+        assert pieza in pagina
+
+
+def test_la_pagina_del_panel_trae_la_tarjeta_de_la_letra():
+    pagina = asyncio.run(api.handle_pagina(pedido("GET", "/"))).text
+    for pieza in ("api('letra?servidor=", "<h2>Letra</h2>", "requestAnimationFrame", "performance.now()", "localStorage", "esc(l.texto)"):
         assert pieza in pagina
 
 

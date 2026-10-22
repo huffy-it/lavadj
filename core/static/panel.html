@@ -30,6 +30,14 @@
   .voz button { padding:3px 10px; } button.sec { background:transparent; color:var(--fg); border:1px solid var(--mut); }
   .voz progress { width:90px; } .err { color:var(--bad); font-size:13px; }
   .guion { display:flex; align-items:center; gap:8px; padding:3px 0; } .guion small { color:var(--mut); }
+  .letra summary { cursor:pointer; list-style:none; display:flex; align-items:baseline; gap:8px; }
+  .letra summary::-webkit-details-marker { display:none; }
+  .letra summary::before { content:'▸'; color:var(--mut); font-size:12px; } .letra[open] summary::before { content:'▾'; }
+  .letra summary h2 { margin:0; } .letra summary small { color:var(--mut); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #letraCaja { position:relative; max-height:260px; overflow:auto; margin-top:8px; }
+  #letraCaja p { margin:0; padding:2px 0; }
+  #letraCaja.sync p { color:var(--mut); transition:color .2s; } #letraCaja.sync p.on { color:var(--fg); font-weight:600; }
+  #letraCaja.sync p:empty::before { content:'♪'; } #letraCaja.plana p:empty { height:.8em; }
 </style>
 </head>
 <body>
@@ -46,6 +54,13 @@
   </div>
 
   <div class="card"><h2>En el aire</h2><div id="voz">Nada.</div></div>
+
+  <div class="card">
+    <details id="letraDet" class="letra" open>
+      <summary><h2>Letra</h2><small id="letraTit"></small></summary>
+      <div id="letraCaja"><p>Nada sonando.</p></div>
+    </details>
+  </div>
 
   <div class="card">
     <h2>Voz del DJ</h2>
@@ -104,6 +119,7 @@ async function actualizar() {
     $('servidores').textContent = e.servidores;
     $('voz').innerHTML = e.voz.length ? e.voz.map(v =>
       `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.sonando ? '▶ ' + esc(v.cancion || '') : 'quieto'} · ${v.en_cola} en cola</span></div>`).join('') : 'Nada.';
+    try { seguirLetra(e.voz); } catch (_) {}    // que la letra falle no es que el bot esté apagado
   } catch (_) {
     $('luz').className = 'dot bad'; $('bot').textContent = 'APAGADO';
     return;
@@ -223,6 +239,68 @@ $('guionistas').onchange = async e => {
     await cargarGuionista(r.error ? null : r);
   } catch (err) { $('guionistaError').textContent = err.message; }
 };
+
+const caja = $('letraCaja'), det = $('letraDet');
+const AVISOS = {sin_letra: 'No encontré la letra de esta canción.', error: 'No pude buscar la letra.'};
+let letra = {pista: null, sync: false, lineas: []}, pedida = null, ancla = null, activa = -1, sala = null, libre = 0;
+
+function avisoLetra(texto) { caja.className = ''; caja.innerHTML = `<p>${esc(texto)}</p>`; }
+
+function pintarLetra(r) {
+  letra = {pista: r.pista, sync: r.sincronizada, lineas: r.lineas};
+  activa = -1;
+  if (!r.lineas.length) return avisoLetra(AVISOS[r.motivo] || 'Sin letra.');
+  caja.className = r.sincronizada ? 'sync' : 'plana';
+  caja.innerHTML = r.lineas.map(l => `<p>${esc(l.texto)}</p>`).join('');
+  caja.scrollTop = 0;
+}
+
+// La letra se pide solo cuando cambia la pista; la posición entre sondeos se interpola en `resaltar`.
+async function pedirLetra(v) {
+  if (!det.open || pedida === v.pista) return;
+  pedida = v.pista; ancla = null; letra = {pista: null, sync: false, lineas: []};
+  $('letraTit').textContent = v.cancion || '';
+  avisoLetra('Buscando la letra…');
+  try {
+    const r = await api('letra?servidor=' + encodeURIComponent(v.id));
+    if (r.pista !== pedida) { pedida = null; return; }    // cambió mientras se buscaba: el próximo sondeo la pide otra vez
+    ancla = {pos: r.posicion_ms, t: performance.now(), pausado: r.pausado};
+    pintarLetra(r);
+  } catch (_) { pedida = null; }
+}
+
+function seguirLetra(voz) {
+  sala = voz.find(v => v.sonando) || null;
+  if (!sala) { pedida = null; ancla = null; letra.pista = null; $('letraTit').textContent = ''; return avisoLetra('Nada sonando.'); }
+  if (sala.dj) { ancla = null; return; }    // habla el locutor: la letra se queda donde estaba
+  if (sala.pista === letra.pista) ancla = {pos: sala.posicion_ms, t: performance.now(), pausado: sala.pausado};
+  else pedirLetra(sala);
+}
+
+function resaltar(forzar) {
+  if (!ancla || !letra.sync || !det.open || !caja.children.length) return;
+  const pos = ancla.pausado ? ancla.pos : ancla.pos + performance.now() - ancla.t, ls = letra.lineas;
+  let lo = 0, hi = ls.length - 1, i = -1;    // la última línea con ms <= pos
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (ls[m].ms <= pos) { i = m; lo = m + 1; } else hi = m - 1; }
+  if (i === activa && !forzar) return;
+  const ps = caja.children;
+  if (ps[activa]) ps[activa].classList.remove('on');
+  activa = i;
+  if (!ps[i]) return;
+  ps[i].classList.add('on');
+  // Dentro de la tarjeta (scrollIntoView movería toda la página); quien rueda a mano no es arrastrado de vuelta.
+  if (performance.now() > libre) caja.scrollTo({top: ps[i].offsetTop - (caja.clientHeight - ps[i].offsetHeight) / 2, behavior: 'smooth'});
+}
+
+const bucle = () => { resaltar(); requestAnimationFrame(bucle); };
+const soltar = () => { libre = performance.now() + 4000; };
+caja.addEventListener('wheel', soltar, {passive: true}); caja.addEventListener('touchmove', soltar, {passive: true});
+try { det.open = localStorage.getItem('lavadj.letra') !== '0'; } catch (_) {}
+det.ontoggle = () => {
+  try { localStorage.setItem('lavadj.letra', det.open ? '1' : '0'); } catch (_) {}
+  if (det.open && sala) { pedirLetra(sala); resaltar(true); }
+};
+requestAnimationFrame(bucle);
 
 actualizar(); setInterval(() => { if (!document.hidden) actualizar(); }, 3000);
 </script>
