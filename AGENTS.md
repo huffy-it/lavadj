@@ -45,7 +45,7 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | Ruta | Responsabilidad |
 |---|---|
 | `bot.py` | Arranque, carga de cogs |
-| `cogs/music.py` | Comandos de Discord de música (wavelink) |
+| `cogs/music.py` | Comandos de Discord de música (wavelink) y el vigilante que destraba la cola |
 | `core/controller.py` | Estado de reproducción y colas |
 | `core/api.py` | API HTTP en `:9876` que consumen los paneles; también sirve el panel web en `/` |
 | `core/static/panel.html` | Panel web (multiplataforma) |
@@ -109,6 +109,12 @@ plugins. Para cambiar de versión: versión y hash en los dos scripts, el nombre
 jar en `lavalink.ps1`, y borrar el jar viejo para que no se carguen los dos.
 
 ## Cuando YouTube deja de sonar
+
+**Si la cola se queda muda** (el AutoPlay de wavelink se frena tras errores seguidos y
+nada suena con temas esperando), el vigilante del cog lo destraba: cada `VIGILAR_CADA`
+(20 s) revisa cada player, y si lo ve dos veces seguidas conectado, sin pausa, sin
+sonar ni resolver y con algo en `queue` o `auto_queue`, arranca el siguiente por el
+mismo camino que `!play`. Solo el vigilante arranca temas del `auto_queue`.
 
 **El síntoma engaña.** La búsqueda sigue funcionando y solo se cae al resolver el
 formato, así que desde Discord parece "no carga ninguna canción". Separa las dos

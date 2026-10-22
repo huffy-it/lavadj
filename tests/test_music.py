@@ -42,6 +42,7 @@ class FakeQueue(list):
 class FakePlayer:
     def __init__(self, playing=False, temas=(), auto=(), guild=None):
         self.playing = playing
+        self.paused = False
         self.connected = True
         self.queue = FakeQueue(temas)
         self.auto_queue = FakeQueue(auto)
@@ -1233,3 +1234,285 @@ async def test_si_la_precarga_falla_el_panel_sale_igual(cog, monkeypatch, caplog
 
     assert publicados == [vc]
     assert "precargar" in caplog.text
+
+
+# --- el vigilante que destraba la cola ---------------------------------------------
+
+class PlayerQueSeQuedaMudo(FakePlayer):
+    async def play(self, track):
+        self.tocando.append(track)
+
+
+class PlayerQueRevienta(FakePlayer):
+    async def play(self, track):
+        raise RuntimeError("Lavalink no responde")
+
+
+class PlayerQueRevientaAlMirarlo(FakePlayer):
+    @property
+    def paused(self):
+        raise RuntimeError("el player se estaba desconectando")
+
+    @paused.setter
+    def paused(self, valor):
+        pass
+
+
+async def _revisar(cog, players, veces):
+    """Con tope de tiempo: un vigilante que pisara un arranque esperaría su lock."""
+    async def _pasadas():
+        for _ in range(veces):
+            await cog._vigilar_una_vez(players)
+    await asyncio.wait_for(_pasadas(), timeout=1)
+
+
+async def test_una_sola_revision_atascada_no_actua_pero_dos_seguidas_si(cog):
+    tema = FakeTrack("la que espera")
+    vc = FakePlayer(temas=[tema])
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == []
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == [tema]
+
+
+async def test_con_cola_destraba_por_el_arranque_de_siempre_y_suelta_el_freno(cog, caplog):
+    primera, segunda = FakeTrack("primera"), FakeTrack("segunda")
+    vc = FakePlayer(temas=[primera, segunda])
+    vc._error_count = music_mod.TOPE_DE_WAVELINK
+    cog._caidas[vc.guild.id] = music_mod.CAIDAS_SEGUIDAS_MAX
+    with caplog.at_level("WARNING", logger="music"):
+        await _revisar(cog, [vc], 2)
+    assert vc.tocando == [primera]
+    assert list(vc.queue) == [segunda]
+    assert vc._error_count == 0
+    assert vc.guild.id not in cog._caidas
+    assert "Nada suena" in caplog.text and "2 en cola" in caplog.text
+
+
+async def test_con_la_cola_vacia_destraba_con_el_tema_del_autoplay(cog):
+    sugerida, otra = FakeTrack("sugerida"), FakeTrack("otra")
+    vc = FakePlayer(auto=[sugerida, otra])
+    vc._error_count = music_mod.TOPE_DE_WAVELINK
+    cog._caidas[vc.guild.id] = music_mod.CAIDAS_SEGUIDAS_MAX
+    await _revisar(cog, [vc], 2)
+    assert vc.tocando == [sugerida]
+    assert list(vc.auto_queue) == [otra]
+    assert vc._error_count == 0
+    assert vc.guild.id not in cog._caidas
+
+
+async def test_lo_que_pidieron_va_antes_que_lo_que_recomendo_el_autoplay(cog):
+    pedida, sugerida = FakeTrack("pedida"), FakeTrack("sugerida")
+    vc = FakePlayer(temas=[pedida], auto=[sugerida])
+    await _revisar(cog, [vc], 2)
+    assert vc.tocando == [pedida]
+    assert list(vc.auto_queue) == [sugerida]
+
+
+def _pausado(vc):
+    vc.paused = True
+
+
+def _sonando(vc):
+    vc.playing = True
+
+
+def _resolviendo(vc):
+    vc.resolviendo = 1
+
+
+def _desconectado(vc):
+    vc.connected = False
+
+
+def _sin_nada_que_tocar(vc):
+    vc.queue.clear()
+    vc.auto_queue.clear()
+
+
+@pytest.mark.parametrize("estado", [
+    pytest.param(_pausado, id="pausado"),
+    pytest.param(_sonando, id="sonando"),
+    pytest.param(_resolviendo, id="resolviendo"),
+    pytest.param(_desconectado, id="desconectado"),
+    pytest.param(_sin_nada_que_tocar, id="sin-nada-en-cola"),
+])
+async def test_el_vigilante_no_toca_lo_que_no_esta_atascado(cog, caplog, estado):
+    vc = FakePlayer(temas=[FakeTrack("de la cola")], auto=[FakeTrack("del autoplay")])
+    estado(vc)
+    with caplog.at_level("WARNING", logger="music"):
+        await _revisar(cog, [vc], 4)
+    assert vc.tocando == []
+    # `_arrancar_si_hace_falta` ya rechaza a un player ocupado: no alcanza con eso.
+    assert "Nada suena" not in caplog.text
+
+
+async def test_con_el_lock_del_servidor_tomado_no_es_un_atasco(cog):
+    vc = FakePlayer(temas=[FakeTrack("de la cola")])
+    lock = cog._arranques.setdefault(vc.guild.id, asyncio.Lock())
+    await lock.acquire()
+    await _revisar(cog, [vc], 4)
+    assert vc.tocando == []
+    lock.release()
+    # Con el lock tomado tampoco se anotó nada: otra vez hacen falta dos.
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == []
+    await cog._vigilar_una_vez([vc])
+    assert len(vc.tocando) == 1
+
+
+async def test_no_pisa_un_arranque_que_esta_sintetizando_la_voz_del_dj(cog, monkeypatch):
+    primero, segundo = FakeTrack("primero"), FakeTrack("segundo")
+    vc = FakePlayer(temas=[primero, segundo])
+    sintetizando, suelta = asyncio.Event(), asyncio.Event()
+
+    async def _dj_que_tarda(self, vc, para):
+        sintetizando.set()
+        await suelta.wait()
+
+    monkeypatch.setattr(cog.dj, "available", lambda: True)
+    monkeypatch.setattr(Music, "_encolar_dj", _dj_que_tarda)
+    arranque = asyncio.create_task(cog._arrancar_si_hace_falta(vc))
+    await sintetizando.wait()
+    await _revisar(cog, [vc], 4)
+    suelta.set()
+    await arranque
+    assert vc.tocando == [primero]
+    assert list(vc.queue) == [segundo]
+
+
+async def test_una_transicion_que_se_resuelve_entre_revisiones_no_acumula(cog):
+    vc = FakePlayer(temas=[FakeTrack("de la cola")])
+    await cog._vigilar_una_vez([vc])
+    vc.playing = True
+    await cog._vigilar_una_vez([vc])
+    vc.playing = False
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == []
+    await cog._vigilar_una_vez([vc])
+    assert len(vc.tocando) == 1
+
+
+async def test_despues_de_actuar_hacen_falta_otras_dos_revisiones(cog):
+    a, b = FakeTrack("a"), FakeTrack("b")
+    vc = PlayerQueSeQuedaMudo(temas=[a, b])
+    await _revisar(cog, [vc], 2)
+    assert vc.tocando == [a]
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == [a]
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == [a, b]
+
+
+async def test_cada_servidor_lleva_su_propia_cuenta(cog):
+    uno = FakePlayer(temas=[FakeTrack("uno")], guild=FakeGuild(1))
+    otro = FakePlayer(temas=[FakeTrack("otro")], guild=FakeGuild(2))
+    await cog._vigilar_una_vez([uno])
+    await cog._vigilar_una_vez([uno, otro])
+    assert len(uno.tocando) == 1
+    assert otro.tocando == []
+
+
+async def test_un_servidor_que_ya_no_esta_pierde_su_marca(cog):
+    vc = FakePlayer(temas=[FakeTrack("de la cola")])
+    await cog._vigilar_una_vez([vc])
+    await cog._vigilar_una_vez([])
+    await cog._vigilar_una_vez([vc])
+    assert vc.tocando == []
+
+
+async def test_un_player_sin_servidor_se_ignora(cog):
+    vc = FakePlayer(temas=[FakeTrack("de la cola")])
+    vc.guild = None
+    await _revisar(cog, [vc], 4)
+    assert vc.tocando == []
+
+
+@pytest.mark.parametrize("clase", [PlayerQueRevienta, PlayerQueRevientaAlMirarlo])
+async def test_un_player_que_falla_no_frena_la_revision_de_los_demas(cog, caplog, clase):
+    roto = clase(temas=[FakeTrack("del roto")], guild=FakeGuild(1))
+    bueno = FakePlayer(temas=[FakeTrack("del bueno")], guild=FakeGuild(2))
+    with caplog.at_level("ERROR", logger="music"):
+        await _revisar(cog, [roto, bueno], 2)
+    assert len(bueno.tocando) == 1
+    assert "No pude revisar" in caplog.text
+
+
+# --- `_arrancar_si_hace_falta` y el autoplay ---------------------------------------
+
+async def test_arrancar_sin_el_parametro_nuevo_no_toca_el_autoplay(cog):
+    vc = FakePlayer(auto=[FakeTrack("sugerida")])
+    await cog._arrancar_si_hace_falta(vc)
+    assert vc.tocando == []
+    assert len(vc.auto_queue) == 1
+
+
+async def test_con_cola_el_autoplay_se_queda_quieto_aunque_se_lo_incluya(cog):
+    pedida, sugerida = FakeTrack("pedida"), FakeTrack("sugerida")
+    vc = FakePlayer(temas=[pedida], auto=[sugerida])
+    await cog._arrancar_si_hace_falta(vc, incluir_autoplay=True)
+    assert vc.tocando == [pedida]
+    assert list(vc.auto_queue) == [sugerida]
+
+
+async def test_el_corte_del_dj_abre_el_tema_del_autoplay_sin_perderlo(cog, monkeypatch):
+    sugerida, corte = FakeTrack("sugerida"), _clip_del_dj()
+    vc = FakePlayer(auto=[sugerida])
+    presentados = []
+
+    async def _dj(self, vc, para):
+        presentados.append(para)
+        vc.queue.put_at(0, corte)
+
+    monkeypatch.setattr(cog.dj, "available", lambda: True)
+    monkeypatch.setattr(Music, "_encolar_dj", _dj)
+    await cog._arrancar_si_hace_falta(vc, incluir_autoplay=True)
+    assert presentados == [sugerida]
+    assert vc.tocando == [corte]
+    assert list(vc.auto_queue) == [sugerida]
+
+
+# --- el bucle del vigilante ----------------------------------------------------------
+
+async def test_el_vigilante_arranca_al_cargar_y_se_cancela_al_descargar(cog, monkeypatch):
+    monkeypatch.setattr(music_mod.DJ, "load_feed_urls", staticmethod(lambda: []))
+    await cog.cog_load()
+    vigilante = cog._vigilante
+    assert vigilante is not None and not vigilante.done()
+    await cog.cog_unload()
+    await asyncio.wait_for(asyncio.gather(vigilante, return_exceptions=True), timeout=1)
+    assert vigilante.cancelled()
+
+
+async def test_un_error_en_la_revision_no_mata_el_bucle(cog, monkeypatch, caplog):
+    esperar = asyncio.sleep
+    revisiones = []
+
+    async def _sin_esperar(_segundos):
+        await esperar(0)
+
+    async def _revision(players):
+        revisiones.append(players)
+        if len(revisiones) == 1:
+            raise RuntimeError("se cayó algo")
+
+    monkeypatch.setattr(music_mod.asyncio, "sleep", _sin_esperar)
+    monkeypatch.setattr(cog, "_vigilar_una_vez", _revision)
+    with caplog.at_level("ERROR", logger="music"):
+        bucle = asyncio.create_task(cog._vigilar())
+        for _ in range(10):
+            await esperar(0)
+        bucle.cancel()
+        await asyncio.gather(bucle, return_exceptions=True)
+    assert len(revisiones) > 1
+    assert "Falló una revisión" in caplog.text
+
+
+def test_sin_bot_no_hay_players_que_vigilar(cog):
+    assert cog._players_del_bot() == []
+
+
+def test_el_vigilante_solo_mira_los_players_de_wavelink(cog):
+    player = wavelink.Player.__new__(wavelink.Player)
+    cog.bot = SimpleNamespace(voice_clients=[player, object()])
+    assert cog._players_del_bot() == [player]

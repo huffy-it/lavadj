@@ -43,6 +43,9 @@ AVISO_NODO_REINICIADO = (
     "la corté. Usa `!play` para volver a empezar."
 )
 
+# Se actúa a la segunda revisión atascada: un mudo dura entre 20 y 40 s.
+VIGILAR_CADA = 20
+
 
 def en_el_mismo_canal():
     """Los controles son de quien está escuchando, no de cualquiera del server.
@@ -87,6 +90,9 @@ class Music(commands.Cog):
         # Referencias fuertes a las tareas de fondo: el loop solo guarda
         # referencias débiles y una tarea sin dueño puede recolectarse a medias.
         self._tareas: set[asyncio.Task] = set()
+        self._vigilante: asyncio.Task | None = None
+        # Servidores que la revisión anterior vio atascados.
+        self._atascados: set[int] = set()
         # Cómo viene la transmisión. Lo lee el panel por la API y lo dice el DJ.
         self.salud = Salud()
         self.dj = DJ()
@@ -112,6 +118,7 @@ class Music(commands.Cog):
             log.warning("espeak-ng no está instalado: el DJ queda desactivado")
         else:
             log.info("DJ activo (%s feeds)", len(feed_urls))
+        self._vigilante = self._segundo_plano(self._vigilar())
 
     async def cog_unload(self):
         for task in (*self._idle_tasks.values(), *self._spotify_tasks.values(), *self._tareas):
@@ -615,29 +622,91 @@ class Music(commands.Cog):
         """
         return vc.playing or bool(getattr(vc, "resolviendo", 0))
 
-    async def _arrancar_si_hace_falta(self, vc: wavelink.Player) -> None:
+    @staticmethod
+    def _cola_a_tocar(vc: wavelink.Player, incluir_autoplay: bool):
+        """`queue` y, solo si se pide, `auto_queue`; None si no hay nada."""
+        if vc.queue:
+            return vc.queue
+        return vc.auto_queue if incluir_autoplay and vc.auto_queue else None
+
+    async def _arrancar_si_hace_falta(
+        self, vc: wavelink.Player, incluir_autoplay: bool = False
+    ) -> None:
         """Si no hay nada sonando, larga el primero de la cola.
 
         Va de a uno por servidor: dos `!play` seguidos (o uno que cae justo
         cuando el autoplay pasa de tema) veían los dos el player libre, sacaban
         cada uno un tema de la cola y el segundo pisaba al primero, que se
-        perdía sin aviso.
+        perdía sin aviso. `incluir_autoplay` suma la `auto_queue`: solo lo usa el vigilante.
         """
         async with self._arranques.setdefault(vc.guild.id, asyncio.Lock()):
-            if self._ocupado(vc) or not vc.queue:
+            cola = self._cola_a_tocar(vc, incluir_autoplay)
+            if self._ocupado(vc) or cola is None:
                 return
             # Presentación del primer tema: aquí sí hay que esperar a que la voz
             # esté sintetizada, porque no hay nada sonando todavía.
             if self.dj.available():
-                await self._encolar_dj(vc, vc.queue[0])
-                # Mientras se sintetizaba pudo arrancar otro tema.
-                if self._ocupado(vc) or not vc.queue:
+                await self._encolar_dj(vc, cola[0])
+                # Pudo arrancar otro tema, y el corte queda al frente de `queue`.
+                cola = self._cola_a_tocar(vc, incluir_autoplay)
+                if self._ocupado(vc) or cola is None:
                     return
             # Lo pidió alguien: si la cola se había parado por fallos en cadena,
             # esto la retoma.
             vc._error_count = 0
             self._caidas.pop(vc.guild.id, None)
-            await vc.play(vc.queue.get())
+            await vc.play(cola.get())
+
+    # --- vigilante de la cola ------------------------------------------------
+    def _players_del_bot(self) -> list[wavelink.Player]:
+        # Con `bot=None` (los tests) no hay players.
+        voces = getattr(self.bot, "voice_clients", ())
+        return [vc for vc in voces if isinstance(vc, wavelink.Player)]
+
+    async def _vigilar(self) -> None:
+        """Revisa los servidores cada `VIGILAR_CADA`, mientras el cog esté cargado."""
+        while True:
+            await asyncio.sleep(VIGILAR_CADA)
+            try:
+                await self._vigilar_una_vez(self._players_del_bot())
+            except Exception:  # noqa: BLE001 - un tropiezo no puede matar al vigilante
+                log.exception("Falló una revisión del vigilante: sigo con la próxima")
+
+    def _atascado(self, vc: wavelink.Player) -> bool:
+        """Si el player está parado teniendo qué tocar y nadie lo detuvo a propósito."""
+        if not vc.connected or vc.paused or self._ocupado(vc):
+            return False
+        if not (vc.queue or vc.auto_queue):
+            return False
+        # Lock tomado: hay un arranque en marcha (la voz del DJ sintetizándose).
+        lock = self._arranques.get(vc.guild.id)
+        return lock is None or not lock.locked()
+
+    async def _vigilar_una_vez(self, players) -> None:
+        """Destraba los players atascados en dos revisiones seguidas (una sola puede ser un cambio de tema)."""
+        anteriores = self._atascados
+        ahora: set[int] = set()
+        for vc in players:
+            try:
+                if getattr(vc, "guild", None) is None or not self._atascado(vc):
+                    continue
+                if vc.guild.id not in anteriores:
+                    ahora.add(vc.guild.id)
+                    continue
+                # Sin volver a anotarlo: el próximo intento pide otras dos revisiones.
+                await self._destrabar(vc)
+            except Exception:  # noqa: BLE001 - un servidor roto no frena a los demás
+                log.exception("No pude revisar el player de %s", getattr(vc, "guild", "?"))
+        self._atascados = ahora
+
+    async def _destrabar(self, vc: wavelink.Player) -> None:
+        log.warning(
+            "Nada suena en %s con temas esperando (%s en cola, %s del autoplay, "
+            "sigue %r): lo destrabo",
+            vc.guild, len(vc.queue), len(vc.auto_queue),
+            resolver.titulo_de(self._proximo(vc)),
+        )
+        await self._arrancar_si_hace_falta(vc, incluir_autoplay=True)
 
     @commands.command(name='play', aliases=['p'])
     async def play(self, ctx: commands.Context, *, query: str):
