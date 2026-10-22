@@ -9,12 +9,18 @@ server:
   address: 0.0.0.0
 
 lavalink:
-  plugins:
-    # Lavalink v4 sacó YouTube del core: sin este plugin `!play` no encuentra
-    # nada. Lavalink lo baja solo al arrancar y lo deja en el volumen
-    # lavadj-lavalink-plugins.
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
-      snapshot: false
+  # Aquí NO hay `plugins:` a propósito. Lavalink v4 sacó YouTube del core y sin el
+  # plugin youtube-source `!play` no encuentra nada, pero declararlo como
+  # `dependency` hace que Lavalink consulte el maven-metadata.xml en
+  # maven.lavalink.dev al arrancar. Ese repositorio hoy contesta con una página
+  # HTML en vez de XML (el .jar tampoco se puede bajar de ahí) y Lavalink no
+  # arranca: revienta con un XmlException. Por eso el jar se instala a mano
+  # en la carpeta de plugins, desde los releases de GitHub, y Lavalink solo lo
+  # carga: lo hacen setup.ps1 (Windows) y start-lavalink.sh (Linux).
+  # Para cambiar de versión se cambian la versión, la URL y el hash en esos dos
+  # scripts (y el nombre del jar en lavalink.ps1), y se borra el jar viejo de la
+  # carpeta de plugins para que no se carguen los dos. No vuelvas a poner la
+  # declaración `dependency` aquí.
   server:
     password: "youshallnotpass"
     sources:

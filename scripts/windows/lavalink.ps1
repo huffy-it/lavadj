@@ -5,6 +5,8 @@ $ErrorActionPreference = "Stop"
 $Raiz = (Resolve-Path "$PSScriptRoot\..\..").Path
 $Dir = Join-Path $Raiz "lavalink"
 $Jar = Join-Path $Dir "Lavalink.jar"
+# Mismo nombre que $PluginArchivo en setup.ps1: si cambias de versión, cámbialo en los dos.
+$PluginJar = Join-Path $Dir "plugins\youtube-plugin-1.18.2.jar"
 $Pid_ = Join-Path $Dir "lavalink.pid"
 $Puerto = if ($env:LAVALINK_PORT) { $env:LAVALINK_PORT } else { 2333 }
 $Heap = if ($env:LAVALINK_HEAP) { $env:LAVALINK_HEAP } else { "768m" }
@@ -36,6 +38,9 @@ function Argumentos {
 }
 function Preparar {
     if (-not (Test-Path $Jar)) { throw "Falta $Jar. Corre scripts\windows\setup.ps1" }
+    # Sin el plugin Lavalink arranca igual pero `!play` no encuentra nada, y el
+    # application.yml ya no lo declara para que Lavalink lo baje: lo instala setup.ps1.
+    if (-not (Test-Path $PluginJar)) { throw "Falta $PluginJar. Corre scripts\windows\setup.ps1" }
     if (-not (Get-Command java -ErrorAction SilentlyContinue)) { throw "Falta Java. Corre scripts\windows\setup.ps1" }
     Copy-Item $Yml (Join-Path $Dir "application.yml") -Force
     New-Item -ItemType Directory -Force (Join-Path $Raiz "dj_cache") | Out-Null

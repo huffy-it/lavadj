@@ -19,7 +19,22 @@ PROYECTO="$(cd "$AQUI/../.." && pwd)"
 IMAGEN="ghcr.io/lavalink-devs/lavalink:4"
 NOMBRE="lavadj-lavalink"
 PUERTO="${LAVALINK_PORT:-2333}"
-VOLUMEN_PLUGINS="lavadj-lavalink-plugins"
+
+# El plugin de YouTube se instala a mano en esta carpeta del proyecto (la misma
+# que usa Windows) y se monta de solo lectura en el contenedor. No va como
+# `dependency` en el application.yml porque Lavalink se caería al arrancar: el
+# repositorio maven.lavalink.dev devuelve una página HTML en vez del
+# maven-metadata.xml que espera. El jar se baja de los releases de GitHub y se
+# verifica contra el hash. Para cambiar de versión, cambia PLUGIN_VERSION y
+# PLUGIN_SHA256 (la URL se arma sola; el hash sale de bajar el jar a mano y correr
+# sha256sum), los mismos datos en scripts/windows/setup.ps1 y el nombre del jar en
+# scripts/windows/lavalink.ps1; y borra el jar viejo de lavalink/plugins para que
+# Lavalink no cargue los dos.
+PLUGINS_DIR="$PROYECTO/lavalink/plugins"
+PLUGIN_VERSION="1.18.2"
+PLUGIN_ARCHIVO="youtube-plugin-$PLUGIN_VERSION.jar"
+PLUGIN_URL="https://github.com/lavalink-devs/youtube-source/releases/download/$PLUGIN_VERSION/$PLUGIN_ARCHIVO"
+PLUGIN_SHA256="dd4b3bce50dbc7582c80776bad47bad87bef1dc683c69d66ab4a084aa3006238"
 
 # El DJ sintetiza sus clips aquí y Lavalink los abre con la fuente "local": el
 # contenedor tiene que verlos en LA MISMA ruta absoluta que usa el bot, porque
@@ -28,8 +43,9 @@ DJ_CACHE="$PROYECTO/dj_cache"
 
 # Compat: antes del cambio de nombre el contenedor se llamaba huffybot-lavalink.
 # Si quedó uno vivo, sigue ocupando el puerto 2333 y el nuevo no podría arrancar.
-# (El volumen viejo huffybot-lavalink-plugins queda huérfano: el plugin se baja
-# de nuevo en el volumen nuevo; se puede borrar con `podman volume rm`.)
+# (Los volúmenes viejos huffybot-lavalink-plugins y lavadj-lavalink-plugins quedan
+# huérfanos: el plugin ahora vive en lavalink/plugins y ya no se usa ningún
+# volumen; se pueden borrar con `podman volume rm`.)
 podman rm -f huffybot-lavalink >/dev/null 2>&1 || true
 
 corriendo() {
@@ -38,6 +54,34 @@ corriendo() {
 
 # La contraseña sale del propio yml para que no se desincronicen.
 CLAVE="$(sed -n 's/^ *password: *"\(.*\)"/\1/p' "$AQUI/application.yml" | head -1)"
+
+# Baja el plugin de YouTube si falta. Se mira solo si el archivo existe, no su
+# hash: así un jar que ya esté en la carpeta (aunque sea otro build de la misma
+# versión) no se reemplaza.
+instalar_plugin() {
+  if [ -f "$PLUGINS_DIR/$PLUGIN_ARCHIVO" ]; then
+    return 0
+  fi
+  mkdir -p "$PLUGINS_DIR"
+  echo "Bajando $PLUGIN_ARCHIVO (github.com/lavalink-devs/youtube-source, ~1.6 MB)..."
+  # Se baja a un archivo aparte y solo recibe su nombre definitivo si el hash
+  # cuadra: una descarga cortada o corrupta nunca queda como jar bueno.
+  local temporal="$PLUGINS_DIR/$PLUGIN_ARCHIVO.descarga"
+  if ! curl -fL -o "$temporal" "$PLUGIN_URL"; then
+    rm -f "$temporal"
+    echo "No pude bajar $PLUGIN_URL" >&2
+    exit 1
+  fi
+  local hash
+  hash="$(sha256sum "$temporal" | awk '{print $1}')"
+  if [ "$hash" != "$PLUGIN_SHA256" ]; then
+    rm -f "$temporal"
+    echo "El SHA-256 de $PLUGIN_ARCHIVO no coincide: esperaba $PLUGIN_SHA256 y llegó $hash." >&2
+    echo "Lo borré; vuelve a correr el script y, si se repite, revisa $PLUGIN_URL" >&2
+    exit 1
+  fi
+  mv "$temporal" "$PLUGINS_DIR/$PLUGIN_ARCHIVO"
+}
 
 responde() {
   # /version responde 401 sin cabecera de autorización, así que hay que mandarla:
@@ -48,7 +92,8 @@ responde() {
 # Las etiquetas SELinux importan: sin ellas el contenedor recibe "permission
 # denied" al leer el yml y Lavalink arranca en silencio con su configuración por
 # defecto (puerto 8080, sin plugins). `Z` reetiqueta privado, `z` compartido —
-# dj_cache lo comparte con el bot, que sigue escribiendo ahí.
+# dj_cache lo comparte con el bot, que sigue escribiendo ahí; la carpeta de
+# plugins solo la usa este contenedor, así que va privada y de solo lectura.
 # Sin tope la JVM se reserva un cuarto de la RAM de la máquina. Un nodo para un
 # bot de música vive cómodo con un heap chico y el GC serial (un solo hilo).
 argumentos_comunes=(
@@ -58,7 +103,7 @@ argumentos_comunes=(
   --env "JAVA_TOOL_OPTIONS=-Xms64m -Xmx${LAVALINK_HEAP:-384m} -XX:+UseSerialGC -XX:MaxMetaspaceSize=128m"
   --publish "127.0.0.1:$PUERTO:2333"
   --volume "$AQUI/application.yml:/opt/Lavalink/application.yml:ro,Z"
-  --volume "$VOLUMEN_PLUGINS:/opt/Lavalink/plugins"
+  --volume "$PLUGINS_DIR:/opt/Lavalink/plugins:ro,Z"
   --volume "$DJ_CACHE:$DJ_CACHE:ro,z"
 )
 
@@ -68,11 +113,11 @@ case "${1:-start}" in
       echo "Lavalink ya está arriba en el puerto $PUERTO."
       exit 0
     fi
+    instalar_plugin
     mkdir -p "$DJ_CACHE"
     podman rm -f "$NOMBRE" >/dev/null 2>&1 || true
     podman run -d --replace "${argumentos_comunes[@]}" "$IMAGEN" >/dev/null
 
-    # La primera vez baja el plugin de YouTube: puede tardar bastante.
     echo -n "Esperando a Lavalink"
     for _ in $(seq 1 90); do
       if responde; then
@@ -117,6 +162,7 @@ case "${1:-start}" in
     ;;
 
   run)
+    instalar_plugin
     mkdir -p "$DJ_CACHE"
     podman rm -f "$NOMBRE" >/dev/null 2>&1 || true
     exec podman run --rm -it "${argumentos_comunes[@]}" "$IMAGEN"

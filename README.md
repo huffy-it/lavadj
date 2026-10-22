@@ -53,6 +53,12 @@ En Linux no hace falta Java: se lo lleva adentro el contenedor de Lavalink (úti
 en distros inmutables como Bazzite, donde meter Java en el sistema base es
 engorroso).
 
+El plugin de YouTube de Lavalink no lo baja Lavalink por su cuenta: el repositorio
+`maven.lavalink.dev` devuelve HTML en lugar de lo que espera y Lavalink no
+arrancaría. Lo instala el propio proyecto, desde los releases de GitHub y
+verificando su SHA-256: `setup.ps1` en Windows y `start-lavalink.sh` en Linux (con
+`curl`, así que sigue sin hacer falta Java en el host). Queda en `lavalink/plugins/`.
+
 ## Instalación en Linux
 
 ```bash
@@ -77,7 +83,8 @@ YouTube cambia seguido y yt-dlp **no se actualiza solo**: mantenlo al día
 (`.venv/bin/python -m pip install -U yt-dlp`). El bot avisa en el log cuando la
 versión tiene más de 30 días, y los paneles lo muestran.
 
-Para arrancar:
+Para arrancar (la primera vez, `start-lavalink.sh` baja el plugin de YouTube a
+`lavalink/plugins/` y lo monta en el contenedor de solo lectura):
 
 ```bash
 scripts/lavalink/start-lavalink.sh         # start | stop | status | logs | run
@@ -107,9 +114,9 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\setup.ps1   # una sola 
 ```
 
 `setup.ps1` crea el venv, instala las dependencias (`yt-dlp` incluido), instala por winget
-Java 21 (Temurin), ffmpeg y eSpeak NG, descarga `Lavalink.jar` a `lavalink\` y
-crea `.env` y `dj_feeds.json` a partir de los ejemplos. Si winget instaló algo,
-abre una terminal nueva para que tome el PATH.
+Java 21 (Temurin), ffmpeg y eSpeak NG, descarga `Lavalink.jar` y el plugin de
+YouTube a `lavalink\` y crea `.env` y `dj_feeds.json` a partir de los ejemplos.
+Si winget instaló algo, abre una terminal nueva para que tome el PATH.
 
 Edita `.env`, pon tu `DISCORD_TOKEN` y arranca:
 

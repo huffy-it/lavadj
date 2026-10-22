@@ -38,7 +38,7 @@ para que la suite siga siendo rápida y sin red.
 En Linux no instales Java: se lo lleva adentro el contenedor de Lavalink. Es
 deliberado — en distros inmutables, meter Java con `rpm-ostree` obliga a reiniciar y
 rehacer la capa en cada actualización del sistema. (En Windows no hay contenedor:
-`setup.ps1` instala Java y descarga `Lavalink.jar`.)
+`setup.ps1` instala Java y descarga `Lavalink.jar` y el plugin de YouTube.)
 
 ## Arquitectura
 
@@ -96,6 +96,17 @@ Tres cosas que hay que respetar si tocas esto:
 
 Si yt-dlp no puede, se devuelve la pista original y Lavalink la intenta a su
 manera: el camino viejo sigue ahí para el día que el plugin reviva.
+
+**El plugin se instala a mano, nunca con `dependency`.** `application.yml` no
+declara `youtube-plugin` en `lavalink.plugins` a propósito: con `dependency`,
+Lavalink consulta al arrancar el `maven-metadata.xml` en `maven.lavalink.dev`, que
+hoy devuelve una página HTML, y Lavalink no arranca (`XmlException`; el `.jar` de
+ahí tampoco se puede bajar). El jar sale de los releases de GitHub y lo instalan en
+`lavalink/plugins/` `setup.ps1` (Windows) o `start-lavalink.sh` (Linux, con `curl`:
+bajar un archivo no mete Java en el host), los dos verificando el SHA-256. En Linux
+esa carpeta se monta en el contenedor de solo lectura; ya no hay volumen de
+plugins. Para cambiar de versión: versión y hash en los dos scripts, el nombre del
+jar en `lavalink.ps1`, y borrar el jar viejo para que no se carguen los dos.
 
 ## Cuando YouTube deja de sonar
 
