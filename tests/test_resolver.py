@@ -5,9 +5,18 @@ la de YouTube (el panel y el DJ leen esos datos) y que ningún tropiezo de yt-dl
 tumbe la reproducción: ante la duda, se devuelve la pista original.
 """
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from core import resolver
+
+
+@pytest.fixture
+def res():
+    """Un `Resolver` nuevo por test: nada de lo que anota llega al siguiente."""
+    return resolver.Resolver()
 
 
 class FakePlayable:
@@ -94,41 +103,41 @@ def _fusionar(monkeypatch):
 # --- resolve -----------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_lo_que_no_es_de_youtube_pasa_derecho(monkeypatch):
+async def test_lo_que_no_es_de_youtube_pasa_derecho(res, monkeypatch):
     async def _no_llamar(url):
         raise AssertionError("no había que resolver nada")
-    monkeypatch.setattr(resolver, "direct_url", _no_llamar)
+    monkeypatch.setattr(res, "direct_url", _no_llamar)
 
     clip = FakePlayable(source="local", uri="/tmp/dj_abc.wav")
-    assert await resolver.resolve(clip) is clip
+    assert await res.resolve(clip) is clip
 
 
 @pytest.mark.asyncio
-async def test_si_yt_dlp_no_puede_se_devuelve_la_original(monkeypatch):
+async def test_si_yt_dlp_no_puede_se_devuelve_la_original(res, monkeypatch):
     async def _sin_url(url):
         return None
-    monkeypatch.setattr(resolver, "direct_url", _sin_url)
+    monkeypatch.setattr(res, "direct_url", _sin_url)
 
     pista = FakePlayable()
-    assert await resolver.resolve(pista) is pista
+    assert await res.resolve(pista) is pista
 
 
 @pytest.mark.asyncio
-async def test_si_lavalink_no_carga_la_url_se_devuelve_la_original(monkeypatch):
+async def test_si_lavalink_no_carga_la_url_se_devuelve_la_original(res, monkeypatch):
     async def _url(url):
         return "https://rr4.googlevideo.com/videoplayback?x=1"
     async def _vacio(identifier):
         return []
-    monkeypatch.setattr(resolver, "direct_url", _url)
+    monkeypatch.setattr(res, "direct_url", _url)
     monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _vacio)
     monkeypatch.setattr(resolver, "PAUSA_ENTRE_CARGAS", 0)
 
     pista = FakePlayable()
-    assert await resolver.resolve(pista) is pista
+    assert await res.resolve(pista) is pista
 
 
 @pytest.mark.asyncio
-async def test_si_lavalink_falla_una_vez_se_reintenta_con_la_misma_url(monkeypatch):
+async def test_si_lavalink_falla_una_vez_se_reintenta_con_la_misma_url(res, monkeypatch):
     """Un tropiezo suelto de Lavalink con la URL no debe mandar al plugin."""
     monkeypatch.setattr(resolver, "PAUSA_ENTRE_CARGAS", 0)
     pedidas = []
@@ -139,17 +148,17 @@ async def test_si_lavalink_falla_una_vez_se_reintenta_con_la_misma_url(monkeypat
         if len(pedidas) == 1:
             raise RuntimeError("Read timed out")
         return [pista_http()]
-    monkeypatch.setattr(resolver, "direct_url", _url)
+    monkeypatch.setattr(res, "direct_url", _url)
     monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _fetch)
     monkeypatch.setattr(resolver.wavelink, "Playable", lambda datos: datos)
 
     pista = FakePlayable()
-    assert await resolver.resolve(pista) is not pista
+    assert await res.resolve(pista) is not pista
     assert pedidas == ["https://rr4.googlevideo.com/videoplayback?x=1"] * 2
 
 
 @pytest.mark.asyncio
-async def test_si_lavalink_sigue_fallando_se_rinde_tras_los_intentos(monkeypatch):
+async def test_si_lavalink_sigue_fallando_se_rinde_tras_los_intentos(res, monkeypatch):
     monkeypatch.setattr(resolver, "PAUSA_ENTRE_CARGAS", 0)
     pedidas = []
     async def _url(url):
@@ -157,41 +166,41 @@ async def test_si_lavalink_sigue_fallando_se_rinde_tras_los_intentos(monkeypatch
     async def _fetch(identifier):
         pedidas.append(identifier)
         raise RuntimeError("Read timed out")
-    monkeypatch.setattr(resolver, "direct_url", _url)
+    monkeypatch.setattr(res, "direct_url", _url)
     monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _fetch)
 
     pista = FakePlayable()
-    assert await resolver.resolve(pista) is pista
+    assert await res.resolve(pista) is pista
     assert len(pedidas) == resolver.INTENTOS_DE_CARGA
 
 
 # --- direct_url --------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_direct_url_se_queda_con_la_linea_de_la_url(monkeypatch):
+async def test_direct_url_se_queda_con_la_linea_de_la_url(res, monkeypatch):
     _falso_proceso(monkeypatch, salida=b"algo de ruido\nhttps://rr4.googlevideo.com/v?x=1\n")
-    assert await resolver.direct_url("https://youtu.be/abc") == "https://rr4.googlevideo.com/v?x=1"
+    assert await res.direct_url("https://youtu.be/abc") == "https://rr4.googlevideo.com/v?x=1"
 
 
 @pytest.mark.asyncio
-async def test_direct_url_devuelve_none_si_yt_dlp_falla(monkeypatch):
+async def test_direct_url_devuelve_none_si_yt_dlp_falla(res, monkeypatch):
     _falso_proceso(monkeypatch, salida=b"", error=b"ERROR: Sign in to confirm", codigo=1)
-    assert await resolver.direct_url("https://youtu.be/abc") is None
+    assert await res.direct_url("https://youtu.be/abc") is None
 
 
 @pytest.mark.asyncio
-async def test_direct_url_sin_url_no_llama_a_nada(monkeypatch):
+async def test_direct_url_sin_url_no_llama_a_nada(res, monkeypatch):
     def _no_llamar(*a, **kw):
         raise AssertionError("no había que lanzar yt-dlp")
     monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _no_llamar)
-    assert await resolver.direct_url("") is None
+    assert await res.direct_url("") is None
 
 
 @pytest.mark.asyncio
-async def test_el_texto_va_como_argumento_nunca_por_shell(monkeypatch):
+async def test_el_texto_va_como_argumento_nunca_por_shell(res, monkeypatch):
     """Las URLs vienen de YouTube: si pasaran por una shell serían inyectables."""
     argumentos = _falso_proceso(monkeypatch, salida=b"https://rr4.googlevideo.com/v\n")
-    await resolver.direct_url("https://youtu.be/abc; rm -rf /")
+    await res.direct_url("https://youtu.be/abc; rm -rf /")
     assert argumentos["args"][-1] == "https://youtu.be/abc; rm -rf /"
     assert argumentos["args"][0] == resolver.config.YTDLP_BIN
 
@@ -254,7 +263,7 @@ def pista_ya_resuelta():
 
 
 @pytest.mark.asyncio
-async def test_el_reintento_pide_una_url_nueva_con_la_uri_de_youtube(monkeypatch):
+async def test_el_reintento_pide_una_url_nueva_con_la_uri_de_youtube(res, monkeypatch):
     """El bug que se está arreglando: sin esto se repetía la URL ya muerta."""
     pedidas = []
 
@@ -265,17 +274,17 @@ async def test_el_reintento_pide_una_url_nueva_con_la_uri_de_youtube(monkeypatch
     async def _encontrar(identifier):
         return [pista_http()]
 
-    monkeypatch.setattr(resolver, "direct_url", _url)
+    monkeypatch.setattr(res, "direct_url", _url)
     monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _encontrar)
     monkeypatch.setattr(resolver.wavelink, "Playable", lambda datos: datos)
 
-    await resolver.resolve(pista_ya_resuelta())
+    await res.resolve(pista_ya_resuelta())
 
     assert pedidas == ["https://www.youtube.com/watch?v=abc"]
 
 
 @pytest.mark.asyncio
-async def test_la_pista_reintentada_no_pierde_la_cara(monkeypatch):
+async def test_la_pista_reintentada_no_pierde_la_cara(res, monkeypatch):
     """En el reintento no se le puede copiar la cara a partir de sí misma.
 
     La pista que vuelve de Lavalink ya está degradada ("Unknown title", uri de
@@ -288,11 +297,11 @@ async def test_la_pista_reintentada_no_pierde_la_cara(monkeypatch):
     async def _encontrar(identifier):
         return [pista_http()]
 
-    monkeypatch.setattr(resolver, "direct_url", _url)
+    monkeypatch.setattr(res, "direct_url", _url)
     monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _encontrar)
     monkeypatch.setattr(resolver.wavelink, "Playable", lambda datos: datos)
 
-    datos = await resolver.resolve(pista_ya_resuelta())
+    datos = await res.resolve(pista_ya_resuelta())
 
     assert datos["info"]["title"] == "Un tema"
     assert datos["info"]["identifier"] == "abc"
@@ -303,42 +312,39 @@ async def test_la_pista_reintentada_no_pierde_la_cara(monkeypatch):
 # --- fallos que no tienen arreglo --------------------------------------------
 
 @pytest.mark.asyncio
-async def test_un_video_bloqueado_queda_marcado_como_definitivo(monkeypatch):
+async def test_un_video_bloqueado_queda_marcado_como_definitivo(res, monkeypatch):
     """Reintentar un video bloqueado no va a servir nunca: hay que saltearlo ya."""
-    resolver.olvidar_motivos()
     _falso_proceso(
         monkeypatch, salida=b"", codigo=1,
         error=b"ERROR: [youtube] abc: It was blocked due to the claimed content by Paramount Global (PMN).",
     )
 
-    assert await resolver.direct_url("https://www.youtube.com/watch?v=abc") is None
-    assert resolver.motivo_definitivo(FakePlayable()) == "está bloqueada"
+    assert await res.direct_url("https://www.youtube.com/watch?v=abc") is None
+    assert res.motivo_definitivo(FakePlayable()) == "está bloqueada"
 
 
 @pytest.mark.asyncio
-async def test_un_tropiezo_pasajero_no_se_marca(monkeypatch):
+async def test_un_tropiezo_pasajero_no_se_marca(res, monkeypatch):
     """Un 400 o un timeout sí mejoran reintentando: no hay que quemarlos."""
-    resolver.olvidar_motivos()
     _falso_proceso(
         monkeypatch, salida=b"", codigo=1,
         error=b"ERROR: unable to download video data: HTTP Error 400: Bad Request",
     )
 
-    await resolver.direct_url("https://www.youtube.com/watch?v=abc")
-    assert resolver.motivo_definitivo(FakePlayable()) is None
+    await res.direct_url("https://www.youtube.com/watch?v=abc")
+    assert res.motivo_definitivo(FakePlayable()) is None
 
 
 @pytest.mark.asyncio
-async def test_el_motivo_se_reconoce_por_el_origen_guardado(monkeypatch):
+async def test_el_motivo_se_reconoce_por_el_origen_guardado(res, monkeypatch):
     """En el reintento la pista llega con la uri de googlevideo, no la de YouTube."""
-    resolver.olvidar_motivos()
     _falso_proceso(
         monkeypatch, salida=b"", codigo=1,
         error=b"ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader",
     )
 
-    await resolver.direct_url("https://www.youtube.com/watch?v=abc")
-    assert resolver.motivo_definitivo(pista_ya_resuelta()) == "la borraron"
+    await res.direct_url("https://www.youtube.com/watch?v=abc")
+    assert res.motivo_definitivo(pista_ya_resuelta()) == "la borraron"
 
 
 # --- yt-dlp viejo -------------------------------------------------------------
@@ -357,14 +363,14 @@ def test_una_version_que_no_es_fecha_no_rompe_nada():
 
 
 @pytest.mark.asyncio
-async def test_revisar_ytdlp_deja_el_estado_a_mano_del_panel(monkeypatch):
+async def test_revisar_ytdlp_deja_el_estado_a_mano_del_panel(res, monkeypatch):
     _falso_proceso(monkeypatch, salida=b"2026.07.04\n")
     from datetime import date
     monkeypatch.setattr(resolver, "_hoy", lambda: date(2026, 8, 28))
 
-    await resolver.revisar_ytdlp()
+    await res.revisar_ytdlp()
 
-    assert resolver.estado_ytdlp() == {"version": "2026.07.04", "dias": 55, "viejo": True}
+    assert res.estado_ytdlp() == {"version": "2026.07.04", "dias": 55, "viejo": True}
 
 
 def test_la_pista_resuelta_se_presenta_como_de_youtube(monkeypatch):
@@ -383,12 +389,13 @@ def test_la_pista_resuelta_se_presenta_como_de_youtube(monkeypatch):
     assert info["identifier"] == "abc"
 
 
-async def test_el_player_avisa_que_esta_resolviendo(monkeypatch):
+async def test_el_player_avisa_que_esta_resolviendo(res, monkeypatch):
     """Mientras yt-dlp trabaja, `playing` da falso: `resolviendo` es lo que
     impide que el cog largue otro tema encima."""
     import wavelink
 
     vc = resolver.ResolvingPlayer.__new__(resolver.ResolvingPlayer)
+    vc.resolver = res
     vc.reanudar = {}
     vc.resolviendo = 0
     visto = []
@@ -401,7 +408,7 @@ async def test_el_player_avisa_que_esta_resolviendo(monkeypatch):
         visto.append(vc.resolviendo)
         return pista
 
-    monkeypatch.setattr(resolver, "resolve", _resolve)
+    monkeypatch.setattr(res, "resolve", _resolve)
     monkeypatch.setattr(wavelink.Player, "play", _play)
     monkeypatch.setattr(wavelink.Player, "connected", property(lambda self: True))
 
@@ -414,22 +421,22 @@ async def test_el_player_avisa_que_esta_resolviendo(monkeypatch):
 # --- yt-dlp que no se puede lanzar ---------------------------------------------
 
 @pytest.mark.parametrize("error", [FileNotFoundError("no existe"), PermissionError("sin permiso")])
-async def test_direct_url_con_el_binario_roto_devuelve_none(monkeypatch, error):
+async def test_direct_url_con_el_binario_roto_devuelve_none(res, monkeypatch, error):
     """Un OSError al lanzar yt-dlp no puede escapar: en el autoplay mataría la cola."""
     async def _exec(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
-    assert await resolver.direct_url("https://youtu.be/abc") is None
+    assert await res.direct_url("https://youtu.be/abc") is None
 
 
-async def test_resolve_cae_a_la_pista_original_si_yt_dlp_no_se_puede_lanzar(monkeypatch):
+async def test_resolve_cae_a_la_pista_original_si_yt_dlp_no_se_puede_lanzar(res, monkeypatch):
     async def _exec(*args, **kwargs):
         raise FileNotFoundError("no existe")
 
     monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
     pista = FakePlayable()
-    assert await resolver.resolve(pista) is pista
+    assert await res.resolve(pista) is pista
 
 
 # --- play() después de desconectarse ---------------------------------------------
@@ -438,6 +445,7 @@ def _player_que_resuelve(monkeypatch, conectado):
     import wavelink
 
     vc = resolver.ResolvingPlayer.__new__(resolver.ResolvingPlayer)
+    vc.resolver = resolver.Resolver()
     vc.reanudar = {}
     vc.resolviendo = 0
     llamadas = []
@@ -449,7 +457,7 @@ def _player_que_resuelve(monkeypatch, conectado):
         llamadas.append(pista)
         return pista
 
-    monkeypatch.setattr(resolver, "resolve", _resolve)
+    monkeypatch.setattr(vc.resolver, "resolve", _resolve)
     monkeypatch.setattr(wavelink.Player, "play", _play)
     monkeypatch.setattr(wavelink.Player, "connected", property(lambda self: conectado))
     return vc, llamadas
@@ -472,3 +480,196 @@ async def test_play_sigue_tocando_si_el_player_esta_conectado(monkeypatch):
     assert await vc.play(pista) is pista
 
     assert llamadas == [pista]
+
+
+# --- el estado vive en la instancia -----------------------------------------------
+
+def _extractor_de(argumentos):
+    """Lo que fue detrás de `--extractor-args` en la última llamada a yt-dlp."""
+    args = argumentos["args"]
+    return args[args.index("--extractor-args") + 1]
+
+
+def test_sin_argumentos_el_resolver_toma_la_configuracion_al_construirse(monkeypatch):
+    monkeypatch.setattr(resolver.config, "YTDLP_BIN", "/otro/yt-dlp")
+    monkeypatch.setattr(resolver.config, "YTDLP_TIMEOUT", 7)
+    monkeypatch.setattr(resolver.config, "YTDLP_PLAYER_CLIENT", "mweb")
+
+    res = resolver.Resolver()
+
+    assert (res.binario, res.timeout, res.cliente) == ("/otro/yt-dlp", 7, "mweb")
+    # Se lee al construir, no en cada llamada: tocar la configuración después no
+    # mueve a un resolver que ya existe (para eso está `res.cliente`).
+    monkeypatch.setattr(resolver.config, "YTDLP_PLAYER_CLIENT", "ios")
+    assert res.cliente == "mweb"
+
+
+def test_los_argumentos_del_constructor_ganan_a_la_configuracion():
+    res = resolver.Resolver(binario="/opt/yt-dlp", cliente="ios", timeout=5)
+    assert (res.binario, res.timeout, res.cliente) == ("/opt/yt-dlp", 5, "ios")
+
+
+async def test_el_cliente_se_puede_cambiar_en_caliente(monkeypatch):
+    """Rotar de cliente cuando el actual falla no puede exigir reiniciar el bot.
+
+    El argumento se arma en cada llamada: si se calculara al importar (como
+    antes) o al construir, cambiar `cliente` no tendría ningún efecto.
+    """
+    res = resolver.Resolver(cliente="android")
+    argumentos = _falso_proceso(monkeypatch, salida=b"https://rr4.googlevideo.com/v\n")
+
+    await res.direct_url("https://youtu.be/abc")
+    assert _extractor_de(argumentos) == "youtube:player_client=android"
+
+    res.cliente = "ios"
+    await res.direct_url("https://youtu.be/abc")
+    assert _extractor_de(argumentos) == "youtube:player_client=ios"
+
+
+async def test_el_binario_del_constructor_es_el_que_se_lanza(monkeypatch):
+    res = resolver.Resolver(binario="/opt/yt-dlp/yt-dlp")
+
+    argumentos = _falso_proceso(monkeypatch, salida=b"https://rr4.googlevideo.com/v\n")
+    await res.direct_url("https://youtu.be/abc")
+    assert argumentos["args"][0] == "/opt/yt-dlp/yt-dlp"
+
+    argumentos = _falso_proceso(monkeypatch, salida=b"2026.07.04\n")
+    await res.revisar_ytdlp()
+    assert argumentos["args"][0] == "/opt/yt-dlp/yt-dlp"
+
+
+class _ProcesoLento:
+    """Un yt-dlp que tarda `demora` segundos en contestar."""
+
+    returncode = 0
+
+    def __init__(self, demora):
+        self.demora = demora
+        self.matado = False
+
+    async def communicate(self):
+        await asyncio.sleep(self.demora)
+        return b"https://rr4.googlevideo.com/v\n", b""
+
+    def kill(self):
+        self.matado = True
+
+    async def wait(self):
+        return 0
+
+
+def _lanzar_proceso(monkeypatch, proceso):
+    async def _exec(*args, **kwargs):
+        return proceso
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+
+
+async def test_el_timeout_del_constructor_corta_a_yt_dlp(monkeypatch):
+    proceso = _ProcesoLento(demora=10)
+    _lanzar_proceso(monkeypatch, proceso)
+
+    res = resolver.Resolver(timeout=0.05)
+
+    assert await res.direct_url("https://youtu.be/abc") is None
+    assert proceso.matado
+
+
+async def test_con_mas_timeout_yt_dlp_alcanza_a_contestar(monkeypatch):
+    proceso = _ProcesoLento(demora=0.05)
+    _lanzar_proceso(monkeypatch, proceso)
+
+    res = resolver.Resolver(timeout=5)
+
+    assert await res.direct_url("https://youtu.be/abc") == "https://rr4.googlevideo.com/v"
+    assert not proceso.matado
+
+
+async def test_dos_resolvers_no_comparten_los_videos_sin_caso(monkeypatch):
+    uno, otro = resolver.Resolver(), resolver.Resolver()
+    _falso_proceso(
+        monkeypatch, salida=b"", codigo=1,
+        error=b"ERROR: [youtube] abc: It was blocked due to the claimed content by Paramount Global (PMN).",
+    )
+
+    await uno.direct_url("https://www.youtube.com/watch?v=abc")
+
+    assert uno.motivo_definitivo(FakePlayable()) == "está bloqueada"
+    assert otro.motivo_definitivo(FakePlayable()) is None
+
+
+async def test_olvidar_motivos_vacia_la_tabla_de_ese_resolver(res, monkeypatch):
+    _falso_proceso(
+        monkeypatch, salida=b"", codigo=1,
+        error=b"ERROR: [youtube] abc: Private video. Sign in if you've been granted access",
+    )
+    await res.direct_url("https://www.youtube.com/watch?v=abc")
+    assert res.motivo_definitivo(FakePlayable()) == "es privada"
+
+    res.olvidar_motivos()
+
+    assert res.motivo_definitivo(FakePlayable()) is None
+
+
+async def test_la_tabla_de_videos_sin_caso_esta_acotada(res, monkeypatch):
+    """Es una ayuda para no quemar reintentos, no un registro histórico."""
+    monkeypatch.setattr(resolver, "RECUERDO_MAXIMO", 2)
+    _falso_proceso(
+        monkeypatch, salida=b"", codigo=1,
+        error=b"ERROR: [youtube] x: Video unavailable. This video has been removed by the uploader",
+    )
+
+    for letra in "abc":
+        await res.direct_url(f"https://www.youtube.com/watch?v={letra}")
+
+    def visto(letra):
+        return res.motivo_definitivo(
+            FakePlayable(uri=f"https://www.youtube.com/watch?v={letra}")
+        )
+
+    assert visto("a") is None       # la más vieja se cayó
+    assert visto("b") == "la borraron"
+    assert visto("c") == "la borraron"
+
+
+async def test_dos_resolvers_no_comparten_el_estado_de_yt_dlp(monkeypatch):
+    from datetime import date
+    uno, otro = resolver.Resolver(), resolver.Resolver()
+    _falso_proceso(monkeypatch, salida=b"2026.07.04\n")
+    monkeypatch.setattr(resolver, "_hoy", lambda: date(2026, 8, 28))
+
+    await uno.revisar_ytdlp()
+
+    assert uno.estado_ytdlp() == {"version": "2026.07.04", "dias": 55, "viejo": True}
+    assert otro.estado_ytdlp() == {"version": None, "dias": None, "viejo": False}
+
+
+def test_el_estado_de_yt_dlp_se_entrega_como_copia(res):
+    """Quien lo lee (la API) no puede pisarle el estado al resolver."""
+    res.estado_ytdlp()["version"] = "tocada"
+    assert res.estado_ytdlp()["version"] is None
+
+
+def _nodo_de_mentira():
+    """Lo mínimo del nodo que `wavelink.Player.__init__` lee al construirse."""
+    return SimpleNamespace(
+        players={}, client=None,
+        _inactive_channel_tokens=None, _inactive_player_timeout=None,
+    )
+
+
+def test_el_player_toma_el_resolver_del_bot():
+    del_bot = resolver.Resolver()
+
+    vc = resolver.ResolvingPlayer(
+        SimpleNamespace(resolver=del_bot), "canal-de-voz", nodes=[_nodo_de_mentira()]
+    )
+
+    assert vc.resolver is del_bot
+
+
+def test_el_player_arma_el_suyo_si_el_bot_no_tiene():
+    uno = resolver.ResolvingPlayer(SimpleNamespace(), "canal-de-voz", nodes=[_nodo_de_mentira()])
+    otro = resolver.ResolvingPlayer(SimpleNamespace(), "canal-de-voz", nodes=[_nodo_de_mentira()])
+
+    assert isinstance(uno.resolver, resolver.Resolver)
+    assert uno.resolver is not otro.resolver

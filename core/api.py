@@ -19,7 +19,7 @@ from pathlib import Path
 import wavelink
 from aiohttp import web
 
-from core import config, resolver
+from core import config
 from core.feeds import invalidate_all as invalidate_feeds
 from core.feeds import refresh_all as refresh_feeds
 
@@ -102,6 +102,18 @@ def _estado_salud(bot) -> dict | None:
     return salud.estado(al_aire=al_aire, hay_cola=hay_cola)
 
 
+def _estado_ytdlp(bot) -> dict:
+    """Lo que se sabe de yt-dlp, con la misma forma aunque el bot no tenga resolver.
+
+    El panel web lee `ytdlp.version` sin comprobar que exista: si el campo
+    faltara, se rompería en vez de mostrar "no encontrado".
+    """
+    resolver = getattr(bot, "resolver", None)
+    if resolver is None:
+        return {"version": None, "dias": None, "viejo": False}
+    return resolver.estado_ytdlp()
+
+
 async def handle_status(request: web.Request) -> web.Response:
     bot = request.app["bot"]
     listo = bot.is_ready()
@@ -116,7 +128,7 @@ async def handle_status(request: web.Request) -> web.Response:
         # Que el proceso conteste no quiere decir que esté sonando algo: el bot
         # se puede quedar mudo sin caerse, y sin esto el panel no lo nota.
         "salud": _estado_salud(bot),
-        "ytdlp": resolver.estado_ytdlp(),
+        "ytdlp": _estado_ytdlp(bot),
     })
 
 

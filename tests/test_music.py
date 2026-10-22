@@ -6,6 +6,7 @@ autoplay, y el par de banderas de estado.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import wavelink
@@ -15,6 +16,7 @@ from cogs import music as music_mod
 from cogs.music import Music
 from core import config
 from core.dj import Clip
+from core.resolver import Resolver
 from core.salud import Salud
 
 
@@ -422,9 +424,7 @@ async def test_el_contador_de_reintentos_sigue_a_la_cancion_no_a_la_url(cog, sin
 async def test_un_video_sin_caso_se_saltea_sin_gastar_reintentos(cog, sin_espera, monkeypatch):
     """Un tema bloqueado no mejora reintentando: son treinta segundos de cola
     congelada para algo que no va a sonar nunca."""
-    monkeypatch.setattr(
-        music_mod.resolver, "motivo_definitivo", lambda pista: "está bloqueada"
-    )
+    monkeypatch.setattr(cog.resolver, "motivo_definitivo", lambda pista: "está bloqueada")
     vc = _reproductor_con_canal()
 
     await cog.on_wavelink_track_exception(
@@ -1048,3 +1048,72 @@ async def test_al_desconectar_el_final_pendiente_se_descarta(cog, reloj):
     reloj(10.0)
 
     assert cog.salud.arranco(vc.guild.id) is None
+
+
+# --- el resolver compartido ------------------------------------------------------
+
+def test_el_cog_toma_el_resolver_del_bot():
+    compartido = Resolver()
+    assert Music(bot=SimpleNamespace(resolver=compartido)).resolver is compartido
+
+
+def test_sin_resolver_en_el_bot_cada_cog_arma_el_suyo():
+    uno, otro = Music(bot=None), Music(bot=None)
+    assert isinstance(uno.resolver, Resolver)
+    assert uno.resolver is not otro.resolver
+
+
+class FakeCanalDeVoz:
+    """El canal al que se conecta el bot: anota con qué clase de player lo hizo."""
+
+    def __init__(self, player):
+        self.player = player
+        self.clase = None
+
+    async def connect(self, *, cls):
+        self.clase = cls
+        return self.player
+
+
+@pytest.mark.asyncio
+async def test_al_conectar_el_player_comparte_el_resolver_del_cog(cog):
+    """Si el bot no trae resolver, el player se arma con uno propio y el cog no
+    vería los videos sin caso que ese anota: `_connect_voice` los empareja."""
+    vc = FakePlayer()
+    canal = FakeCanalDeVoz(vc)
+    ctx = FakeCtx(author=FakeAuthor(channel=canal))
+    ctx.channel = "canal-de-texto"
+
+    assert await cog._connect_voice(ctx) is vc
+
+    assert canal.clase is music_mod.resolver.ResolvingPlayer
+    assert vc.resolver is cog.resolver
+
+
+@pytest.mark.asyncio
+async def test_el_cog_saltea_el_video_que_marco_el_resolver_compartido(sin_espera, monkeypatch):
+    """El player anota en el resolver que el cog después consulta: es el mismo."""
+    compartido = Resolver()
+    cog = Music(bot=SimpleNamespace(resolver=compartido))
+    cog.dj.enabled = False
+
+    class ProcesoQueFalla:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader"
+
+    async def _exec(*args, **kwargs):
+        return ProcesoQueFalla()
+
+    monkeypatch.setattr(music_mod.asyncio, "create_subprocess_exec", _exec)
+    await compartido.direct_url("https://www.youtube.com/watch?v=abc")
+
+    pista = FakeTrack("la borrada")
+    pista.uri = "https://www.youtube.com/watch?v=abc"
+    vc = _reproductor_con_canal()
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, pista))
+
+    assert list(vc.queue) == []
+    assert "la borraron" in vc.text_channel.enviados[-1]

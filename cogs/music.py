@@ -90,6 +90,9 @@ class Music(commands.Cog):
         # Cómo viene la transmisión. Lo lee el panel por la API y lo dice el DJ.
         self.salud = Salud()
         self.dj = DJ()
+        # La del bot, para que el player y el cog vean los mismos videos sin caso.
+        # Los tests construyen el cog con `bot=None` y así cada uno tiene la suya.
+        self.resolver = getattr(bot, "resolver", None) or resolver.Resolver()
 
     async def cog_check(self, ctx: commands.Context) -> bool:
         """Nada de música por mensaje directo: sin servidor no hay canal de voz."""
@@ -406,7 +409,7 @@ class Music(commands.Cog):
         vc._error_count = 0
 
         clave = (vc.guild.id, resolver.id_de_cancion(pista))
-        motivo = resolver.motivo_definitivo(pista)
+        motivo = self.resolver.motivo_definitivo(pista)
         self.salud.fallo(motivo)
 
         # Un fallo sin arreglo no gasta reintentos. Un tema bloqueado o borrado
@@ -564,6 +567,9 @@ class Music(commands.Cog):
             # ResolvingPlayer y no wavelink.Player: el audio de YouTube lo saca
             # yt-dlp justo antes de sonar (ver core/resolver.py).
             vc = await ctx.author.voice.channel.connect(cls=resolver.ResolvingPlayer)
+            # Si el bot no tiene resolver, el player se armó con uno propio y el
+            # cog no vería lo que ese anota: se les da el mismo a los dos.
+            vc.resolver = self.resolver
         elif vc.channel != ctx.author.voice.channel:
             await vc.move_to(ctx.author.voice.channel)
 

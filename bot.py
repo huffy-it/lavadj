@@ -16,7 +16,7 @@ log = logging.getLogger("bot")
 
 # Importar core.tts DESPUÉS de configurar el logging.
 from core.api import start_server                          # noqa: E402
-from core.resolver import revisar_ytdlp                     # noqa: E402
+from core.resolver import Resolver                          # noqa: E402
 from core.feeds import invalidate_all as invalidate_feeds   # noqa: E402
 from core.tts import purge_cache as purge_dj_cache          # noqa: E402
 
@@ -24,6 +24,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=config.PREFIX, intents=intents)
+# Una sola para todo el bot: el cog y los players de cada servidor la comparten,
+# así lo que uno aprende de yt-dlp (videos bloqueados, versión) lo ven todos.
+bot.resolver = Resolver()
 
 
 class ServidorNoPermitido(commands.CheckFailure):
@@ -216,7 +219,7 @@ async def main():
             bot.loop.create_task(conectar_lavalink())
             # yt-dlp saca todo el audio y nadie mira si quedó viejo. Se pregunta
             # una vez al arrancar y queda anotado para que lo muestre el panel.
-            bot.loop.create_task(revisar_ytdlp())
+            bot.loop.create_task(bot.resolver.revisar_ytdlp())
             bot.loop.create_task(esperar_orden_de_apagado(apagar))
             await bot.start(config.DISCORD_TOKEN)
     finally:

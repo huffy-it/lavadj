@@ -6,6 +6,7 @@ de verdad obligaría a ocupar un puerto y no probaría nada más.
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
@@ -203,9 +204,20 @@ async def test_el_estado_delata_al_bot_que_viene_fallando():
 
 async def test_el_estado_incluye_la_antiguedad_de_yt_dlp():
     """Es el punto único de falla de toda la música y nadie lo mira."""
+    bot = FakeBot(FakeCog())
+    bot.resolver = SimpleNamespace(
+        estado_ytdlp=lambda: {"version": "2026.07.04", "dias": 55, "viejo": True}
+    )
+
+    datos = cuerpo(await api.handle_status(pedido("GET", "/api/status", bot)))
+
+    assert datos["ytdlp"] == {"version": "2026.07.04", "dias": 55, "viejo": True}
+
+
+async def test_sin_resolver_en_el_bot_el_estado_de_yt_dlp_conserva_su_forma():
+    """El panel web lee `ytdlp.version` sin comprobar nada: no puede faltar."""
     datos = cuerpo(await api.handle_status(pedido("GET", "/api/status")))
-    assert "ytdlp" in datos
-    assert "viejo" in datos["ytdlp"]
+    assert datos["ytdlp"] == {"version": None, "dias": None, "viejo": False}
 
 
 async def test_sin_cog_cargado_el_estado_no_revienta():

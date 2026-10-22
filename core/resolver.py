@@ -20,6 +20,13 @@ llegue el turno.
 El título, el autor y la carátula que muestra el panel salen de la pista
 original de YouTube: la fuente `http` no trae metadatos y sin esto todo se
 vería como "Unknown title".
+
+**Por qué el estado vive en una instancia.** Lo que cambia con el tiempo —los
+videos que no van a sonar, la versión de yt-dlp y el cliente de YouTube que se
+le pide— está en `Resolver` y no en variables del módulo. Así cada test arma el
+suyo sin limpiar el de otro, y el cliente se puede cambiar en caliente cuando el
+actual deja de funcionar, sin reiniciar el bot. Las funciones que solo leen sus
+argumentos se quedan sueltas en el módulo.
 """
 
 import asyncio
@@ -35,10 +42,6 @@ import wavelink
 from core import config
 
 log = logging.getLogger("resolver")
-
-# Sin esto yt-dlp usa sus clientes por defecto y se come el mismo "Sign in to
-# confirm you're not a bot" que tumbó al plugin.
-CLIENT_ARG = f"youtube:player_client={config.YTDLP_PLAYER_CLIENT}"
 
 # El cliente `android` entrega el itag 18 (mp4 con audio). Se pide primero el
 # mejor audio suelto por si algún día vuelve a haber formatos separados.
@@ -79,10 +82,14 @@ MOTIVOS_DEFINITIVOS = (
     ("video unavailable", "no está disponible"),
 )
 
-# Los videos que ya sabemos que no van a funcionar, por uri de YouTube. Acotada: es
-# una ayuda para no quemar reintentos, no un registro histórico.
+# Cuántos videos sin caso recuerda cada `Resolver`. Acotada: es una ayuda para no
+# quemar reintentos, no un registro histórico.
 RECUERDO_MAXIMO = 100
-_SIN_CASO: "OrderedDict[str, str]" = OrderedDict()
+
+# yt-dlp es el punto único de falla de toda la música y nadie lo mira. Su
+# versión es una fecha, así que la antigüedad se calcula sin pedirle nada a la
+# red: si quedó viejo, se ve en el panel.
+DIAS_PARA_QUE_ESTE_VIEJO = 30
 
 
 def _clasificar(error: str) -> str | None:
@@ -91,74 +98,6 @@ def _clasificar(error: str) -> str | None:
     for fragmento, motivo in MOTIVOS_DEFINITIVOS:
         if fragmento in plano:
             return motivo
-    return None
-
-
-def olvidar_motivos() -> None:
-    """Vacía la tabla de videos sin caso. Al arrancar y en los tests."""
-    _SIN_CASO.clear()
-
-
-def motivo_definitivo(pista: wavelink.Playable) -> str | None:
-    """Por qué esta canción no va a sonar nunca, si ya lo sabemos.
-
-    Se busca por la uri de YouTube: en el reintento la pista llega con la de
-    googlevideo, así que primero se mira el origen guardado.
-    """
-    uri = _origen(pista).get("uri") or getattr(pista, "uri", "") or ""
-    return _SIN_CASO.get(uri)
-
-
-async def direct_url(webpage_url: str) -> str | None:
-    """La URL directa del audio, o None si yt-dlp no pudo."""
-    if not webpage_url:
-        return None
-
-    # Nunca por shell: los títulos y las URLs vienen de YouTube y no son de fiar.
-    try:
-        proceso = await asyncio.create_subprocess_exec(
-            config.YTDLP_BIN,
-            "--no-warnings",
-            "--skip-download",
-            "--no-playlist",
-            "--extractor-args", CLIENT_ARG,
-            "-f", FORMATO,
-            "--get-url",
-            webpage_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except OSError as error:
-        # No existe (FileNotFoundError) o no se puede ejecutar (PermissionError).
-        # Se devuelve None y `resolve()` cae a la pista original, como promete.
-        log.error("No pude lanzar yt-dlp (%s): %s", config.YTDLP_BIN, error)
-        return None
-    try:
-        salida, error = await asyncio.wait_for(
-            proceso.communicate(), timeout=config.YTDLP_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        proceso.kill()
-        await proceso.wait()
-        log.warning("yt-dlp se pasó de %ss con %s", config.YTDLP_TIMEOUT, webpage_url)
-        return None
-
-    if proceso.returncode != 0:
-        detalle = error.decode(errors="replace").strip()[:200]
-        log.warning("yt-dlp no pudo con %s: %s", webpage_url, detalle)
-        motivo = _clasificar(detalle)
-        if motivo:
-            _SIN_CASO[webpage_url] = motivo
-            _SIN_CASO.move_to_end(webpage_url)
-            while len(_SIN_CASO) > RECUERDO_MAXIMO:
-                _SIN_CASO.popitem(last=False)
-        return None
-
-    # `--get-url` imprime una línea por formato; con un formato pedido es una.
-    for linea in salida.decode(errors="replace").splitlines():
-        linea = linea.strip()
-        if linea.startswith("http"):
-            return linea
     return None
 
 
@@ -190,14 +129,6 @@ def id_de_cancion(pista: wavelink.Playable) -> str:
     return _origen(pista).get("identifier") or getattr(pista, "identifier", "")
 
 
-# yt-dlp es el punto único de falla de toda la música y nadie lo mira. Su
-# versión es una fecha, así que la antigüedad se calcula sin pedirle nada a la
-# red: si quedó viejo, se ve en el panel.
-DIAS_PARA_QUE_ESTE_VIEJO = 30
-
-_ESTADO_YTDLP: dict = {"version": None, "dias": None, "viejo": False}
-
-
 def _hoy() -> datetime.date:
     """Aparte para que los tests puedan pararse en un día fijo."""
     return datetime.date.today()
@@ -217,41 +148,6 @@ def antiguedad_de(version: str, hoy: datetime.date | None = None) -> int | None:
     except ValueError:
         return None
     return ((hoy or _hoy()) - salida).days
-
-
-async def revisar_ytdlp() -> dict:
-    """Le pregunta la versión a yt-dlp y la deja anotada para el panel."""
-    version = None
-    proceso = None
-    try:
-        proceso = await asyncio.create_subprocess_exec(
-            config.YTDLP_BIN, "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        salida, _ = await asyncio.wait_for(proceso.communicate(), timeout=10)
-        if proceso.returncode == 0:
-            version = salida.decode(errors="replace").strip() or None
-    except (OSError, asyncio.TimeoutError):
-        if proceso is not None and proceso.returncode is None:
-            proceso.kill()
-            await proceso.wait()
-        log.warning("no pude preguntarle la versión a yt-dlp")
-
-    dias = antiguedad_de(version or "")
-    _ESTADO_YTDLP.update(
-        version=version,
-        dias=dias,
-        viejo=dias is not None and dias > DIAS_PARA_QUE_ESTE_VIEJO,
-    )
-    if _ESTADO_YTDLP["viejo"]:
-        log.warning("yt-dlp está en %s, hace %s días. Conviene actualizarlo.", version, dias)
-    return dict(_ESTADO_YTDLP)
-
-
-def estado_ytdlp() -> dict:
-    """Lo último que se supo de yt-dlp. Lo lee la API para el panel."""
-    return dict(_ESTADO_YTDLP)
 
 
 def titulo_de(pista: wavelink.Playable) -> str:
@@ -293,65 +189,199 @@ def _con_la_cara_del_original(
     return wavelink.Playable(datos)
 
 
-async def resolve(pista: wavelink.Playable) -> wavelink.Playable:
-    """La pista lista para reproducir. Si algo falla, devuelve la original.
+class Resolver:
+    """Le pide a yt-dlp el audio de YouTube y lleva la cuenta de cómo le va.
 
-    Hay dos maneras de llegar aquí y las dos tienen que terminar con una URL
-    fresca:
+    Hay una sola instancia por bot (`bot.resolver`), compartida por el cog y por
+    los players de cada servidor. Lo que se recuerda aquí —qué videos no van a
+    sonar, qué versión de yt-dlp hay— tiene que ser visto por todos, y por eso
+    no se crea una por player.
 
-    - **La pista viene de YouTube**: es el primer play. Se resuelve por su uri y
-      de ahí sale el origen que se guarda en `userData`.
-    - **La pista ya está resuelta y vuelve a pasar**: es el reintento después de
-      un fallo. Llega de Lavalink con la cara de la fuente http y la uri de
-      googlevideo ya caducada, así que la uri buena sale del origen guardado.
-      Volver a intentar con la misma URL muerta era exactamente el bug.
-
-    Cualquier otra cosa —los clips del DJ, que no tienen origen guardado— pasa
-    derecho. Y ante cualquier tropiezo se devuelve la original en vez de
-    reventar: si mañana el plugin vuelve a funcionar, el camino viejo sigue ahí.
+    Los parámetros en `None` toman el valor de `core.config` al construir, no al
+    importar el módulo.
     """
-    origen = _origen(pista)
-    if getattr(pista, "source", None) == "youtube":
-        pagina = pista.uri or ""
-    else:
-        pagina = origen.get("uri") or ""
-    if not pagina:
-        return pista
 
-    inicio = time.monotonic()
-    url = await direct_url(pagina)
-    if not url:
-        log.warning("yt-dlp no entregó URL para %r", titulo_de(pista))
-        return pista
-    log.info(
-        "URL resuelta para %r en %.1fs (%s)",
-        titulo_de(pista), time.monotonic() - inicio, _resumen_url(url),
-    )
+    def __init__(
+        self,
+        *,
+        binario: str | None = None,
+        cliente: str | None = None,
+        timeout: int | None = None,
+    ):
+        self.binario = config.YTDLP_BIN if binario is None else binario
+        # Público y modificable: cuando YouTube cierra un cliente, quien lo note
+        # puede pasar a otro y la siguiente llamada a yt-dlp ya lo usa.
+        self.cliente = config.YTDLP_PLAYER_CLIENT if cliente is None else cliente
+        self.timeout = config.YTDLP_TIMEOUT if timeout is None else timeout
+        # Los videos que ya sabemos que no van a funcionar, por uri de YouTube.
+        self._sin_caso: "OrderedDict[str, str]" = OrderedDict()
+        self._estado_ytdlp: dict = {"version": None, "dias": None, "viejo": False}
 
-    encontradas = None
-    for intento in range(1, INTENTOS_DE_CARGA + 1):
+    def _extractor_args(self) -> str:
+        """El cliente de YouTube que se le pide a yt-dlp, leído en cada llamada.
+
+        Sin esto yt-dlp usa sus clientes por defecto y se come el mismo "Sign in
+        to confirm you're not a bot" que tumbó al plugin.
+        """
+        return f"youtube:player_client={self.cliente}"
+
+    def olvidar_motivos(self) -> None:
+        """Vacía la tabla de videos sin caso."""
+        self._sin_caso.clear()
+
+    def motivo_definitivo(self, pista: wavelink.Playable) -> str | None:
+        """Por qué esta canción no va a sonar nunca, si ya lo sabemos.
+
+        Se busca por la uri de YouTube: en el reintento la pista llega con la de
+        googlevideo, así que primero se mira el origen guardado.
+        """
+        uri = _origen(pista).get("uri") or getattr(pista, "uri", "") or ""
+        return self._sin_caso.get(uri)
+
+    async def direct_url(self, webpage_url: str) -> str | None:
+        """La URL directa del audio, o None si yt-dlp no pudo."""
+        if not webpage_url:
+            return None
+
+        # Nunca por shell: los títulos y las URLs vienen de YouTube y no son de fiar.
         try:
-            encontradas = await wavelink.Pool.fetch_tracks(url)
-        except Exception as error:  # noqa: BLE001
-            log.warning(
-                "Lavalink no pudo cargar la URL de %r (intento %s/%s): %s",
-                titulo_de(pista), intento, INTENTOS_DE_CARGA, error,
+            proceso = await asyncio.create_subprocess_exec(
+                self.binario,
+                "--no-warnings",
+                "--skip-download",
+                "--no-playlist",
+                "--extractor-args", self._extractor_args(),
+                "-f", FORMATO,
+                "--get-url",
+                webpage_url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            encontradas = None
+        except OSError as error:
+            # No existe (FileNotFoundError) o no se puede ejecutar (PermissionError).
+            # Se devuelve None y `resolve()` cae a la pista original, como promete.
+            log.error("No pude lanzar yt-dlp (%s): %s", self.binario, error)
+            return None
+        try:
+            salida, error = await asyncio.wait_for(
+                proceso.communicate(), timeout=self.timeout
+            )
+        except asyncio.TimeoutError:
+            proceso.kill()
+            await proceso.wait()
+            log.warning("yt-dlp se pasó de %ss con %s", self.timeout, webpage_url)
+            return None
+
+        if proceso.returncode != 0:
+            detalle = error.decode(errors="replace").strip()[:200]
+            log.warning("yt-dlp no pudo con %s: %s", webpage_url, detalle)
+            motivo = _clasificar(detalle)
+            if motivo:
+                self._sin_caso[webpage_url] = motivo
+                self._sin_caso.move_to_end(webpage_url)
+                while len(self._sin_caso) > RECUERDO_MAXIMO:
+                    self._sin_caso.popitem(last=False)
+            return None
+
+        # `--get-url` imprime una línea por formato; con un formato pedido es una.
+        for linea in salida.decode(errors="replace").splitlines():
+            linea = linea.strip()
+            if linea.startswith("http"):
+                return linea
+        return None
+
+    async def revisar_ytdlp(self) -> dict:
+        """Le pregunta la versión a yt-dlp y la deja anotada para el panel."""
+        version = None
+        proceso = None
+        try:
+            proceso = await asyncio.create_subprocess_exec(
+                self.binario, "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            salida, _ = await asyncio.wait_for(proceso.communicate(), timeout=10)
+            if proceso.returncode == 0:
+                version = salida.decode(errors="replace").strip() or None
+        except (OSError, asyncio.TimeoutError):
+            if proceso is not None and proceso.returncode is None:
+                proceso.kill()
+                await proceso.wait()
+            log.warning("no pude preguntarle la versión a yt-dlp")
+
+        dias = antiguedad_de(version or "")
+        self._estado_ytdlp.update(
+            version=version,
+            dias=dias,
+            viejo=dias is not None and dias > DIAS_PARA_QUE_ESTE_VIEJO,
+        )
+        if self._estado_ytdlp["viejo"]:
+            log.warning("yt-dlp está en %s, hace %s días. Conviene actualizarlo.", version, dias)
+        return dict(self._estado_ytdlp)
+
+    def estado_ytdlp(self) -> dict:
+        """Lo último que se supo de yt-dlp. Lo lee la API para el panel."""
+        return dict(self._estado_ytdlp)
+
+    async def resolve(self, pista: wavelink.Playable) -> wavelink.Playable:
+        """La pista lista para reproducir. Si algo falla, devuelve la original.
+
+        Hay dos maneras de llegar aquí y las dos tienen que terminar con una URL
+        fresca:
+
+        - **La pista viene de YouTube**: es el primer play. Se resuelve por su uri y
+          de ahí sale el origen que se guarda en `userData`.
+        - **La pista ya está resuelta y vuelve a pasar**: es el reintento después de
+          un fallo. Llega de Lavalink con la cara de la fuente http y la uri de
+          googlevideo ya caducada, así que la uri buena sale del origen guardado.
+          Volver a intentar con la misma URL muerta era exactamente el bug.
+
+        Cualquier otra cosa —los clips del DJ, que no tienen origen guardado— pasa
+        derecho. Y ante cualquier tropiezo se devuelve la original en vez de
+        reventar: si mañana el plugin vuelve a funcionar, el camino viejo sigue ahí.
+        """
+        origen = _origen(pista)
+        if getattr(pista, "source", None) == "youtube":
+            pagina = pista.uri or ""
         else:
-            if encontradas:
-                break
-            log.warning(
-                "Lavalink no devolvió nada para la URL de %r (intento %s/%s)",
-                titulo_de(pista), intento, INTENTOS_DE_CARGA,
-            )
-        if intento < INTENTOS_DE_CARGA:
-            await asyncio.sleep(PAUSA_ENTRE_CARGAS)
+            pagina = origen.get("uri") or ""
+        if not pagina:
+            return pista
 
-    if not encontradas:
-        return pista
+        inicio = time.monotonic()
+        url = await self.direct_url(pagina)
+        if not url:
+            log.warning("yt-dlp no entregó URL para %r", titulo_de(pista))
+            return pista
+        log.info(
+            "URL resuelta para %r en %.1fs (%s)",
+            titulo_de(pista), time.monotonic() - inicio, _resumen_url(url),
+        )
 
-    return _con_la_cara_del_original(encontradas[0], pista)
+        encontradas = None
+        for intento in range(1, INTENTOS_DE_CARGA + 1):
+            try:
+                encontradas = await wavelink.Pool.fetch_tracks(url)
+            except Exception as error:  # noqa: BLE001
+                log.warning(
+                    "Lavalink no pudo cargar la URL de %r (intento %s/%s): %s",
+                    titulo_de(pista), intento, INTENTOS_DE_CARGA, error,
+                )
+                encontradas = None
+            else:
+                if encontradas:
+                    break
+                log.warning(
+                    "Lavalink no devolvió nada para la URL de %r (intento %s/%s)",
+                    titulo_de(pista), intento, INTENTOS_DE_CARGA,
+                )
+            if intento < INTENTOS_DE_CARGA:
+                await asyncio.sleep(PAUSA_ENTRE_CARGAS)
+
+        if not encontradas:
+            return pista
+
+        return _con_la_cara_del_original(encontradas[0], pista)
 
 
 class ResolvingPlayer(wavelink.Player):
@@ -369,6 +399,9 @@ class ResolvingPlayer(wavelink.Player):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # El del bot, para que el cog y todos los players vean lo mismo. Si el
+        # bot no lo tiene, el cog lo pisa al conectar (`Music._connect_voice`).
+        self.resolver = getattr(self.client, "resolver", None) or Resolver()
         self.reanudar = {}
         # Cuántos `play()` hay en curso. Mientras yt-dlp resuelve, `playing` da
         # falso (wavelink recién marca el tema al mandárselo a Lavalink) y quien
@@ -381,7 +414,7 @@ class ResolvingPlayer(wavelink.Player):
             kwargs["start"] = inicio
         self.resolviendo += 1
         try:
-            resuelta = await resolve(track)
+            resuelta = await self.resolver.resolve(track)
             # Resolver tarda segundos y en ese rato pudo llegar un `!stop`, la
             # desconexión por inactividad o el corte por canal vacío. Si ahora
             # se llamara a `super().play()`, wavelink haría el PATCH igual y

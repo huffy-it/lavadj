@@ -1,5 +1,6 @@
 """El arranque de bot.py (el orden de las cosas en `main()`) y la lista blanca de servidores."""
 
+import asyncio
 import importlib
 import logging
 import sys
@@ -9,6 +10,7 @@ import pytest
 from discord.ext import commands
 
 from core import config, tts
+from core.resolver import Resolver
 
 
 @pytest.fixture
@@ -63,6 +65,44 @@ async def test_si_el_puerto_esta_ocupado_no_se_purga_nada(bot_mod, monkeypatch):
         await bot_mod.main()
 
     assert bot_mod.orden == []
+
+
+def test_el_bot_trae_su_resolver_desde_el_import(bot_mod):
+    """El cog y los players lo toman de aquí: tiene que existir antes de cargar nada."""
+    assert isinstance(bot_mod.bot.resolver, Resolver)
+
+
+async def test_al_arrancar_se_revisa_yt_dlp_con_el_resolver_del_bot(bot_mod, monkeypatch):
+    class Fin(Exception):
+        pass
+
+    revisadas = []
+
+    async def _revisar():
+        revisadas.append("yt-dlp")
+        return {}
+
+    async def _start_server(bot, apagar):
+        return type("Runner", (), {"cleanup": staticmethod(_nada)})()
+
+    async def _load_extension(nombre):
+        return None
+
+    async def _start(token):
+        await asyncio.sleep(0)      # deja correr las tareas que `main()` dejó creadas
+        raise Fin()
+
+    monkeypatch.setattr(bot_mod, "start_server", _start_server)
+    monkeypatch.setattr(bot_mod, "conectar_lavalink", _nada)
+    monkeypatch.setattr(bot_mod, "esperar_orden_de_apagado", lambda apagar: _nada())
+    monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
+    monkeypatch.setattr(bot_mod.bot, "start", _start)
+    monkeypatch.setattr(bot_mod.bot.resolver, "revisar_ytdlp", _revisar)
+
+    with pytest.raises(Fin):
+        await bot_mod.main()
+
+    assert revisadas == ["yt-dlp"]
 
 
 # --- Lista blanca de servidores ----------------------------------------------
