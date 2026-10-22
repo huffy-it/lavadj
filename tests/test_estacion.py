@@ -393,6 +393,85 @@ async def test_cog_unload_corta_los_vigias(cog):
     assert vigia.cancelled()
 
 
+# --- la precarga del tema que viene --------------------------------------------------------
+
+def test_una_estacion_nueva_no_tiene_precarga():
+    assert Estacion().precarga is None
+
+
+async def test_cancelar_precarga_corta_la_tarea_y_la_suelta():
+    est = Estacion()
+    est.precarga = tarea = await _tarea_en_marcha()
+
+    est.cancelar_precarga()
+
+    await _terminadas(tarea)
+    assert tarea.cancelled() and est.precarga is None
+
+
+def test_cancelar_la_precarga_sin_tarea_no_hace_nada():
+    est = Estacion()
+    est.cancelar_precarga()
+    assert est.precarga is None
+
+
+async def test_las_demas_cancelaciones_no_tocan_la_precarga():
+    est = Estacion()
+    est.idle = await _tarea_en_marcha()
+    est.precarga = precarga = await _tarea_en_marcha()
+    est.segmentos = [await _tarea_en_marcha()]
+
+    est.cancelar_idle()
+    est.cancelar_spotify()
+    est.cancelar_segmentos()
+
+    assert not precarga.cancelled() and est.precarga is precarga
+    est.cancelar_precarga()
+
+
+async def test_cancelar_tareas_corta_tambien_la_precarga():
+    est = Estacion()
+    est.precarga = tarea = await _tarea_en_marcha()
+
+    est.cancelar_tareas()
+
+    await _terminadas(tarea)
+    assert tarea.cancelled() and est.precarga is None
+
+
+async def test_teardown_corta_la_precarga(cog):
+    vc = FakePlayer()
+    est = await _estacion_cargada(cog)
+    est.precarga = tarea = await _tarea_en_marcha()
+
+    await cog.teardown(vc.guild)
+
+    await _terminadas(tarea)
+    assert tarea.cancelled() and est.precarga is None
+
+
+async def test_teardown_no_toca_la_precarga_de_los_otros_servidores(cog):
+    vc = FakePlayer(guild=FakeGuild(1))
+    cog.estacion(1)
+    otra = cog.estacion(2)
+    otra.precarga = await _tarea_en_marcha()
+
+    await cog.teardown(vc.guild)
+
+    assert not otra.precarga.cancelled()
+    otra.cancelar_tareas()
+
+
+async def test_cog_unload_corta_la_precarga(cog):
+    est = cog.estacion(1)
+    est.precarga = tarea = await _tarea_en_marcha()
+
+    await cog.cog_unload()
+
+    await _terminadas(tarea)
+    assert tarea.cancelled()
+
+
 # --- la letra en vivo ----------------------------------------------------------------------
 
 def test_una_estacion_nueva_tiene_la_letra_apagada_y_cada_una_la_suya():

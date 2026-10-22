@@ -46,6 +46,10 @@ AVISO_RETOMADA = "Volví: sigo con la cola."
 # Cada cuánto, como mucho, mira un vigía de segmento por dónde va el tema: así nota una pausa o un seek del usuario.
 REVISAR_SEGMENTO = 2.0
 PISO_DE_REVISION = 0.25
+# Una URL de googlevideo usada minutos después de pedida suele fallar al instante (302): se pide casi al final del tema.
+PRECARGAR_ANTES = 30
+# Como mucho cada tanto mira la tarea de precarga por dónde va el tema: así nota una pausa o un seek del usuario.
+REVISAR_PRECARGA = 5.0
 # Lavalink reporta la posición cada 5 s; con un reporte más viejo (tras una pausa larga) no se extrapola.
 REPORTE_VIGENTE_MS = 6000
 
@@ -373,6 +377,39 @@ class Music(commands.Cog):
         except Exception:
             log.warning("No pude precargar la URL del tema que viene", exc_info=True)
 
+    def _final_de(self, vc: wavelink.Player, pista: wavelink.Playable) -> int:
+        """Ms donde acaba `pista` para el cog: su largo, o donde empieza la parte final que no es música; 0 si no se sabe."""
+        largo = 0 if getattr(pista, "is_stream", False) else int(getattr(pista, "length", 0) or 0)
+        quien = getattr(vc, "resolver", None) or self.resolver
+        try:
+            partes = quien.segmentos_de(pista) if largo else ()
+        except Exception:  # noqa: BLE001 - sin las marcas vale el largo
+            log.debug("No pude leer las partes que no son música del tema", exc_info=True)
+            partes = ()
+        return min((parte.inicio for parte in partes if llega_al_final(parte, largo)), default=largo)
+
+    async def _precargar_al_final(self, vc: wavelink.Player, est: Estacion, pista: wavelink.Playable) -> None:
+        """Espera a que a `pista` le queden `PRECARGAR_ANTES` s y entonces adelanta la URL de lo que venga.
+
+        Mira la posición real cada `REVISAR_PRECARGA` como mucho: una pausa o un seek del usuario mueven
+        la cuenta y así se notan. Lo que viene se elige al final, porque la cola pudo cambiar.
+        """
+        yo = asyncio.current_task()
+        try:
+            while True:
+                if vc.current is not pista or not vc.connected:
+                    return
+                falta = (self._final_de(vc, pista) - self.posicion_viva(vc)) / 1000 - PRECARGAR_ANTES
+                if falta <= 0:
+                    break
+                await asyncio.sleep(max(PISO_DE_REVISION, min(falta, REVISAR_PRECARGA)))
+            self._precargar_siguiente(vc)
+        except Exception:  # noqa: BLE001 - tarea suelta: nada de lo que pase puede escapar
+            log.warning("No pude precargar a tiempo la URL del tema que viene", exc_info=True)
+        finally:
+            if est.precarga is yo:
+                est.precarga = None
+
     @staticmethod
     def _posicion(vc: wavelink.Player) -> int:
         """Ms por donde iba el tema en curso; 0 si Lavalink aún no lo reportó.
@@ -465,9 +502,10 @@ class Music(commands.Cog):
         if not vc or not vc.guild:
             return
 
-        # Los vigías de segmentos son de esta canción: la que siga programa los suyos.
+        # Los vigías de segmentos y la precarga son de esta canción: la que siga programa los suyos.
         if est := self._estaciones.get(vc.guild.id):
             est.cancelar_segmentos()
+            est.cancelar_precarga()
 
         # Empieza a correr el hueco hasta la próxima pista, sea canción o clip.
         # Un skip también cuenta: es silencio que se escucha.
@@ -606,17 +644,16 @@ class Music(commands.Cog):
                 hueco, "corte del DJ" if es_clip else resolver.titulo_de(sonando),
             )
 
-        # La URL del tema que viene se adelanta con lo que suena ya en marcha, para
-        # que el cambio no espere a yt-dlp. Va antes del `return` de los clips a
-        # propósito: al arrancar la canción `proximo` es la que sigue, pero el
-        # corte del DJ entra a la cola después y se interpone; cuando el corte
-        # arranca, `proximo` ya es la que viene tras él, y el rato de la voz es
-        # justo el que hace falta para resolverla. `precargar` deduplica.
-        self._precargar_siguiente(vc)
-
+        # La URL del tema que viene se adelanta con lo que suena ya en marcha, para que el cambio no espere
+        # a yt-dlp. Con una canción, unos `PRECARGAR_ANTES` s antes de que acabe. El corte del DJ entra a la
+        # cola y se interpone: cuando arranca, `proximo` ya es la que viene tras él, y el rato de la voz es
+        # justo el que hace falta para resolverla, así que ahí va enseguida. `precargar` deduplica.
+        est.cancelar_precarga()
         if es_clip:
+            self._precargar_siguiente(vc)
             await self._poner_letra(vc, sonando, es_clip=True)
             return
+        est.precarga = asyncio.create_task(self._precargar_al_final(vc, est, sonando))
 
         # Que arranque una canción es la única prueba de que esto funciona. El corte
         # del DJ no cuenta: si contara, taparía para siempre que no suena música.

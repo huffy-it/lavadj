@@ -105,9 +105,15 @@ lo actualiza solo (`Resolver.mantener_al_dia`): revisa la versión al arrancar y
 del bot, `-U` si no), como mucho cada 6 h. `YTDLP_AUTOACTUALIZAR=false` lo apaga y
 solo avisa en el log y en los paneles.
 
-Tres cosas que hay que respetar si tocas esto:
+Cuatro cosas que hay que respetar si tocas esto:
 - **La URL se pide al reproducir, nunca al encolar.** Las de googlevideo caducan
   en horas; una cola larga las mataría antes de que les toque el turno.
+- **La del tema que viene se adelanta unos 30 s antes del final del que suena**
+  (`PRECARGAR_ANTES` en `cogs/music.py`; la tarea vive en `Estacion.precarga`), no
+  al empezarlo: una URL de googlevideo usada minutos después de pedida falla muchas
+  veces al instante con un 302 (`Not success status code: 302`). Cuenta como final
+  el inicio de la parte final que no es música de SponsorBlock, porque ahí el cog
+  salta al siguiente. Con un corte del DJ de por medio, se pide al arrancar el corte.
 - **El enganche va en `Player.play()`** (`ResolvingPlayer`), no en el comando
   `!play`: quien va pasando de tema en tema es el AutoPlay de wavelink, y así
   quedan cubiertos comando, botón del panel y autoplay de una sola vez.
@@ -231,8 +237,9 @@ Eso ya está hecho en `scripts/probar-que-suena.py`; no lo reescribas a mano cad
 Usa el `Resolver` y el `ResolvingPlayer` reales (con `client.resolver`, como el bot),
 toca unas 4 búsquedas variadas o las primeras pistas de una playlist, y por cada una
 mide los segundos desde `play()` hasta que Lavalink avisa del arranque —yt-dlp incluido,
-que es el dato a bajar—. Igual que el bot, adelanta la URL de la pista siguiente
-mientras suena la actual, así que desde la segunda el tiempo baja; con
+que es el dato a bajar—. Adelanta la URL de la pista siguiente mientras suena la
+actual (el bot espera a los últimos 30 s del tema; aquí, que cada pista suena poco,
+se pide al empezar), así que desde la segunda el tiempo baja; con
 `--sin-precarga` se ve la diferencia. Después la deja sonar unos segundos, porque una
 pista puede arrancar y reventar al rato. Imprime OK o FALLA por pista y un resumen;
 sale con 0 si todas sonaron, 1 si alguna falló y 2 si ni siquiera pudo prepararse la

@@ -674,9 +674,8 @@ async def principal(args) -> int:
             # Sin autoplay: aquí quien decide qué suena es el script, no wavelink.
             vc.autoplay = wavelink.AutoPlayMode.disabled
             for indice, pista in enumerate(pistas):
-                # Como el bot: la URL del tema que viene se adelanta mientras suena
-                # este, así el tiempo hasta arrancar mide lo que oye la gente. La
-                # primera pista siempre se resuelve en frío.
+                # Como el bot, la URL del que viene se adelanta (aquí al empezar: cada pista
+                # suena unos segundos). La primera siempre se resuelve en frío.
                 if not args.sin_precarga and indice + 1 < len(pistas):
                     client.resolver.precargar(pistas[indice + 1])
                 resultado = await probar_pista(

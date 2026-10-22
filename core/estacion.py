@@ -20,6 +20,7 @@ class Estacion:
     atascado: bool = False                  # la revisión anterior lo vio atascado
     segmentos: list[asyncio.Task] = field(default_factory=list)     # vigías de las partes que no son música del tema en curso
     letra: LetraEnVivo = field(default_factory=LetraEnVivo)         # la letra en vivo: si está prendida, su tarea y su mensaje
+    precarga: asyncio.Task | None = None    # espera a que al tema en curso le queden pocos segundos y adelanta la URL del que viene
 
     def cancelar_idle(self) -> None:
         if self.idle:
@@ -36,8 +37,14 @@ class Estacion:
             tarea.cancel()
         self.segmentos.clear()
 
+    def cancelar_precarga(self) -> None:
+        if self.precarga:
+            self.precarga.cancel()
+            self.precarga = None
+
     def cancelar_tareas(self) -> None:
         self.cancelar_idle()
         self.cancelar_spotify()
         self.cancelar_segmentos()
+        self.cancelar_precarga()
         self.letra.cancelar()

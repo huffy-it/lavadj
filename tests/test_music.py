@@ -1109,34 +1109,24 @@ def _clip_del_dj():
     return clip
 
 
-@pytest.mark.asyncio
-async def test_al_arrancar_una_cancion_se_precarga_la_que_sigue(cog, sin_panel):
-    vc = _reproductor_con_canal()
-    vc.resolver = ResolverQueAnota()
-    siguiente = FakeTrack("la que sigue")
-    vc.queue.extend([siguiente, FakeTrack("la de después")])
-
-    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
-
-    # Solo la próxima: las demás esperan su turno, porque la URL caduca.
-    assert vc.resolver.precargadas == [siguiente]
+def _cancion_corta(titulo="la que suena"):
+    """Un tema al que ya le quedan menos de `PRECARGAR_ANTES` s: su precarga no espera."""
+    pista = FakeTrack(titulo)
+    pista.length = 20_000
+    return pista
 
 
-@pytest.mark.asyncio
-async def test_si_la_cola_esta_vacia_se_precarga_la_que_puso_el_autoplay(cog, sin_panel):
-    vc = _reproductor_con_canal()
-    vc.resolver = ResolverQueAnota()
-    sugerida = FakeTrack("la sugerida")
-    vc.auto_queue.append(sugerida)
-
-    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
-
-    assert vc.resolver.precargadas == [sugerida]
+async def _arranca_y_precarga(cog, vc, pista):
+    """Arranca `pista` en `vc` y deja terminar su tarea de precarga, con tope por si se queda dando vueltas."""
+    vc.current = pista
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
+    if tarea := cog.estacion(vc.guild.id).precarga:
+        await asyncio.wait_for(tarea, timeout=5)
 
 
 @pytest.mark.asyncio
 async def test_al_arrancar_un_corte_del_dj_se_precarga_la_que_viene_despues(cog, sin_panel):
-    """El rato de la voz es justo el que hace falta para resolver la que sigue."""
+    """El rato de la voz es justo el que hace falta para resolver la que sigue: va enseguida, sin tarea de espera."""
     vc = _reproductor_con_canal()
     vc.resolver = ResolverQueAnota()
     despues_del_corte = FakeTrack("la que viene después del corte")
@@ -1145,6 +1135,7 @@ async def test_al_arrancar_un_corte_del_dj_se_precarga_la_que_viene_despues(cog,
     await cog.on_wavelink_track_start(FakePayloadInicio(vc, _clip_del_dj()))
 
     assert vc.resolver.precargadas == [despues_del_corte]
+    assert cog.estacion(1).precarga is None
 
 
 @pytest.mark.asyncio
@@ -1152,7 +1143,7 @@ async def test_sin_nada_que_venga_no_se_precarga(cog, sin_panel):
     vc = _reproductor_con_canal()
     vc.resolver = ResolverQueAnota()
 
-    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+    await _arranca_y_precarga(cog, vc, _cancion_corta())
     await cog.on_wavelink_track_start(FakePayloadInicio(vc, _clip_del_dj()))
 
     assert vc.resolver.precargadas == []
@@ -1164,21 +1155,21 @@ async def test_si_lo_que_viene_es_un_corte_del_dj_no_se_precarga(cog, sin_panel)
     vc.resolver = ResolverQueAnota()
     vc.queue.append(_clip_del_dj())
 
-    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+    await _arranca_y_precarga(cog, vc, _cancion_corta())
 
     assert vc.resolver.precargadas == []
 
 
 @pytest.mark.asyncio
 async def test_sin_resolver_en_el_player_se_usa_el_del_cog(cog, sin_panel):
-    """Por si el player no es un `ResolvingPlayer` y no trae resolver propio."""
+    """Por si el player no es un `ResolvingPlayer` y no trae resolver propio (y el del cog tampoco sabe de marcas)."""
     vc = _reproductor_con_canal()
     assert not hasattr(vc, "resolver")
     cog.resolver = ResolverQueAnota()
     siguiente = FakeTrack("la que sigue")
     vc.queue.append(siguiente)
 
-    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+    await _arranca_y_precarga(cog, vc, _cancion_corta())
 
     assert cog.resolver.precargadas == [siguiente]
 
@@ -1201,7 +1192,7 @@ async def test_si_la_precarga_falla_el_panel_sale_igual(cog, monkeypatch, caplog
     vc.queue.append(FakeTrack("la que sigue"))
 
     with caplog.at_level("WARNING", logger="music"):
-        await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+        await _arranca_y_precarga(cog, vc, _cancion_corta())
 
     assert publicados == [vc]
     assert "precargar" in caplog.text
@@ -2329,14 +2320,21 @@ async def test_si_el_aviso_no_sale_la_cola_sigue_sonando(cog, discord_falso):
 
 # --- saltar las partes que no son música -----------------------------------------------
 
+async def _sin_precarga(self, vc, est, pista):
+    return None
+
+
 class Escenario:
     """Un tema sonando con reloj, posición y reportes de Lavalink simulados (uno cada 5 s, solo mientras suena)."""
 
-    def __init__(self, monkeypatch, vc):
+    def __init__(self, monkeypatch, vc, *, precarga=False):
         self.vc, self.ns, self.t, self.pos, self.reporte, self.eventos = vc, 10**12, 0.0, 0, 0.0, []
+        self.pedidas = []   # (pista, reloj, posición) de cada precarga que le piden al resolver
         vc.escenario = self
         original = asyncio.sleep
         monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: self.ns, monotonic=time.monotonic))
+        if not precarga:    # su espera también corre este reloj y lo adelantaría el doble
+            monkeypatch.setattr(Music, "_precargar_al_final", _sin_precarga)
 
         async def dormir(segundos, *a):
             self.avanzar(segundos)
@@ -2391,16 +2389,18 @@ def _tema(id_="abc", largo=200_000):
     return tema
 
 
-async def _arrancar(cog, monkeypatch, segmentos, *, arranque=0, pista=None):
+async def _arrancar(cog, monkeypatch, segmentos, *, arranque=0, pista=None, precarga=False, cola=()):
     """Arranca un tema de 200 s con esos segmentos ya en la caché y devuelve (player, escenario, estación, pista)."""
     pista = pista or _tema()
     vc = PlayerQueSalta(pista)
+    vc.queue.extend(cola)
     sb = SponsorBlock(activo=True)
     sb._cache["abc"] = tuple(segmentos)
     vc.resolver = Resolver(sponsorblock=sb)
     vc.arranque_ms = arranque
-    escenario = Escenario(monkeypatch, vc)
+    escenario = Escenario(monkeypatch, vc, precarga=precarga)
     escenario.pos = arranque
+    vc.resolver.precargar = lambda p: escenario.pedidas.append((p, escenario.t, escenario.pos))
     await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
     return vc, escenario, cog.estacion(vc.guild.id), pista
 
@@ -2662,6 +2662,202 @@ def test_un_reporte_del_tema_anterior_no_cuenta(monkeypatch):
     vc = SimpleNamespace(_last_update=5 * 10**8, _last_position=170_000, _inicio_ns=10**9, arranque_ms=0, paused=False)
 
     assert Music.posicion_viva(vc) == 3_000
+
+
+# --- precargar la URL del tema que viene, justo antes del final -----------------------------
+
+async def _precargada(est):
+    """Deja terminar la tarea de precarga de la estación, con tope por si se queda dando vueltas."""
+    if tarea := est.precarga:
+        await asyncio.wait_for(tarea, timeout=5)
+
+
+def _pedidas(escenario):
+    return [pista for pista, _, _ in escenario.pedidas]
+
+
+async def test_una_cancion_larga_no_precarga_al_arrancar_sino_en_sus_ultimos_30_segundos(cog, sin_panel, monkeypatch):
+    siguiente = FakeTrack("la que sigue")
+    _, escenario, est, _ = await _arrancar(
+        cog, monkeypatch, [], precarga=True, cola=[siguiente, FakeTrack("la de después")]
+    )
+    assert escenario.pedidas == [] and est.precarga is not None
+
+    await _precargada(est)
+
+    # Solo la próxima: las demás esperan su turno, porque la URL caduca.
+    [(pista, _, posicion)] = escenario.pedidas
+    limite = 200_000 - music_mod.PRECARGAR_ANTES * 1000
+    assert pista is siguiente and limite <= posicion <= limite + 6_000
+    assert est.precarga is None
+
+
+async def test_si_la_cola_esta_vacia_se_precarga_la_que_puso_el_autoplay(cog, sin_panel, monkeypatch):
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True)
+    sugerida = FakeTrack("la sugerida")
+    vc.auto_queue.append(sugerida)
+
+    await _precargada(est)
+
+    assert _pedidas(escenario) == [sugerida]
+
+
+async def test_sin_nada_que_venga_la_tarea_termina_sin_precargar(cog, sin_panel, monkeypatch):
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True)
+
+    await _precargada(est)
+
+    assert escenario.pedidas == [] and est.precarga is None
+
+
+async def test_lo_que_viene_se_elige_al_momento_de_precargar_no_al_arrancar(cog, sin_panel, monkeypatch):
+    nueva = FakeTrack("la que pusieron después")
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que había")])
+    escenario.a_los(60, lambda: vc.queue.insert(0, nueva))
+
+    await _precargada(est)
+
+    assert _pedidas(escenario) == [nueva]
+
+
+async def test_una_pausa_demora_la_precarga(cog, sin_panel, monkeypatch):
+    """En pausa el tema no avanza: pausar 30 s corre la precarga 30 s."""
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+    escenario.a_los(50, lambda: setattr(vc, "paused", True))
+    escenario.a_los(80, lambda: setattr(vc, "paused", False))
+
+    await _precargada(est)
+
+    [(_, reloj, posicion)] = escenario.pedidas
+    assert reloj >= 199 and 170_000 <= posicion <= 176_000
+
+
+async def test_un_salto_adelante_del_usuario_adelanta_la_precarga(cog, sin_panel, monkeypatch):
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+    escenario.a_los(10, lambda: setattr(escenario, "pos", 150_000))
+
+    await _precargada(est)
+
+    [(_, reloj, posicion)] = escenario.pedidas
+    assert reloj < 40 and posicion >= 170_000
+
+
+@pytest.mark.parametrize("parte", [Segmento(150_000, 200_000, 200_000), Segmento(150_000, 196_000, 200_000)])
+async def test_una_parte_final_que_no_es_musica_adelanta_el_final_del_tema(cog, sin_panel, monkeypatch, parte):
+    """Ahí el cog salta al siguiente: contar hasta el largo precargaría tarde, ya con la que sigue sonando."""
+    siguiente = FakeTrack("la que sigue")
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [parte], precarga=True, cola=[siguiente])
+
+    await _precargada(est)
+    await _terminar(est)
+
+    [(pista, _, posicion)] = escenario.pedidas
+    assert pista is siguiente and 120_000 <= posicion < 150_000
+    assert len(vc.skips) == 1
+
+
+@pytest.mark.parametrize("parte", [Segmento(40_000, 60_000, 200_000), Segmento(150_000, 190_000, 200_000)])
+async def test_una_parte_que_no_llega_al_final_no_mueve_la_precarga(cog, sin_panel, monkeypatch, parte):
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [parte], precarga=True, cola=[FakeTrack("la que sigue")])
+
+    await _precargada(est)
+
+    [(_, _, posicion)] = escenario.pedidas
+    assert posicion >= 170_000
+
+
+async def test_si_no_se_pueden_leer_las_marcas_se_cuenta_el_largo_de_la_pista(cog, sin_panel, monkeypatch):
+    def _revienta(self, pista):
+        raise RuntimeError("caché rota")
+
+    monkeypatch.setattr(Resolver, "segmentos_de", _revienta)
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+
+    await _precargada(est)
+
+    [(_, _, posicion)] = escenario.pedidas
+    assert 170_000 <= posicion <= 176_000
+
+
+@pytest.mark.parametrize("largo, arranque", [(20_000, 0), (30_000, 0), (0, 0), (200_000, 175_000)])
+async def test_un_tema_corto_sin_largo_o_al_que_ya_le_quedan_30_segundos_precarga_enseguida(
+    cog, sin_panel, monkeypatch, largo, arranque
+):
+    siguiente = FakeTrack("la que sigue")
+    _, escenario, est, _ = await _arrancar(
+        cog, monkeypatch, [], pista=_tema(largo=largo), arranque=arranque, precarga=True, cola=[siguiente]
+    )
+
+    await _precargada(est)
+
+    assert [(pista, reloj) for pista, reloj, _ in escenario.pedidas] == [(siguiente, 0.0)]
+
+
+async def test_un_stream_precarga_enseguida_aunque_su_largo_sea_enorme(cog, sin_panel, monkeypatch):
+    stream = _tema(largo=2**63 - 1)
+    stream.is_stream = True
+    siguiente = FakeTrack("la que sigue")
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [], pista=stream, precarga=True, cola=[siguiente])
+
+    await _precargada(est)
+
+    assert [(pista, reloj) for pista, reloj, _ in escenario.pedidas] == [(siguiente, 0.0)]
+
+
+async def test_al_terminar_la_cancion_se_cancela_la_precarga(cog, sin_panel, monkeypatch):
+    vc, escenario, est, pista = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+    tarea = est.precarga
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, pista, reason="replaced"))
+    await asyncio.gather(tarea, return_exceptions=True)
+
+    assert tarea.cancelled() and est.precarga is None and escenario.pedidas == []
+
+
+@pytest.mark.parametrize("otro", ["una canción", "un corte del DJ"])
+async def test_arrancar_otro_tema_cancela_la_precarga_del_anterior(cog, sin_panel, monkeypatch, otro):
+    siguiente = FakeTrack("la que sigue")
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[siguiente])
+    anterior = est.precarga
+    nuevo = _tema("otra")
+    nuevo.is_dj_clip = otro == "un corte del DJ"
+    vc.current = nuevo
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, nuevo))
+    await asyncio.gather(anterior, return_exceptions=True)
+    await _precargada(est)
+
+    assert anterior.cancelled() and est.precarga is None
+    assert _pedidas(escenario) == [siguiente]   # una sola vez: la del anterior no llegó a pedir nada
+
+
+@pytest.mark.parametrize("pasa", ["otra pista", "desconectado"])
+async def test_si_la_pista_se_fue_o_el_player_se_desconecto_no_precarga_nada(cog, sin_panel, monkeypatch, pasa):
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+    if pasa == "otra pista":
+        escenario.a_los(20, lambda: setattr(vc, "current", _tema("otra")))
+    else:
+        escenario.a_los(20, lambda: setattr(vc, "connected", False))
+
+    await _precargada(est)
+
+    assert escenario.pedidas == [] and est.precarga is None
+
+
+async def test_un_error_dentro_de_la_tarea_se_anota_y_no_escapa(cog, sin_panel, monkeypatch, caplog):
+    _, escenario, est, _ = await _arrancar(cog, monkeypatch, [], precarga=True, cola=[FakeTrack("la que sigue")])
+    tarea = est.precarga
+
+    def _sin_posicion(vc):
+        raise RuntimeError("sin posición")
+
+    cog.posicion_viva = _sin_posicion
+
+    with caplog.at_level("WARNING", logger="music"):
+        assert await asyncio.wait_for(tarea, timeout=5) is None
+
+    assert "No pude precargar a tiempo" in caplog.text and "sin posición" in caplog.text
+    assert escenario.pedidas == [] and est.precarga is None
 
 
 # --- comandos híbridos: `!` y `/` ------------------------------------------------
