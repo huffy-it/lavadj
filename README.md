@@ -241,7 +241,14 @@ cuántos registró y dónde.
 
 Los comandos de música no funcionan por mensaje directo. Pausa, reanudar, saltar,
 parar, loop, shuffle, volumen, quitar y letra exigen estar en el mismo canal de voz que
-el bot, igual que los botones del panel del chat.
+el bot, igual que los botones del panel del chat (menos 📋, que solo muestra la cola).
+
+**Panel de botones.** Acompaña a cada tema: ⏸️/▶️ pausa y reanuda, ⏭️ salta, ⏹️ para,
+🔁 loop, 🔀 mezcla, 🔉/🔊 volumen, 📋 cola, 🎙️ DJ, 🎤 **Letra** y 🔮 **Autoplay**. El
+loop, la letra en vivo y el autoplay van en verde mientras están activos. Lo que se ve en el
+panel se actualiza en el propio mensaje; ⏭️, 📋, 🎙️ y los errores responden en privado. El
+panel se borra al apagar el bot y, si el bot se cae sin cerrar, sus botones siguen
+funcionando cuando vuelve.
 
 **Letra en vivo.** `/letra` (o `!letra`, o el botón **🎤 Letra** del panel) enciende un
 mensaje debajo del panel que se edita línea a línea al compás del tema: la actual en

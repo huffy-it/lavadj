@@ -22,6 +22,7 @@ from core.dj import Clip
 from core.letra_en_vivo import HABLA_EL_DJ, SIN_TIEMPOS, armar_texto
 from core.locutor import Locutor
 from core.lyrics import Letra
+from core.panel import PlayerPanel
 from core.reintentos import CAIDAS_SEGUIDAS_MAX, REINTENTOS_POR_PISTA
 from core.resolver import Resolver
 from core.salud import Salud
@@ -3348,3 +3349,216 @@ async def test_si_la_transmision_sigue_la_letra_sigue_prendida(cog, en_vivo, mot
 
 def test_la_cache_de_letras_es_una_por_cog():
     assert Music(bot=None).letras is not Music(bot=None).letras
+
+
+# --- el autoplay del panel -------------------------------------------------------------
+
+def test_poner_autoplay_lo_aplica_al_player_y_devuelve_el_aviso(cog):
+    vc = FakePlayer(auto=[FakeTrack("recomendada")])
+
+    encendido = cog.poner_autoplay(1, vc, True)
+    assert "encendido" in encendido and cog.autoplay_activo(1) and vc.autoplay is wavelink.AutoPlayMode.enabled
+    assert len(vc.auto_queue) == 1      # encender no descarta lo ya recomendado
+
+    apagado = cog.poner_autoplay(1, vc, False)
+    assert "apagado" in apagado and not cog.autoplay_activo(1) and vc.autoplay is wavelink.AutoPlayMode.partial
+    assert not vc.auto_queue
+
+
+def test_poner_autoplay_sin_player_solo_guarda_la_preferencia(cog):
+    assert "apagado" in cog.poner_autoplay(5, None, False)
+    assert cog.autoplay_activo(5) is False
+
+
+async def test_el_comando_autoplay_dice_lo_mismo_que_poner_autoplay(cog):
+    ctx = FakeCtx(FakePlayer())
+
+    await cog.autoplay_cmd(cog, ctx, "on")
+    await cog.autoplay_cmd(cog, ctx, "off")
+
+    assert ctx.enviados == [cog.poner_autoplay(1, None, True), cog.poner_autoplay(1, None, False)]
+
+
+# --- el panel de botones y el cog ----------------------------------------------------------
+
+def _interaccion_de_panel(vc):
+    """Quien toca el panel, con el cog de verdad del otro lado."""
+    yo = SimpleNamespace(guild=vc.guild, editados=[], privados=[], data={})
+
+    async def edit_message(**kwargs):
+        yo.editados.append(kwargs)
+
+    async def send_message(contenido, **kwargs):
+        yo.privados.append(contenido)
+
+    yo.response = SimpleNamespace(edit_message=edit_message, send_message=send_message)
+    return yo
+
+
+def _player_de_panel():
+    vc = FakePlayer(playing=True)
+    vc.guild.voice_client = vc
+    vc.current, vc.volume, vc.queue.mode = FakeTrack("Tema A"), 100, wavelink.QueueMode.normal
+    return vc
+
+
+async def test_el_boton_de_autoplay_usa_la_logica_del_cog_y_repinta_el_panel(cog):
+    vc = _player_de_panel()
+    vc.auto_queue.append(FakeTrack("recomendada"))
+    cog._autoplay[1] = False
+    vista = PlayerPanel(cog)
+
+    yo = _interaccion_de_panel(vc)
+    await vista.autoplay.callback(yo)
+    assert cog.autoplay_activo(1) and vc.autoplay is wavelink.AutoPlayMode.enabled
+    assert vista.autoplay.style is discord.ButtonStyle.success and len(yo.editados) == 1 and yo.privados == []
+
+    yo = _interaccion_de_panel(vc)
+    await vista.autoplay.callback(yo)
+    assert not cog.autoplay_activo(1) and vc.autoplay is wavelink.AutoPlayMode.partial
+    assert not vc.auto_queue and vista.autoplay.style is discord.ButtonStyle.secondary
+    assert len(yo.editados) == 1 and yo.privados == []
+
+
+async def test_el_boton_de_la_letra_del_panel_sigue_a_la_letra_del_cog(cog, en_vivo):
+    vc = _sonando(en_vivo)
+    vc.queue.mode, vc.volume = wavelink.QueueMode.normal, 100
+    vista = PlayerPanel(cog)
+
+    yo = _interaccion_de_panel(vc)
+    await vista.letra_en_vivo.callback(yo)
+    assert cog.estacion(1).letra.activa and vista.letra_en_vivo.style is discord.ButtonStyle.success
+    assert len(yo.editados) == 1 and yo.privados == []
+
+    yo = _interaccion_de_panel(vc)
+    await vista.letra_en_vivo.callback(yo)
+    assert not cog.estacion(1).letra.activa and vista.letra_en_vivo.style is discord.ButtonStyle.secondary
+
+
+async def test_el_panel_sale_publicado_con_los_botones_ya_pintados(cog):
+    vc = _player_de_panel()
+    vc.paused, vc.queue.mode, vc.text_channel = True, wavelink.QueueMode.loop, FakeCanalTexto()
+    cog._autoplay[1] = True
+    publicados = []
+
+    async def _enviar(contenido=None, **kwargs):
+        publicados.append(kwargs)
+        return SimpleNamespace()
+
+    vc.text_channel.send = _enviar
+    await cog._post_panel(vc.guild, vc)
+
+    vista = publicados[0]["view"]
+    assert isinstance(vista, PlayerPanel) and publicados[0]["embed"].title.startswith("⏸️")
+    assert vista.toggle_pause.emoji.name == "▶️"
+    assert vista.loop.style is vista.autoplay.style is discord.ButtonStyle.success
+    assert vista.letra_en_vivo.style is discord.ButtonStyle.secondary
+    assert cog.estacion(1).panel[1] is vista
+
+
+class BotQueRegistraVistas:
+    """Valida como `Client.add_view`: solo acepta vistas persistentes."""
+
+    def __init__(self):
+        self.vistas = []
+
+    def add_view(self, vista):
+        if not vista.is_persistent():
+            raise ValueError("View is not persistent")
+        self.vistas.append(vista)
+
+
+async def test_al_cargar_el_cog_registra_la_vista_persistente_del_panel(cog, monkeypatch):
+    monkeypatch.setattr(music_mod.DJ, "load_feed_urls", staticmethod(lambda: []))
+    cog.bot = BotQueRegistraVistas()
+
+    await cog.cog_load()
+
+    assert cog.bot.vistas == [cog._vista] and isinstance(cog._vista, PlayerPanel)
+    await cog.cog_unload()
+    assert cog._vista.is_finished()
+
+
+async def test_sin_bot_el_cog_carga_sin_registrar_vista(cog, monkeypatch):
+    monkeypatch.setattr(music_mod.DJ, "load_feed_urls", staticmethod(lambda: []))
+
+    await cog.cog_load()
+    await cog.cog_unload()
+
+    assert cog._vista is None
+
+
+# --- al apagar el bot --------------------------------------------------------------------------
+
+class MensajeDePanel:
+    def __init__(self, falla=False):
+        self.borrado, self.falla = False, falla
+
+    async def delete(self):
+        if self.falla:
+            raise RuntimeError("se cayó")
+        self.borrado = True
+
+
+class VistaDePanel:
+    def __init__(self):
+        self.detenida = False
+
+    def stop(self):
+        self.detenida = True
+
+
+CIERRES = [
+    pytest.param(lambda cog: cog.guardar_y_cerrar(), id="guardar_y_cerrar"),
+    pytest.param(lambda cog: cog.cog_unload(), id="cog_unload"),
+]
+
+
+async def _con_panel_y_letra(cog, en_vivo, guild_id):
+    """Un servidor con el panel publicado y la letra en vivo ya en el chat."""
+    vc = _sonando(en_vivo)
+    vc.guild = FakeGuild(guild_id)
+    vc.guild.voice_client = vc
+    est = cog.estacion(guild_id)
+    est.panel = (MensajeDePanel(), VistaDePanel())
+    await cog.alternar_letra(vc.guild)
+    await _publicada(vc)
+    return vc, est
+
+
+@pytest.mark.parametrize("cerrar", CIERRES)
+async def test_al_apagar_se_borran_el_panel_y_la_letra_de_cada_servidor(cog, en_vivo, cerrar):
+    servidores = [await _con_panel_y_letra(cog, en_vivo, guild_id) for guild_id in (1, 2)]
+    paneles = [est.panel for _, est in servidores]
+    tareas = [est.letra.tarea for _, est in servidores]
+
+    await cerrar(cog)
+
+    for (vc, est), (mensaje, vista), tarea in zip(servidores, paneles, tareas):
+        assert mensaje.borrado and vista.detenida and est.panel is None
+        assert vc.text_channel.vivos == [] and est.letra.mensaje is None
+        await asyncio.gather(tarea, return_exceptions=True)
+        assert tarea.cancelled()
+
+
+@pytest.mark.parametrize("cerrar", CIERRES)
+async def test_si_un_mensaje_no_se_deja_borrar_el_apagado_sigue_con_los_demas(cog, cerrar, caplog):
+    roto, bueno = cog.estacion(1), cog.estacion(2)
+    roto.panel = (MensajeDePanel(falla=True), VistaDePanel())
+    bueno.panel = (MensajeDePanel(), VistaDePanel())
+
+    with caplog.at_level("ERROR", logger="music"):
+        await cerrar(cog)
+
+    assert bueno.panel is None
+    assert "No pude borrar los mensajes de 1" in caplog.text
+
+
+async def test_guardar_y_cerrar_borra_los_mensajes_aunque_no_se_haya_retomado_nada(cog):
+    est = cog.estacion(1)
+    est.panel = (MensajeDePanel(), VistaDePanel())
+    mensaje = est.panel[0]
+
+    await cog.guardar_y_cerrar()
+
+    assert cog._persistencia == "cerrada" and mensaje.borrado

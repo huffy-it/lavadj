@@ -1,5 +1,6 @@
 """Panel de botones que acompaña a la canción que suena."""
 
+import inspect
 import logging
 import discord
 import wavelink
@@ -9,6 +10,8 @@ from core.messages import split_message
 
 log = logging.getLogger("panel")
 VOLUME_STEP = 10
+ID_COLA = "lavadj:cola"
+VERDE, GRIS = discord.ButtonStyle.success, discord.ButtonStyle.secondary
 
 def format_duration(milliseconds: int) -> str:
     if not milliseconds:
@@ -58,15 +61,18 @@ def build_embed(vc: wavelink.Player) -> discord.Embed:
 
 
 class PlayerPanel(discord.ui.View):
-    def __init__(self, cog, guild_id: int):
+    """Persistente: `custom_id` fijos y todo sale de `interaction.guild`, así que una instancia atiende a cualquier panel, también al de antes de un reinicio."""
+
+    def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
-        self.guild_id = guild_id
 
     def _vc(self, interaction: discord.Interaction) -> wavelink.Player | None:
         return interaction.guild.voice_client if interaction.guild else None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if (getattr(interaction, "data", None) or {}).get("custom_id") == ID_COLA:
+            return True     # la cola es de solo lectura: la ve cualquiera
         vc = self._vc(interaction)
         author_voice = getattr(interaction.user, "voice", None)
         if vc and author_voice and author_voice.channel == vc.channel:
@@ -76,54 +82,64 @@ class PlayerPanel(discord.ui.View):
         )
         return False
 
-    async def _apply(self, interaction: discord.Interaction, note: str):
+    def pintar(self, vc: wavelink.Player | None, guild: discord.Guild) -> discord.Embed:
+        """Ajusta los botones al estado de ahora (pausa, loop, autoplay, letra) y devuelve el embed que va con ellos."""
+        self.toggle_pause.emoji = "▶️" if vc and vc.paused else "⏸️"
+        self.loop.style = VERDE if vc and vc.queue.mode == wavelink.QueueMode.loop else GRIS
+        self.autoplay.style = VERDE if self.cog.autoplay_activo(guild.id) else GRIS
+        self.letra_en_vivo.style = VERDE if self.cog.estacion(guild.id).letra.activa else GRIS
+        return build_embed(vc)
+
+    def _huella(self, embed: discord.Embed) -> tuple:
+        """Lo que se ve del panel: si una acción no lo cambia, editarlo no mostraría nada."""
+        return embed.to_dict(), tuple((str(b.emoji), b.style) for b in self.children)
+
+    async def _cambiar(self, interaction: discord.Interaction, accion):
+        """Corre `accion(vc)`, que da el aviso (texto o corrutina). Si el panel se ve distinto lo edita; si no, el aviso va aparte y en privado."""
+        vc, guild = self._vc(interaction), interaction.guild
+        antes = self._huella(self.pintar(vc, guild))
+        aviso = accion(vc)
+        if inspect.isawaitable(aviso):
+            aviso = await aviso
+        embed = self.pintar(vc, guild)
+        if self._huella(embed) == antes:
+            return await interaction.response.send_message(aviso, ephemeral=True)
         try:
-            await interaction.response.edit_message(
-                embed=build_embed(self._vc(interaction)), view=self
-            )
+            await interaction.response.edit_message(embed=embed, view=self)
         except discord.HTTPException:
             log.debug("no pude editar el panel", exc_info=True)
-        try:
-            await interaction.followup.send(note, ephemeral=True)
-        except discord.HTTPException:
-            pass
 
-    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏸️", style=GRIS, row=0, custom_id="lavadj:pausa")
     async def toggle_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
-        note = await controller.toggle_pause(self._vc(interaction))
-        await self._apply(interaction, note)
+        await self._cambiar(interaction, controller.toggle_pause)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="⏭️", style=GRIS, row=0, custom_id="lavadj:saltar")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         note = await controller.skip(self._vc(interaction))
         await interaction.response.send_message(note, ephemeral=True)
 
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, row=0, custom_id="lavadj:parar")
     async def stop_playback(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("Parando 🛑", ephemeral=True)
         await self.cog.teardown(interaction.guild, "Parado 🛑")
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔁", style=GRIS, row=0, custom_id="lavadj:loop")
     async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        note = await controller.toggle_loop(self._vc(interaction))
-        await self._apply(interaction, note)
+        await self._cambiar(interaction, controller.toggle_loop)
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(emoji="🔀", style=GRIS, row=0, custom_id="lavadj:mezclar")
     async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        note = controller.shuffle(self._vc(interaction))
-        await self._apply(interaction, note)
+        await self._cambiar(interaction, controller.shuffle)     # solo se nota si cambia el "Después"
 
-    @discord.ui.button(emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔉", style=GRIS, row=1, custom_id="lavadj:vol-bajar")
     async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
-        note = await controller.nudge_volume(self._vc(interaction), -VOLUME_STEP)
-        await self._apply(interaction, note)
+        await self._cambiar(interaction, lambda vc: controller.nudge_volume(vc, -VOLUME_STEP))
 
-    @discord.ui.button(emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔊", style=GRIS, row=1, custom_id="lavadj:vol-subir")
     async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
-        note = await controller.nudge_volume(self._vc(interaction), VOLUME_STEP)
-        await self._apply(interaction, note)
+        await self._cambiar(interaction, lambda vc: controller.nudge_volume(vc, VOLUME_STEP))
 
-    @discord.ui.button(emoji="📋", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="📋", style=GRIS, row=1, custom_id=ID_COLA)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = self._vc(interaction)
         if not vc or (not vc.current and not vc.queue):
@@ -143,20 +159,25 @@ class PlayerPanel(discord.ui.View):
         for chunk in chunks[1:]:
             await interaction.followup.send(chunk, ephemeral=True)
 
-    @discord.ui.button(emoji="🎙️", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(emoji="🎙️", style=discord.ButtonStyle.primary, row=2, custom_id="lavadj:dj")
     async def dj(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.cog.dj.available():
             return await interaction.response.send_message(
                 "El DJ está apagado o no hay voz disponible.", ephemeral=True
             )
-        self.cog.dj.force(self.guild_id)
+        self.cog.dj.force(interaction.guild.id)
         await interaction.response.send_message(
             "🎙️ El DJ habla en el próximo corte.", ephemeral=True
         )
 
     # Con rótulo: el 🎤 se parece demasiado al 🎙️ del DJ.
-    @discord.ui.button(emoji="🎤", label="Letra", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🎤", label="Letra", style=GRIS, row=2, custom_id="lavadj:letra")
     async def letra_en_vivo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            await self.cog.alternar_letra(interaction.guild), ephemeral=True
+        await self._cambiar(interaction, lambda vc: self.cog.alternar_letra(interaction.guild))
+
+    @discord.ui.button(emoji="🔮", label="Autoplay", style=GRIS, row=2, custom_id="lavadj:autoplay")
+    async def autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild.id
+        await self._cambiar(
+            interaction, lambda vc: self.cog.poner_autoplay(guild_id, vc, not self.cog.autoplay_activo(guild_id))
         )

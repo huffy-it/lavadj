@@ -15,7 +15,7 @@ from core.estacion import Estacion
 from core.feeds import FeedCache
 from core.locutor import Locutor, proximo
 from core.messages import split_message
-from core.panel import PlayerPanel, build_embed
+from core.panel import PlayerPanel
 from core.reintentos import REINTENTOS_POR_PISTA, Accion, decidir
 from core.salud import Salud
 from core.sponsorblock import Segmento, llega_al_final
@@ -117,6 +117,8 @@ class Music(commands.Cog):
         self._tareas: set[asyncio.Task] = set()
         self._vigilante: asyncio.Task | None = None
         self._guardador: asyncio.Task | None = None
+        # La vista persistente del panel (la registrada en el bot): atiende a los paneles que quedaron de antes de un reinicio.
+        self._vista: PlayerPanel | None = None
         # De lo último escrito en disco, para no reescribirlo si nada cambió.
         self._huella: str | None = None
         self._escrita = 0.0
@@ -160,14 +162,18 @@ class Music(commands.Cog):
             log.info("DJ activo (%s feeds)", len(feed_urls))
         self._vigilante = self._segundo_plano(self._vigilar())
         self._guardador = self._segundo_plano(self._guardar_en_bucle())
+        if self.bot is not None:    # los tests construyen el cog sin bot
+            self._vista = PlayerPanel(self)
+            self.bot.add_view(self._vista)
 
     async def cog_unload(self):
         for est in self._estaciones.values():
             est.cancelar_tareas()
-            if est.panel:
-                est.panel[1].stop()
         for task in self._tareas:
             task.cancel()
+        await self._borrar_mensajes()
+        if self._vista:
+            self._vista.stop()
         if self._session:
             await self._session.close()
         await self.resolver.cerrar()
@@ -194,16 +200,25 @@ class Music(commands.Cog):
 
     async def _post_panel(self, guild: discord.Guild, vc: wavelink.Player):
         await self._delete_panel(guild.id)
-        view = PlayerPanel(self, guild.id)
+        view = PlayerPanel(self)
         try:
             # Wavelink no ata el player a un canal de texto y hace falta un lugar donde publicar:
             # se guarda el último canal de texto en el propio vc.
             text_channel = getattr(vc, "text_channel", None)
             if text_channel:
-                message = await text_channel.send(embed=build_embed(vc), view=view)
+                message = await text_channel.send(embed=view.pintar(vc, guild), view=view)
                 self.estacion(guild.id).panel = (message, view)
         except discord.HTTPException:
             log.warning("no pude postear el panel", exc_info=True)
+
+    async def _borrar_mensajes(self) -> None:
+        """Borra el panel y la letra en vivo de cada servidor: sin el bot, sus botones quedarían muertos y la letra sin editar."""
+        for guild_id, est in list(self._estaciones.items()):
+            try:
+                await self._delete_panel(guild_id)
+                await est.letra.parar()
+            except Exception:  # noqa: BLE001 - cerrar tiene que seguir pase lo que pase
+                log.exception("No pude borrar los mensajes de %s al cerrar", guild_id)
 
     # --- ciclo de vida -------------------------------------------------------
     async def _schedule_idle_disconnect(self, guild: discord.Guild, vc: wavelink.Player):
@@ -320,6 +335,21 @@ class Music(commands.Cog):
             wavelink.AutoPlayMode.enabled
             if self.autoplay_activo(vc.guild.id)
             else wavelink.AutoPlayMode.partial
+        )
+
+    def poner_autoplay(self, guild_id: int, vc: wavelink.Player | None, activo: bool) -> str:
+        """Enciende o apaga el autoplay del servidor, lo aplica al player si lo hay y devuelve el aviso."""
+        self._autoplay[guild_id] = activo
+        if vc:
+            self._aplicar_autoplay(vc)
+            if not activo:
+                # Lo ya recomendado se descarta: si no, sigue sonando un rato
+                # más y parece que el comando no hizo nada.
+                vc.auto_queue.clear()
+        return (
+            "🔮 Autoplay encendido: cuando se acabe la cola sigo solo."
+            if activo
+            else "Autoplay apagado: al final de la cola me quedo callado."
         )
 
     def _espacio_en_cola(self, vc: wavelink.Player) -> int:
@@ -805,7 +835,7 @@ class Music(commands.Cog):
                 log.exception("No pude guardar las colas: sigo con la próxima")
 
     async def guardar_y_cerrar(self) -> None:
-        """Escribe la foto final y deja de escribir.
+        """Escribe la foto final, deja de escribir y borra el panel y la letra en vivo de cada servidor.
 
         Hay que llamarlo antes de desconectar los players: sin ellos, la tarea
         periódica guardaría una foto vacía y se perdería la cola.
@@ -820,6 +850,7 @@ class Music(commands.Cog):
         if tarea:
             tarea.cancel()
             await asyncio.gather(tarea, return_exceptions=True)
+        await self._borrar_mensajes()
 
     async def retomar_guardadas(self) -> None:
         """Retoma las colas que dejó guardadas el bot anterior; una sola vez por arranque."""
@@ -1116,19 +1147,7 @@ class Music(commands.Cog):
                 "al último en vez de callarme."
             )
 
-        self._autoplay[ctx.guild.id] = modo == "on"
-        vc: wavelink.Player = ctx.voice_client
-        if vc:
-            self._aplicar_autoplay(vc)
-            if modo == "off":
-                # Lo ya recomendado se descarta: si no, sigue sonando un rato
-                # más y parece que el comando no hizo nada.
-                vc.auto_queue.clear()
-        await ctx.send(
-            "🔮 Autoplay encendido: cuando se acabe la cola sigo solo."
-            if modo == "on"
-            else "Autoplay apagado: al final de la cola me quedo callado."
-        )
+        await ctx.send(self.poner_autoplay(ctx.guild.id, ctx.voice_client, modo == "on"))
 
     # Solo con prefijo: elige con reacciones sobre un mensaje, que no encaja con una respuesta de `/`; `/play` ya autocompleta.
     @commands.command(name='search', aliases=['buscar'])
