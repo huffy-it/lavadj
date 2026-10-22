@@ -16,8 +16,11 @@ from cogs import music as music_mod
 from cogs.music import Music
 from core import config
 from core.dj import Clip
+from core.locutor import Locutor
+from core.reintentos import CAIDAS_SEGUIDAS_MAX, REINTENTOS_POR_PISTA
 from core.resolver import Resolver
 from core.salud import Salud
+from core.spotify import Lista
 
 
 class FakeTrack:
@@ -213,13 +216,6 @@ def test_el_autoplay_es_por_servidor(cog):
     assert cog.autoplay_activo(8) is config.AUTOPLAY_DEFAULT
 
 
-def test_el_proximo_mira_primero_la_cola_y_despues_el_autoplay(cog):
-    pedido, sugerido = FakeTrack("pedida"), FakeTrack("sugerida")
-    assert cog._proximo(FakePlayer(temas=[pedido], auto=[sugerido])) is pedido
-    assert cog._proximo(FakePlayer(auto=[sugerido])) is sugerido
-    assert cog._proximo(FakePlayer()) is None
-
-
 # --- permisos ----------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -337,7 +333,7 @@ async def test_despues_de_agotar_los_reintentos_la_saltea_y_avisa(cog, sin_esper
     vc = _reproductor_con_canal()
     caida = FakeTrack("la maldita")
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA):
+    for _ in range(REINTENTOS_POR_PISTA):
         await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, caida))
     vc.queue.clear()
 
@@ -372,11 +368,11 @@ async def test_si_la_pista_termina_bien_recupera_todos_sus_intentos(cog, sin_esp
     await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
     # Arrancar no basta: un tema que arranca y revienta al decodificar no puede
     # reiniciar el contador, o se reintenta sin fin.
-    assert cog._reintentos != {}
+    assert cog.estacion(vc.guild.id).reintentos != {}
 
     await cog.on_wavelink_track_end(FakePayloadFin(vc, pista))
 
-    assert cog._reintentos == {}
+    assert cog.estacion(vc.guild.id).reintentos == {}
 
 
 def _listo(valor):
@@ -407,7 +403,7 @@ async def test_el_contador_de_reintentos_sigue_a_la_cancion_no_a_la_url(cog, sin
     """
     vc = _reproductor_con_canal()
 
-    for vuelta in range(music_mod.REINTENTOS_POR_PISTA):
+    for vuelta in range(REINTENTOS_POR_PISTA):
         await cog.on_wavelink_track_exception(
             FakePayloadExcepcion(vc, _pista_resuelta("la maldita", f"rr{vuelta}-url"))
         )
@@ -450,7 +446,7 @@ async def test_la_cancion_se_nombra_por_su_titulo_de_youtube(cog, sin_espera):
     pista.identifier = "rr4-url"
     pista.extras = {"yt_origen": {"identifier": "abc", "title": "Gato por liebre"}}
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, pista))
 
     assert "Gato por liebre" in vc.text_channel.enviados[-1]
@@ -502,7 +498,7 @@ async def test_cuando_se_rinde_con_un_tema_el_dj_lo_dice(cog, sin_espera, monkey
     vc = _reproductor_con_canal()
     pista = FakeTrack("la maldita")
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, pista))
 
     assert dicho, "no dijo nada"
@@ -521,11 +517,11 @@ async def test_el_aviso_hablado_va_al_frente_de_la_cola(cog, sin_espera, monkeyp
         return locucion
 
     monkeypatch.setattr(cog.dj, "aviso", falso_aviso)
-    monkeypatch.setattr(Music, "_clip_a_track", falso_track)
+    monkeypatch.setattr(Locutor, "_clip_a_track", falso_track)
     vc = _reproductor_con_canal()
     vc.queue.append(FakeTrack("la que sigue"))
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, FakeTrack("la maldita")))
 
     assert vc.queue[0] is locucion
@@ -544,7 +540,7 @@ async def test_no_dice_nada_si_no_esta_en_un_canal(cog, sin_espera, monkeypatch)
     vc = _reproductor_con_canal()
     vc.connected = False
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, FakeTrack("la maldita")))
 
     assert dicho == []
@@ -630,7 +626,7 @@ async def test_un_tema_que_agota_sus_reintentos_no_traba_la_cola(cog, sin_espera
     vc._error_count = 0
     pista = FakeTrack("la maldita")
 
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         assert not await _falla_como_en_lavalink(cog, vc, pista)
 
     # Lo que suena después (el aviso del DJ, el próximo tema) tiene que avanzar.
@@ -643,9 +639,9 @@ async def test_varios_temas_perdidos_seguidos_paran_la_cola(cog, sin_espera):
     vc._error_count = 0
     trabadas = []
 
-    for n in range(music_mod.CAIDAS_SEGUIDAS_MAX):
+    for n in range(CAIDAS_SEGUIDAS_MAX):
         pista = FakeTrack(f"caída {n}")
-        for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+        for _ in range(REINTENTOS_POR_PISTA + 1):
             trabadas.append(await _falla_como_en_lavalink(cog, vc, pista))
 
     assert trabadas[-1] and not any(trabadas[:-1])
@@ -657,14 +653,14 @@ async def test_una_cancion_entera_corta_la_racha_de_temas_perdidos(cog, sin_espe
     vc = _reproductor_con_canal()
     vc._error_count = 0
 
-    for n in range(music_mod.CAIDAS_SEGUIDAS_MAX - 1):
+    for n in range(CAIDAS_SEGUIDAS_MAX - 1):
         pista = FakeTrack(f"caída {n}")
-        for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+        for _ in range(REINTENTOS_POR_PISTA + 1):
             await _falla_como_en_lavalink(cog, vc, pista)
     await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("una que sí sonó")))
 
     pista = FakeTrack("otra caída")
-    for _ in range(music_mod.REINTENTOS_POR_PISTA + 1):
+    for _ in range(REINTENTOS_POR_PISTA + 1):
         assert not await _falla_como_en_lavalink(cog, vc, pista)
 
 
@@ -673,13 +669,13 @@ async def test_play_retoma_una_cola_parada_por_fallos(cog):
     tema = FakeTrack("la que espera")
     vc = FakePlayer(temas=[tema])
     vc._error_count = music_mod.TOPE_DE_WAVELINK
-    cog._caidas[vc.guild.id] = music_mod.CAIDAS_SEGUIDAS_MAX
+    cog.estacion(vc.guild.id).caidas = CAIDAS_SEGUIDAS_MAX
 
     await cog._arrancar_si_hace_falta(vc)
 
     assert vc.tocando == [tema]
     assert vc._error_count == 0
-    assert vc.guild.id not in cog._caidas
+    assert cog.estacion(vc.guild.id).caidas == 0
 
 
 # --- arranques que se pisan ----------------------------------------------------
@@ -832,7 +828,7 @@ async def test_si_no_se_puede_repetir_el_tema_se_corta_y_avisa_en_el_panel(cog):
         def stop(self):
             pass
 
-    cog._panels[vc.guild.id] = (MensajeFalso(), VistaFalsa())
+    cog.estacion(vc.guild.id).panel = (MensajeFalso(), VistaFalsa())
 
     await cog.recuperar_players([vc])
 
@@ -852,45 +848,6 @@ async def test_un_player_roto_no_frena_a_los_demas(cog):
 
 
 # --- wavs del DJ que no se quedan en disco ---------------------------------------
-
-async def test_si_lavalink_no_carga_el_clip_se_borra_su_wav(cog, tmp_path, monkeypatch):
-    wav = tmp_path / "dj_x.wav"
-    wav.write_bytes(b"RIFF")
-    proximo = FakeTrack("proximo")
-    vc = FakePlayer(temas=[proximo])
-
-    async def _prepare(*a, **kw):
-        return None
-
-    async def _sin_track(self, clip):
-        return None
-
-    monkeypatch.setattr(cog.dj, "prepare", _prepare)
-    monkeypatch.setattr(cog.dj, "take", lambda g, t: Clip(wav, "hola", None, "bumper"))
-    monkeypatch.setattr(Music, "_clip_a_track", _sin_track)
-
-    await cog._encolar_dj(vc, proximo)
-
-    assert not wav.exists()
-
-
-async def test_si_lavalink_no_carga_el_aviso_se_borra_su_wav(cog, tmp_path, monkeypatch):
-    wav = tmp_path / "dj_aviso.wav"
-    wav.write_bytes(b"RIFF")
-
-    async def _aviso(texto):
-        return Clip(wav, texto, None, "aviso")
-
-    async def _sin_track(self, clip):
-        return None
-
-    monkeypatch.setattr(cog.dj, "aviso", _aviso)
-    monkeypatch.setattr(Music, "_clip_a_track", _sin_track)
-
-    await cog._decir(FakePlayer(), "se cayó")
-
-    assert not wav.exists()
-
 
 async def test_al_cortar_se_borran_los_cortes_del_dj_que_esperaban_en_la_cola(cog, tmp_path, monkeypatch):
     monkeypatch.setattr(music_mod.tts, "CACHE_DIR", tmp_path)
@@ -1279,13 +1236,13 @@ async def test_con_cola_destraba_por_el_arranque_de_siempre_y_suelta_el_freno(co
     primera, segunda = FakeTrack("primera"), FakeTrack("segunda")
     vc = FakePlayer(temas=[primera, segunda])
     vc._error_count = music_mod.TOPE_DE_WAVELINK
-    cog._caidas[vc.guild.id] = music_mod.CAIDAS_SEGUIDAS_MAX
+    cog.estacion(vc.guild.id).caidas = CAIDAS_SEGUIDAS_MAX
     with caplog.at_level("WARNING", logger="music"):
         await _revisar(cog, [vc], 2)
     assert vc.tocando == [primera]
     assert list(vc.queue) == [segunda]
     assert vc._error_count == 0
-    assert vc.guild.id not in cog._caidas
+    assert cog.estacion(vc.guild.id).caidas == 0
     assert "Nada suena" in caplog.text and "2 en cola" in caplog.text
 
 
@@ -1293,12 +1250,12 @@ async def test_con_la_cola_vacia_destraba_con_el_tema_del_autoplay(cog):
     sugerida, otra = FakeTrack("sugerida"), FakeTrack("otra")
     vc = FakePlayer(auto=[sugerida, otra])
     vc._error_count = music_mod.TOPE_DE_WAVELINK
-    cog._caidas[vc.guild.id] = music_mod.CAIDAS_SEGUIDAS_MAX
+    cog.estacion(vc.guild.id).caidas = CAIDAS_SEGUIDAS_MAX
     await _revisar(cog, [vc], 2)
     assert vc.tocando == [sugerida]
     assert list(vc.auto_queue) == [otra]
     assert vc._error_count == 0
-    assert vc.guild.id not in cog._caidas
+    assert cog.estacion(vc.guild.id).caidas == 0
 
 
 async def test_lo_que_pidieron_va_antes_que_lo_que_recomendo_el_autoplay(cog):
@@ -1349,7 +1306,7 @@ async def test_el_vigilante_no_toca_lo_que_no_esta_atascado(cog, caplog, estado)
 
 async def test_con_el_lock_del_servidor_tomado_no_es_un_atasco(cog):
     vc = FakePlayer(temas=[FakeTrack("de la cola")])
-    lock = cog._arranques.setdefault(vc.guild.id, asyncio.Lock())
+    lock = cog.estacion(vc.guild.id).arranque
     await lock.acquire()
     await _revisar(cog, [vc], 4)
     assert vc.tocando == []
@@ -1366,12 +1323,12 @@ async def test_no_pisa_un_arranque_que_esta_sintetizando_la_voz_del_dj(cog, monk
     vc = FakePlayer(temas=[primero, segundo])
     sintetizando, suelta = asyncio.Event(), asyncio.Event()
 
-    async def _dj_que_tarda(self, vc, para):
+    async def _dj_que_tarda(self, vc, para, session):
         sintetizando.set()
         await suelta.wait()
 
     monkeypatch.setattr(cog.dj, "available", lambda: True)
-    monkeypatch.setattr(Music, "_encolar_dj", _dj_que_tarda)
+    monkeypatch.setattr(Locutor, "encolar", _dj_que_tarda)
     arranque = asyncio.create_task(cog._arrancar_si_hace_falta(vc))
     await sintetizando.wait()
     await _revisar(cog, [vc], 4)
@@ -1460,12 +1417,12 @@ async def test_el_corte_del_dj_abre_el_tema_del_autoplay_sin_perderlo(cog, monke
     vc = FakePlayer(auto=[sugerida])
     presentados = []
 
-    async def _dj(self, vc, para):
+    async def _dj(self, vc, para, session):
         presentados.append(para)
         vc.queue.put_at(0, corte)
 
     monkeypatch.setattr(cog.dj, "available", lambda: True)
-    monkeypatch.setattr(Music, "_encolar_dj", _dj)
+    monkeypatch.setattr(Locutor, "encolar", _dj)
     await cog._arrancar_si_hace_falta(vc, incluir_autoplay=True)
     assert presentados == [sugerida]
     assert vc.tocando == [corte]
@@ -1516,3 +1473,156 @@ def test_el_vigilante_solo_mira_los_players_de_wavelink(cog):
     player = wavelink.Player.__new__(wavelink.Player)
     cog.bot = SimpleNamespace(voice_clients=[player, object()])
     assert cog._players_del_bot() == [player]
+
+
+# --- reanudar donde se cortó ---------------------------------------------------------
+
+def _con_reporte_de_lavalink(vc, posicion):
+    """Lavalink ya reportó este tema (`_last_update` posterior al arranque)."""
+    vc.reanudar = {}
+    vc._last_update, vc._inicio_ns, vc._last_position = 2, 1, posicion
+    return vc
+
+
+@pytest.mark.asyncio
+async def test_un_reintento_a_mitad_de_tema_reanuda_desde_el_corte_menos_un_respiro(cog):
+    vc = _con_reporte_de_lavalink(_reproductor_con_canal(), 60_000)
+    pista = FakeTrack("la que se cortó")
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, pista))
+
+    assert vc.reanudar == {"la que se cortó": 58_000}
+    assert list(vc.queue) == [pista]
+
+
+@pytest.mark.asyncio
+async def test_si_lavalink_no_reporto_este_tema_el_reintento_arranca_de_cero(cog):
+    vc = _con_reporte_de_lavalink(_reproductor_con_canal(), 60_000)
+    vc._last_update, vc._inicio_ns = 1, 2       # el último reporte es del tema anterior
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, FakeTrack("la que se cortó")))
+
+    assert vc.reanudar == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("posicion", [5_000, 165_000], ids=["recien-empezada", "casi-terminada"])
+async def test_un_corte_muy_temprano_o_muy_tardio_no_se_reanuda(cog, posicion):
+    vc = _con_reporte_de_lavalink(_reproductor_con_canal(), posicion)
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, FakeTrack("la que se cortó")))
+
+    assert vc.reanudar == {}
+
+
+@pytest.mark.asyncio
+async def test_un_player_sin_tabla_de_reanudacion_igual_reintenta(cog):
+    vc = _reproductor_con_canal()
+    vc._last_update, vc._inicio_ns, vc._last_position = 2, 1, 60_000
+    assert not hasattr(vc, "reanudar")
+    pista = FakeTrack("la que se cortó")
+
+    await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, pista))
+
+    assert list(vc.queue) == [pista]
+
+
+# --- listas de Spotify ---------------------------------------------------------------------
+
+def _con_busqueda(monkeypatch, sin_resultado=()):
+    """`wavelink.Playable.search` que encuentra todo, salvo lo que se le indique."""
+    async def _search(consulta, *a, **kw):
+        return [] if consulta in sin_resultado else [FakeTrack(consulta)]
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _search)
+
+
+def _con_lista_de_spotify(monkeypatch, *consultas, nombre="una lista"):
+    async def _fetch(session, url, limit=100):
+        return Lista(kind="playlist", name=nombre, queries=list(consultas))
+    monkeypatch.setattr(music_mod.spotify, "fetch", _fetch)
+
+
+@pytest.mark.asyncio
+async def test_un_link_de_spotify_de_un_solo_tema_suena_al_toque(cog, monkeypatch):
+    vc = FakePlayer()
+    ctx = FakeCtx(vc)
+    cog._session = object()
+    _con_busqueda(monkeypatch)
+    _con_lista_de_spotify(monkeypatch, "Artista - Tema")
+
+    await cog._play_spotify(ctx, vc, "https://open.spotify.com/track/x")
+
+    assert [t.title for t in vc.tocando] == ["Artista - Tema"]
+    assert vc.tocando[0].requester == "ana"
+    assert ctx.ultimo == "🎧 Spotify — **Artista - Tema**"
+    assert cog.estacion(ctx.guild.id).spotify is None
+
+
+@pytest.mark.asyncio
+async def test_una_lista_de_spotify_arranca_con_el_primero_y_carga_el_resto_de_fondo(cog, monkeypatch):
+    vc = FakePlayer()
+    ctx = FakeCtx(vc)
+    cog._session = object()
+    _con_busqueda(monkeypatch, sin_resultado=("c",))
+    _con_lista_de_spotify(monkeypatch, "a", "b", "c", "d")
+
+    await cog._play_spotify(ctx, vc, "https://open.spotify.com/playlist/x")
+
+    assert [t.title for t in vc.tocando] == ["a"]
+    assert "buscando 4 temas" in ctx.enviados[-1]
+    carga = cog.estacion(ctx.guild.id).spotify
+    assert carga is not None
+    await carga
+
+    assert [t.title for t in vc.queue] == ["b", "d"]
+    assert ctx.ultimo == "🎧 Listo: 2 temas más en la cola. No encontré 1 en YouTube."
+    assert cog.estacion(ctx.guild.id).spotify is None
+
+
+@pytest.mark.asyncio
+async def test_si_el_player_se_va_mientras_carga_la_lista_no_hay_resumen(cog, monkeypatch):
+    vc = FakePlayer()
+    vc.connected = False
+    ctx = FakeCtx(vc)
+    _con_busqueda(monkeypatch)
+    est = cog.estacion(ctx.guild.id)
+    est.spotify = asyncio.current_task()
+
+    await cog._encolar_spotify(ctx, vc, ["a", "b"], "ana")
+
+    assert ctx.enviados == []
+    assert est.spotify is None
+
+
+async def test_una_lista_reemplazada_no_borra_la_referencia_de_la_nueva(cog, monkeypatch):
+    vc = FakePlayer()
+    vc.connected = False
+    ctx = FakeCtx(vc)
+    _con_busqueda(monkeypatch)
+    est = cog.estacion(ctx.guild.id)
+    est.spotify = nueva = object()
+    await cog._encolar_spotify(ctx, vc, ["a"], "ana")
+    assert est.spotify is nueva
+
+
+@pytest.mark.asyncio
+async def test_cancelar_la_carga_de_spotify_suelta_la_tarea_de_la_estacion(cog, monkeypatch):
+    vc = FakePlayer()
+    ctx = FakeCtx(vc)
+    buscando = asyncio.Event()
+
+    async def _search(consulta, *a, **kw):
+        buscando.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _search)
+    est = cog.estacion(ctx.guild.id)
+    est.spotify = tarea = asyncio.create_task(cog._encolar_spotify(ctx, vc, ["a"], "ana"))
+    await buscando.wait()
+
+    est.cancelar_spotify()
+
+    await asyncio.wait_for(asyncio.gather(tarea, return_exceptions=True), timeout=1)
+    assert tarea.cancelled()
+    assert est.spotify is None
+    assert ctx.enviados == []

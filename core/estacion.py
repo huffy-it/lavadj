@@ -1,0 +1,33 @@
+"""El estado de un servidor, junto: nace al primer uso y se tira entero al desconectar."""
+
+import asyncio
+from dataclasses import dataclass, field
+
+import discord
+
+from core.panel import PlayerPanel
+
+
+@dataclass
+class Estacion:
+    idle: asyncio.Task | None = None        # desconexión por falta de música
+    panel: tuple[discord.Message, PlayerPanel] | None = None
+    spotify: asyncio.Task | None = None     # carga de fondo de una lista
+    reintentos: dict[str, int] = field(default_factory=dict)    # id de canción -> intentos gastados
+    caidas: int = 0                         # temas seguidos perdidos tras gastar sus reintentos
+    arranque: asyncio.Lock = field(default_factory=asyncio.Lock)   # un arranque a la vez
+    atascado: bool = False                  # la revisión anterior lo vio atascado
+
+    def cancelar_idle(self) -> None:
+        if self.idle:
+            self.idle.cancel()
+            self.idle = None
+
+    def cancelar_spotify(self) -> None:
+        if self.spotify:
+            self.spotify.cancel()
+            self.spotify = None
+
+    def cancelar_tareas(self) -> None:
+        self.cancelar_idle()
+        self.cancelar_spotify()

@@ -7,32 +7,19 @@ import discord
 from discord.ext import commands
 import wavelink
 
-from core import config, controller, lyrics, resolver, spotify, tts
+from core import cola_spotify, config, controller, lyrics, resolver, spotify, tts
 from core.dj import DJ
+from core.estacion import Estacion
 from core.feeds import FeedCache
+from core.locutor import Locutor, proximo
 from core.messages import split_message
 from core.panel import PlayerPanel, build_embed
+from core.reintentos import REINTENTOS_POR_PISTA, Accion, decidir
 from core.salud import Salud
 
 log = logging.getLogger("music")
 
 IDLE_TIMEOUT = config.IDLE_TIMEOUT
-
-# Cuántos temas de Spotify se buscan a la vez en YouTube. De a uno una lista de
-# 50 tarda una eternidad; todos juntos es una avalancha para Lavalink.
-SPOTIFY_LOTE = 5
-
-# Cuántas veces se vuelve a intentar una pista que Lavalink no pudo resolver.
-# YouTube le contesta "Invalid status code for player api response: 400" al
-# cliente ANDROID de a ratos, sin patrón: el mismo video que se cae ahora suele
-# sonar al segundo intento. Sin esto un tropiezo se lleva puesta la canción, y
-# en una lista larga el autoplay va saltando y las quema todas de corrido.
-REINTENTOS_POR_PISTA = 2
-
-# Cuántos temas seguidos se pueden perder (agotados sus reintentos) antes de dar
-# la transmisión por caída y dejar de avanzar la cola. Con YouTube sin entregar
-# audio y el autoplay encendido, sin este tope se pasaría el día probando temas.
-CAIDAS_SEGUIDAS_MAX = 3
 
 # El tope fijo de wavelink: con su cuenta de fallos ahí, deja de avanzar la cola.
 TOPE_DE_WAVELINK = 3
@@ -76,29 +63,28 @@ def format_duration(milliseconds: int) -> str:
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._idle_tasks: dict[int, asyncio.Task] = {}
-        self._panels: dict[int, tuple[discord.Message, PlayerPanel]] = {}
         self._session: aiohttp.ClientSession | None = None
+        self._estaciones: dict[int, Estacion] = {}
+        # Una preferencia del servidor, no estado de la transmisión: sobrevive a `teardown`.
         self._autoplay: dict[int, bool] = {}
-        self._spotify_tasks: dict[int, asyncio.Task] = {}
-        # (guild, identifier) -> intentos ya gastados en esa pista.
-        self._reintentos: dict[tuple[int, str], int] = {}
-        # guild -> temas seguidos que se perdieron después de gastar los reintentos.
-        self._caidas: dict[int, int] = {}
-        # Un arranque a la vez por servidor (ver `_arrancar_si_hace_falta`).
-        self._arranques: dict[int, asyncio.Lock] = {}
         # Referencias fuertes a las tareas de fondo: el loop solo guarda
         # referencias débiles y una tarea sin dueño puede recolectarse a medias.
         self._tareas: set[asyncio.Task] = set()
         self._vigilante: asyncio.Task | None = None
-        # Servidores que la revisión anterior vio atascados.
-        self._atascados: set[int] = set()
         # Cómo viene la transmisión. Lo lee el panel por la API y lo dice el DJ.
         self.salud = Salud()
         self.dj = DJ()
+        self.locutor = Locutor(self.dj)
         # La del bot, para que el player y el cog vean los mismos videos sin caso.
         # Los tests construyen el cog con `bot=None` y así cada uno tiene la suya.
         self.resolver = getattr(bot, "resolver", None) or resolver.Resolver()
+
+    def estacion(self, guild_id: int) -> Estacion:
+        """El estado del servidor; se crea la primera vez que se pide."""
+        est = self._estaciones.get(guild_id)
+        if est is None:
+            est = self._estaciones[guild_id] = Estacion()
+        return est
 
     async def cog_check(self, ctx: commands.Context) -> bool:
         """Nada de música por mensaje directo: sin servidor no hay canal de voz."""
@@ -121,10 +107,12 @@ class Music(commands.Cog):
         self._vigilante = self._segundo_plano(self._vigilar())
 
     async def cog_unload(self):
-        for task in (*self._idle_tasks.values(), *self._spotify_tasks.values(), *self._tareas):
+        for est in self._estaciones.values():
+            est.cancelar_tareas()
+            if est.panel:
+                est.panel[1].stop()
+        for task in self._tareas:
             task.cancel()
-        for _, view in self._panels.values():
-            view.stop()
         if self._session:
             await self._session.close()
 
@@ -137,7 +125,8 @@ class Music(commands.Cog):
 
     # --- panel ---------------------------------------------------------------
     async def _delete_panel(self, guild_id: int):
-        entry = self._panels.pop(guild_id, None)
+        est = self.estacion(guild_id)
+        entry, est.panel = est.panel, None
         if not entry:
             return
         message, view = entry
@@ -156,19 +145,15 @@ class Music(commands.Cog):
             text_channel = getattr(vc, "text_channel", None)
             if text_channel:
                 message = await text_channel.send(embed=build_embed(vc), view=view)
-                self._panels[guild.id] = (message, view)
+                self.estacion(guild.id).panel = (message, view)
         except discord.HTTPException:
             log.warning("no pude postear el panel", exc_info=True)
 
     # --- ciclo de vida -------------------------------------------------------
-    def _cancel_idle(self, guild_id: int):
-        task = self._idle_tasks.pop(guild_id, None)
-        if task:
-            task.cancel()
-
     async def _schedule_idle_disconnect(self, guild: discord.Guild, vc: wavelink.Player):
         guild_id = guild.id
-        self._cancel_idle(guild_id)
+        est = self.estacion(guild_id)
+        est.cancelar_idle()
 
         async def _task():
             await asyncio.sleep(IDLE_TIMEOUT)
@@ -179,30 +164,27 @@ class Music(commands.Cog):
                 text_channel = getattr(vc, "text_channel", None)
                 if text_channel:
                     await text_channel.send("Sin música por 5 min, me fui 👋")
-            self._idle_tasks.pop(guild_id, None)
+            est.idle = None
 
-        self._idle_tasks[guild_id] = asyncio.create_task(_task())
+        est.idle = asyncio.create_task(_task())
 
     async def teardown(self, guild: discord.Guild, note: str | None = None):
         vc: wavelink.Player = guild.voice_client
-        self._cancel_idle(guild.id)
-        self._cancelar_spotify(guild.id)
+        est = self.estacion(guild.id)
+        est.cancelar_tareas()
         self.dj.drop(guild.id)
-        for clave in [k for k in self._reintentos if k[0] == guild.id]:
-            del self._reintentos[clave]
-        self._caidas.pop(guild.id, None)
         self.salud.sin_siguiente(guild.id)
         if vc:
-            # Los cortes del DJ que quedaron esperando en la cola no van a sonar
-            # nunca: sin esto sus wavs se quedan en dj_cache hasta el próximo
-            # arranque.
+            # Los cortes del DJ que esperan en la cola no van a sonar nunca: sin
+            # esto sus wavs se quedan en dj_cache hasta el próximo arranque.
             for pista in vc.queue:
-                self._borrar_clip_dj(pista)
+                self.locutor.borrar_clip(pista)
             vc.queue.clear()
             vc.auto_queue.clear()
             await vc.disconnect()
-        panel = self._panels.get(guild.id)
+        panel = est.panel
         await self._delete_panel(guild.id)
+        self._estaciones.pop(guild.id, None)
         if note and panel:
             await panel[0].channel.send(note)
 
@@ -240,11 +222,7 @@ class Music(commands.Cog):
             log.info("Nodo reiniciado: voz restablecida en %s (sin tema en curso)", vc.guild)
             return
 
-        # `_last_position` solo vale si Lavalink ya reportó ESTE tema (ver
-        # `on_wavelink_track_exception`); si no, es la posición del anterior.
-        posicion = 0
-        if (getattr(vc, "_last_update", None) or 0) > getattr(vc, "_inicio_ns", 0):
-            posicion = getattr(vc, "_last_position", 0) or 0
+        posicion = self._posicion(vc)
         # La cola queda intacta: solo se vuelve a tocar el tema que sonaba. Pasa
         # por `ResolvingPlayer.play`, que pide una URL fresca a yt-dlp (la
         # anterior pudo caducar). `add_history=False`: no es un tema nuevo.
@@ -257,7 +235,7 @@ class Music(commands.Cog):
     async def _cortar_por_nodo(self, vc: wavelink.Player) -> None:
         """Último recurso cuando no se pudo retomar: se corta y se avisa."""
         canal = getattr(vc, "text_channel", None)
-        con_panel = vc.guild.id in self._panels
+        con_panel = self.estacion(vc.guild.id).panel is not None
         try:
             await self.teardown(vc.guild, note=AVISO_NODO_REINICIADO)
             # `teardown` solo avisa donde estaba el panel; sin panel, al canal
@@ -288,15 +266,6 @@ class Music(commands.Cog):
     def _espacio_en_cola(self, vc: wavelink.Player) -> int:
         return max(0, config.QUEUE_LIMIT - len(vc.queue))
 
-    @staticmethod
-    def _proximo(vc: wavelink.Player):
-        """El tema que suena después: el de la cola, o el que puso el autoplay."""
-        if vc.queue:
-            return vc.queue[0]
-        if vc.auto_queue:
-            return vc.auto_queue[0]
-        return None
-
     def _precargar_siguiente(self, vc: wavelink.Player) -> None:
         """Le pide al resolver que adelante la URL del tema que viene.
 
@@ -304,7 +273,7 @@ class Music(commands.Cog):
         falla, que no se lleve por delante el panel ni el corte del DJ que siguen
         al listener.
         """
-        siguiente = self._proximo(vc)
+        siguiente = proximo(vc)
         if siguiente is None or getattr(siguiente, "is_dj_clip", False):
             return
         # El del player, que es el que va a resolver después; en la práctica es el
@@ -315,54 +284,17 @@ class Music(commands.Cog):
         except Exception:
             log.warning("No pude precargar la URL del tema que viene", exc_info=True)
 
-    def _cancelar_spotify(self, guild_id: int) -> None:
-        task = self._spotify_tasks.pop(guild_id, None)
-        if task:
-            task.cancel()
+    @staticmethod
+    def _posicion(vc: wavelink.Player) -> int:
+        """Ms por donde iba el tema en curso; 0 si Lavalink aún no lo reportó.
 
-    # --- DJ ------------------------------------------------------------------
-    async def _clip_a_track(self, clip) -> wavelink.Playable | None:
-        """Convierte el .wav del DJ en un track que Lavalink pueda reproducir.
-
-        `source=None` es obligatorio: por defecto `search()` le antepone
-        `ytmsearch:` a lo que no sea una URL, y saldría a buscar la ruta del
-        archivo en YouTube Music en vez de abrirlo con la fuente local.
+        Sin ese reporte `_last_position` es la del tema anterior y reanudar ahí
+        revienta con EOFException. wavelink deja `_last_update` en None hasta el
+        primer playerUpdate.
         """
-        try:
-            resultados = await wavelink.Playable.search(str(clip.path), source=None)
-        except Exception:
-            log.warning("Lavalink no pudo cargar el clip del DJ", exc_info=True)
-            return None
-        if not resultados or isinstance(resultados, wavelink.Playlist):
-            log.warning("Lavalink no encontró el clip del DJ en %s", clip.path)
-            return None
-        track = resultados[0]
-        track.is_dj_clip = True
-        return track
-
-    async def _encolar_dj(self, vc: wavelink.Player, para: wavelink.Playable) -> None:
-        """Sintetiza el corte del DJ y lo deja al frente, delante de `para`.
-
-        Se mete en la cola en lugar de reproducirlo a mano porque el que va
-        pasando de tema en tema es el AutoPlay de wavelink: si intentáramos
-        colarlo en el momento del cambio, competiríamos con él.
-        """
-        await self.dj.prepare(vc.guild.id, para, self._session)
-        clip = self.dj.take(vc.guild.id, para)
-        if not clip:
-            return
-        # Mientras sintetizábamos pudo haber un skip, un shuffle o un !stop.
-        if not vc.connected or self._proximo(vc) is not para:
-            tts.cleanup(clip.path)
-            return
-        track = await self._clip_a_track(clip)
-        if not track:
-            tts.cleanup(clip.path)
-            return
-        # Siempre a `queue`, aunque el tema que presenta lo haya elegido el
-        # autoplay: wavelink vacía primero `queue` y solo después va a
-        # `auto_queue`, así que el clip queda justo antes de su canción.
-        vc.queue.put_at(0, track)
+        if (getattr(vc, "_last_update", None) or 0) > getattr(vc, "_inicio_ns", 0):
+            return getattr(vc, "_last_position", 0) or 0
+        return 0
 
     # --- wavelink events -----------------------------------------------------
     @commands.Cog.listener()
@@ -371,7 +303,7 @@ class Music(commands.Cog):
         # El wav del DJ ya sonó (o se cortó): no hace falta en disco. Si solo se
         # borrara al arrancar el bot, dj_cache crecería sin tope.
         if payload.track is not None:
-            self._borrar_clip_dj(payload.track)
+            self.locutor.borrar_clip(payload.track)
         if not vc or not vc.guild:
             return
 
@@ -383,11 +315,12 @@ class Music(commands.Cog):
         # arrancar: un tema que arranca y revienta al decodificar reiniciaba el
         # contador y se reintentaba sin fin.
         if payload.reason == "finished" and payload.track is not None:
-            self._reintentos.pop((vc.guild.id, resolver.id_de_cancion(payload.track)), None)
+            est = self.estacion(vc.guild.id)
+            est.reintentos.pop(resolver.id_de_cancion(payload.track), None)
             # Sonó una canción entera: la racha de temas perdidos se corta. El
             # clip del DJ no cuenta, que el aviso de "la salteo" también es uno.
-            if not self._es_clip_dj(payload.track):
-                self._caidas.pop(vc.guild.id, None)
+            if not self.locutor.es_clip(payload.track):
+                est.caidas = 0
 
         # Del "qué suena ahora" se encarga el AutoPlay de wavelink; aquí solo
         # atendemos el final de la cola. "replaced" es un skip: viene otro tema.
@@ -417,128 +350,72 @@ class Music(commands.Cog):
             return
 
         pista = payload.track
-        # El payload viene deserializado de Lavalink y no trae los atributos que
-        # les colgamos nosotros, así que al clip del DJ hay que reconocerlo por
-        # la ruta. Un clip que falla no se reintenta: se vuelve a sintetizar solo
-        # en el próximo corte.
-        if pista is None or self._es_clip_dj(pista):
+        # El payload no trae los atributos que le colgamos nosotros: al clip del DJ
+        # hay que reconocerlo por la ruta. Un clip que falla no se reintenta: se
+        # vuelve a sintetizar solo en el próximo corte.
+        if pista is None or self.locutor.es_clip(pista):
             return
 
-        # wavelink lleva su propia cuenta de fallos y, al llegar a tres seguidos,
-        # deja de avanzar la cola para siempre: después ya no la pone en cero ni
-        # aunque suene algo. Un solo tema con sus dos reintentos llegaba a tres y
-        # la transmisión quedaba muda hasta que el bot se iba del canal. Los
-        # reintentos y el corte por fallos en cadena (`_caidas`) los lleva este
-        # cog, así que esa cuenta se anula aquí. Tiene que ser antes del primer
-        # await: esto corre antes que el `_auto_play_event` de este mismo final.
+        # wavelink cuenta fallos y, a los tres seguidos, deja de avanzar la cola
+        # para siempre. Los reintentos y las caídas los lleva este cog, así que esa
+        # cuenta se anula. Tiene que ser antes del primer await: esto corre antes
+        # que el `_auto_play_event` de este mismo final.
         vc._error_count = 0
 
-        clave = (vc.guild.id, resolver.id_de_cancion(pista))
+        est = self.estacion(vc.guild.id)
+        cancion = resolver.id_de_cancion(pista)
         motivo = self.resolver.motivo_definitivo(pista)
         self.salud.fallo(motivo)
+        gastados = est.reintentos.get(cancion, 0)
+        decision = decidir(
+            motivo, gastados, est.caidas, self._posicion(vc), getattr(pista, "length", 0) or 0
+        )
+        titulo = resolver.titulo_de(pista)
+        canal = getattr(vc, "text_channel", None)
 
-        # Un fallo sin arreglo no gasta reintentos. Un tema bloqueado o borrado
-        # no mejora porque se lo pida de nuevo: son treinta segundos de cola
-        # congelada para algo que no va a sonar nunca.
-        if motivo:
-            self._reintentos.pop(clave, None)
-            titulo = resolver.titulo_de(pista)
+        if decision.accion is Accion.SALTAR:
+            est.reintentos.pop(cancion, None)
             log.info("Salteo %r: %s", titulo, motivo)
-            canal = getattr(vc, "text_channel", None)
             if canal:
                 await canal.send(f"**{titulo}** {motivo}, la salteo.")
-            await self._decir(vc, self.salud.rendido(titulo, motivo))
-            return
-
-        gastados = self._reintentos.get(clave, 0)
-
-        if gastados >= REINTENTOS_POR_PISTA:
-            self._reintentos.pop(clave, None)
-            caidas = self._caidas.get(vc.guild.id, 0) + 1
-            self._caidas[vc.guild.id] = caidas
-            titulo = resolver.titulo_de(pista)
+            await self.locutor.decir(vc, self.salud.rendido(titulo, motivo))
+        elif decision.accion is Accion.REINTENTAR:
+            est.reintentos[cancion] = gastados + 1
+            # Si se cortó a mitad de tema, el reintento sigue desde ahí; el corte
+            # por 302 de googlevideo pasa en pleno stream.
+            if decision.reanudar_en is not None and hasattr(vc, "reanudar"):
+                vc.reanudar[cancion] = decision.reanudar_en
+            log.info(
+                "Reintento %s/%s de %r: %s",
+                gastados + 1, REINTENTOS_POR_PISTA, titulo, payload.exception,
+            )
+            # Se reencola YA, sin esperar nada: wavelink mira la cola apenas muere el
+            # tema y, si está vacía, busca recomendaciones y estaciona el player (desde
+            # afuera, "el bot dejó de reproducir").
+            if vc.connected:
+                vc.queue.put_at(0, pista)
+        else:
+            est.reintentos.pop(cancion, None)
+            est.caidas = decision.caidas
             log.warning(
                 "Sin audio para %r después de %s intentos: %s",
                 titulo, gastados, payload.exception,
             )
-            canal = getattr(vc, "text_channel", None)
-            if caidas >= CAIDAS_SEGUIDAS_MAX:
-                # Tema tras tema sin audio: YouTube no está entregando y seguir
-                # probando solo quema la cola. Se deja la cuenta de wavelink en
-                # su tope, antes de que mire este final, para que no pase al
-                # siguiente; `!play` la retoma (ver `_arrancar_si_hace_falta`).
+            if decision.accion is Accion.PARAR:
+                # Con YouTube sin entregar, seguir probando solo quema la cola. Se deja
+                # la cuenta de wavelink en su tope para que no pase al siguiente;
+                # `!play` la retoma (ver `_arrancar_si_hace_falta`).
                 vc._error_count = TOPE_DE_WAVELINK
-                log.warning("%s temas seguidos sin audio: paro la cola", caidas)
+                log.warning("%s temas seguidos sin audio: paro la cola", decision.caidas)
                 if canal:
                     await canal.send(
                         f"No pude sacar el audio de **{titulo}** ni de los "
-                        f"{caidas - 1} anteriores: paro la cola. `!play` para retomar."
+                        f"{decision.caidas - 1} anteriores: paro la cola. `!play` para retomar."
                     )
                 return
             if canal:
                 await canal.send(f"No pude sacar el audio de **{titulo}**, la salteo.")
-            await self._decir(vc, self.salud.rendido(titulo))
-            return
-
-        self._reintentos[clave] = gastados + 1
-        # Si se cortó a mitad de tema, el reintento sigue desde ahí (menos un
-        # respiro de 2 s); el corte por 302 de googlevideo pasa en pleno stream.
-        # `_last_position` solo vale si Lavalink ya reportó ESTE tema: si no, es
-        # la posición del anterior y reanudar ahí revienta con EOFException.
-        corte = 0
-        # wavelink arranca `_last_update` en None hasta el primer playerUpdate.
-        if (getattr(vc, "_last_update", None) or 0) > getattr(vc, "_inicio_ns", 0):
-            corte = getattr(vc, "_last_position", 0) or 0
-        largo = getattr(pista, "length", 0) or 0
-        if hasattr(vc, "reanudar") and 5000 < corte and (not largo or corte < largo - 15000):
-            vc.reanudar[clave[1]] = corte - 2000
-        log.info(
-            "Reintento %s/%s de %r: %s",
-            gastados + 1, REINTENTOS_POR_PISTA, resolver.titulo_de(pista),
-            payload.exception,
-        )
-        # Se reencola YA, sin esperar nada en el medio. wavelink decide qué hacer
-        # apenas se muere el tema y lo primero que mira es si hay cola: si para
-        # entonces todavía no la devolvimos, se va a buscar recomendaciones y, si
-        # no encuentra, estaciona el player. La pista quedaría en una cola que ya
-        # nadie va a mirar, que desde afuera es "el bot dejó de reproducir".
-        #
-        # El respiro que antes daba este sleep ahora lo da el propio resolver, que
-        # se toma su viaje a yt-dlp antes de cada intento.
-        if vc.connected:
-            vc.queue.put_at(0, pista)
-
-    async def _decir(self, vc: wavelink.Player, frase: str | None) -> None:
-        """Que el DJ diga algo ahora mismo, al frente de la cola.
-
-        Es el canal que sigue vivo justo cuando falla lo que hay que avisar, y
-        como el tema se cayó el player está libre: suena de inmediato sin competir
-        con nada. `frase` viene en None cuando toca callarse (ver Salud.rendido).
-        """
-        if not frase or not vc.connected:
-            return
-        clip = await self.dj.aviso(frase)
-        if not clip:
-            return
-        track = await self._clip_a_track(clip)
-        if track:
-            vc.queue.put_at(0, track)
-        else:
-            tts.cleanup(clip.path)
-
-    @staticmethod
-    def _es_clip_dj(pista: wavelink.Playable) -> bool:
-        """Si la pista es un wav del DJ y no una canción."""
-        carpeta = str(tts.CACHE_DIR)
-        return any(
-            str(getattr(pista, campo, "") or "").startswith(carpeta)
-            for campo in ("uri", "identifier")
-        )
-
-    def _borrar_clip_dj(self, pista: wavelink.Playable) -> None:
-        """Borra el wav si la pista es un corte del DJ; una canción ni se toca."""
-        if self._es_clip_dj(pista):
-            tts.cleanup(getattr(pista, "uri", None) or pista.identifier)
+            await self.locutor.decir(vc, self.salud.rendido(titulo))
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
@@ -546,7 +423,7 @@ class Music(commands.Cog):
         if not vc or not vc.guild:
             return
 
-        self._cancel_idle(vc.guild.id)
+        self.estacion(vc.guild.id).cancelar_idle()
         vc._inicio_ns = time.monotonic_ns()
 
         # Mientras habla el DJ no se toca el panel: el que manda es el tema.
@@ -567,9 +444,9 @@ class Music(commands.Cog):
 
         # La URL del tema que viene se adelanta con lo que suena ya en marcha, para
         # que el cambio no espere a yt-dlp. Va antes del `return` de los clips a
-        # propósito: al arrancar la canción `_proximo` es la que sigue, pero el
+        # propósito: al arrancar la canción `proximo` es la que sigue, pero el
         # corte del DJ entra a la cola después y se interpone; cuando el corte
-        # arranca, `_proximo` ya es la que viene tras él, y el rato de la voz es
+        # arranca, `proximo` ya es la que viene tras él, y el rato de la voz es
         # justo el que hace falta para resolverla. `precargar` deduplica.
         self._precargar_siguiente(vc)
 
@@ -585,16 +462,16 @@ class Music(commands.Cog):
         # El corte del próximo cambio se prepara ahora, con la canción sonando:
         # sintetizar la voz toma su tiempo y así llega listo.
         if self.dj.available():
-            siguiente = self._proximo(vc)
+            siguiente = proximo(vc)
             if siguiente is not None and not getattr(siguiente, "is_dj_clip", False):
-                self._segundo_plano(self._encolar_dj(vc, siguiente))
+                self._segundo_plano(self.locutor.encolar(vc, siguiente, self._session))
 
     # --- helpers -------------------------------------------------------------
     async def _connect_voice(self, ctx: commands.Context) -> wavelink.Player | None:
         if not ctx.author.voice:
             await ctx.send("Entra a un canal de voz primero.")
             return None
-        
+
         vc: wavelink.Player = ctx.voice_client
         if not vc:
             # ResolvingPlayer y no wavelink.Player: el audio de YouTube lo saca
@@ -639,14 +516,15 @@ class Music(commands.Cog):
         cada uno un tema de la cola y el segundo pisaba al primero, que se
         perdía sin aviso. `incluir_autoplay` suma la `auto_queue`: solo lo usa el vigilante.
         """
-        async with self._arranques.setdefault(vc.guild.id, asyncio.Lock()):
+        est = self.estacion(vc.guild.id)
+        async with est.arranque:
             cola = self._cola_a_tocar(vc, incluir_autoplay)
             if self._ocupado(vc) or cola is None:
                 return
             # Presentación del primer tema: aquí sí hay que esperar a que la voz
             # esté sintetizada, porque no hay nada sonando todavía.
             if self.dj.available():
-                await self._encolar_dj(vc, cola[0])
+                await self.locutor.encolar(vc, cola[0], self._session)
                 # Pudo arrancar otro tema, y el corte queda al frente de `queue`.
                 cola = self._cola_a_tocar(vc, incluir_autoplay)
                 if self._ocupado(vc) or cola is None:
@@ -654,7 +532,7 @@ class Music(commands.Cog):
             # Lo pidió alguien: si la cola se había parado por fallos en cadena,
             # esto la retoma.
             vc._error_count = 0
-            self._caidas.pop(vc.guild.id, None)
+            est.caidas = 0
             await vc.play(cola.get())
 
     # --- vigilante de la cola ------------------------------------------------
@@ -679,12 +557,11 @@ class Music(commands.Cog):
         if not (vc.queue or vc.auto_queue):
             return False
         # Lock tomado: hay un arranque en marcha (la voz del DJ sintetizándose).
-        lock = self._arranques.get(vc.guild.id)
-        return lock is None or not lock.locked()
+        return not self.estacion(vc.guild.id).arranque.locked()
 
     async def _vigilar_una_vez(self, players) -> None:
         """Destraba los players atascados en dos revisiones seguidas (una sola puede ser un cambio de tema)."""
-        anteriores = self._atascados
+        anteriores = {g for g, est in self._estaciones.items() if est.atascado}
         ahora: set[int] = set()
         for vc in players:
             try:
@@ -697,14 +574,16 @@ class Music(commands.Cog):
                 await self._destrabar(vc)
             except Exception:  # noqa: BLE001 - un servidor roto no frena a los demás
                 log.exception("No pude revisar el player de %s", getattr(vc, "guild", "?"))
-        self._atascados = ahora
+        # Los que esta pasada no vio atascados (o no vio) pierden la marca.
+        for g, est in self._estaciones.items():
+            est.atascado = g in ahora
 
     async def _destrabar(self, vc: wavelink.Player) -> None:
         log.warning(
             "Nada suena en %s con temas esperando (%s en cola, %s del autoplay, "
             "sigue %r): lo destrabo",
             vc.guild, len(vc.queue), len(vc.auto_queue),
-            resolver.titulo_de(self._proximo(vc)),
+            resolver.titulo_de(proximo(vc)),
         )
         await self._arrancar_si_hace_falta(vc, incluir_autoplay=True)
 
@@ -715,7 +594,7 @@ class Music(commands.Cog):
         if not vc:
             return
 
-        self._cancel_idle(ctx.guild.id)
+        self.estacion(ctx.guild.id).cancelar_idle()
 
         if spotify.es_spotify(query):
             return await self._play_spotify(ctx, vc, query)
@@ -758,7 +637,7 @@ class Music(commands.Cog):
         if not vc:
             return
 
-        self._cancel_idle(ctx.guild.id)
+        self.estacion(ctx.guild.id).cancelar_idle()
 
         if not self._espacio_en_cola(vc):
             return await ctx.send(
@@ -794,19 +673,6 @@ class Music(commands.Cog):
         await ctx.send(f"🔝 La próxima: **{track.title}**")
 
     # --- Spotify --------------------------------------------------------------
-    async def _buscar_uno(self, consulta: str, pedido_por: str) -> wavelink.Playable | None:
-        """Un nombre de Spotify → el tema en YouTube. None si no aparece."""
-        try:
-            tracks: wavelink.Search = await wavelink.Playable.search(consulta)
-        except Exception:
-            log.warning("falló la búsqueda de %r", consulta, exc_info=True)
-            return None
-        if not tracks or isinstance(tracks, wavelink.Playlist):
-            return None
-        track = tracks[0]
-        track.requester = pedido_por
-        return track
-
     async def _play_spotify(self, ctx: commands.Context, vc: wavelink.Player, url: str):
         """Encola un link de Spotify buscando cada tema por nombre en YouTube."""
         if not self._session:
@@ -827,7 +693,7 @@ class Music(commands.Cog):
             )
 
         pedido_por = ctx.author.display_name
-        primero = await self._buscar_uno(lista.queries[0], pedido_por)
+        primero = await cola_spotify.buscar_uno(lista.queries[0], pedido_por)
         if primero:
             await vc.queue.put_wait(primero)
 
@@ -848,8 +714,9 @@ class Music(commands.Cog):
         await self._arrancar_si_hace_falta(vc)
 
         if restantes:
-            self._cancelar_spotify(ctx.guild.id)
-            self._spotify_tasks[ctx.guild.id] = asyncio.create_task(
+            est = self.estacion(ctx.guild.id)
+            est.cancelar_spotify()
+            est.spotify = asyncio.create_task(
                 self._encolar_spotify(ctx, vc, restantes, pedido_por)
             )
 
@@ -860,33 +727,21 @@ class Music(commands.Cog):
         consultas: list[str],
         pedido_por: str,
     ) -> None:
-        encolados, perdidos = 0, 0
+        est = self.estacion(ctx.guild.id)
         try:
-            for i in range(0, len(consultas), SPOTIFY_LOTE):
-                if not vc.connected:
-                    return
-                lote = consultas[i:i + SPOTIFY_LOTE]
-                # En lote pero manteniendo el orden del disco/playlist.
-                resultados = await asyncio.gather(
-                    *(self._buscar_uno(c, pedido_por) for c in lote)
-                )
-                for track in resultados:
-                    if track is None:
-                        perdidos += 1
-                    elif self._espacio_en_cola(vc):
-                        await vc.queue.put_wait(track)
-                        encolados += 1
-                await self._arrancar_si_hace_falta(vc)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("se cayó la carga de la lista de Spotify")
+            carga = await cola_spotify.cargar(
+                vc, consultas, pedido_por, self._espacio_en_cola, self._arrancar_si_hace_falta
+            )
         finally:
-            self._spotify_tasks.pop(ctx.guild.id, None)
+            # Si otra lista reemplazó a esta, la referencia ya es de la nueva.
+            if est.spotify is asyncio.current_task():
+                est.spotify = None
+        if carga is None:
+            return
 
-        resumen = f"🎧 Listo: {encolados} temas más en la cola."
-        if perdidos:
-            resumen += f" No encontré {perdidos} en YouTube."
+        resumen = f"🎧 Listo: {carga.encolados} temas más en la cola."
+        if carga.perdidos:
+            resumen += f" No encontré {carga.perdidos} en YouTube."
         try:
             await ctx.send(resumen)
         except discord.HTTPException:
@@ -927,10 +782,10 @@ class Music(commands.Cog):
 
         async with ctx.typing():
             tracks: wavelink.Search = await wavelink.Playable.search(query)
-        
+
         if not tracks or isinstance(tracks, wavelink.Playlist):
             return await ctx.send("No encontré resultados individuales.")
-        
+
         options = tracks[:5]
         numbers = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"][:len(options)]
         lines = [
@@ -955,7 +810,7 @@ class Music(commands.Cog):
 
         chosen = options[numbers.index(str(reaction.emoji))]
         chosen.requester = ctx.author.display_name
-        
+
         await vc.queue.put_wait(chosen)
         if self._ocupado(vc):
             await ctx.send(f"Cola #{len(vc.queue)}: **{chosen.title}**")

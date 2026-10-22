@@ -48,6 +48,10 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 |---|---|
 | `bot.py` | Arranque, carga de cogs |
 | `cogs/music.py` | Comandos de Discord de música (wavelink) y el vigilante que destraba la cola |
+| `core/estacion.py` | El estado de un servidor en un solo objeto (`Estacion`); `teardown` lo tira entero |
+| `core/reintentos.py` | Política de reintentos de una pista caída: función pura, el cog aplica la decisión |
+| `core/locutor.py` | El DJ frente al player: sus wavs se vuelven pistas al frente de la cola |
+| `core/cola_spotify.py` | Carga de una lista de Spotify: busca cada nombre en YouTube y lo encola por lotes |
 | `core/controller.py` | Estado de reproducción y colas |
 | `core/api.py` | API HTTP en `:9876` que consumen los paneles; también sirve el panel web en `/` |
 | `core/static/panel.html` | Panel web (multiplataforma) |
