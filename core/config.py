@@ -114,6 +114,12 @@ YTDLP_TIMEOUT = _entero("YTDLP_TIMEOUT", 30)
 # paciencia de cualquiera.
 SILENCIO_PARA_MUDO = _entero("SILENCIO_PARA_MUDO", 300)
 
+# --- SponsorBlock --------------------------------------------------------------
+# Salta de los videoclips lo que no es la canción (intros habladas, sketches, finales)
+# según las marcas públicas de SponsorBlock (core/sponsorblock.py). No necesita cuenta.
+SPONSORBLOCK = _booleano("SPONSORBLOCK", True)
+SPONSORBLOCK_CATEGORIAS = _lista_de_texto("SPONSORBLOCK_CATEGORIAS", ("music_offtopic",))
+
 # --- DJ ----------------------------------------------------------------------
 # Volumen de la voz del DJ, en porcentaje de su nivel histórico (0-200). Es el
 # valor con el que arranca el bot; el panel de escritorio lo mueve en vivo por

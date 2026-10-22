@@ -16,6 +16,7 @@ from core.messages import split_message
 from core.panel import PlayerPanel, build_embed
 from core.reintentos import REINTENTOS_POR_PISTA, Accion, decidir
 from core.salud import Salud
+from core.sponsorblock import Segmento, llega_al_final
 
 log = logging.getLogger("music")
 
@@ -39,6 +40,12 @@ GUARDAR_CADA = 15
 REFRESCAR_CADA = 60
 
 AVISO_RETOMADA = "Volví: sigo con la cola."
+
+# Cada cuánto, como mucho, mira un vigía de segmento por dónde va el tema: así nota una pausa o un seek del usuario.
+REVISAR_SEGMENTO = 2.0
+PISO_DE_REVISION = 0.25
+# Lavalink reporta la posición cada 5 s; con un reporte más viejo (tras una pausa larga) no se extrapola.
+REPORTE_VIGENTE_MS = 6000
 
 
 def en_el_mismo_canal():
@@ -130,6 +137,7 @@ class Music(commands.Cog):
             task.cancel()
         if self._session:
             await self._session.close()
+        await self.resolver.cerrar()
 
     def _segundo_plano(self, coro) -> asyncio.Task:
         """Lanza una tarea y la retiene hasta que termine."""
@@ -313,6 +321,75 @@ class Music(commands.Cog):
             return getattr(vc, "_last_position", 0) or 0
         return 0
 
+    @staticmethod
+    def _posicion_viva(vc: wavelink.Player) -> int:
+        """Ms por donde va el tema ahora, sin adelantarse nunca a lo que Lavalink contó.
+
+        Entre reportes suma el tiempo corrido, pero no si está en pausa ni con un reporte viejo:
+        tras una pausa larga extrapolar adelantaría la cuenta y se saltaría música.
+        """
+        reporte = getattr(vc, "_last_update", None) or 0
+        arranque = getattr(vc, "_inicio_ns", 0)
+        if reporte > arranque:
+            base, desde = getattr(vc, "_last_position", 0) or 0, reporte
+        else:
+            base, desde = getattr(vc, "arranque_ms", 0), arranque
+        corrido = (time.monotonic_ns() - desde) // 1_000_000
+        return base if vc.paused or corrido > REPORTE_VIGENTE_MS else base + corrido
+
+    def _programar_saltos(self, vc: wavelink.Player, sonando: wavelink.Playable) -> None:
+        """Un vigía por cada parte que no es música de la canción que arranca."""
+        est = self.estacion(vc.guild.id)
+        est.cancelar_segmentos()
+        if not resolver.video_de(sonando):
+            return
+        quien = getattr(vc, "resolver", None) or self.resolver
+        try:
+            segmentos = quien.segmentos_de(sonando)
+        except Exception:  # noqa: BLE001 - es un extra: que no se lleve por delante el panel ni el corte del DJ
+            log.warning("No pude leer las partes que no son música del tema", exc_info=True)
+            return
+        est.segmentos.extend(
+            asyncio.create_task(self._vigilar_segmento(vc, est, sonando, segmento)) for segmento in segmentos
+        )
+
+    async def _vigilar_segmento(
+        self, vc: wavelink.Player, est: Estacion, pista: wavelink.Playable, segmento: Segmento
+    ) -> None:
+        """Espera a que `pista` llegue al segmento y lo salta: `seek` a su final, o el tema siguiente si llega al final.
+
+        Mira la posición real cada `REVISAR_SEGMENTO` como mucho en vez de dormir hasta el inicio: una pausa
+        o un seek del usuario mueven la cuenta y así se notan sin depender de un evento, que wavelink no emite.
+        """
+        yo = asyncio.current_task()
+        try:
+            while True:
+                posicion = self._posicion_viva(vc)
+                if vc.current is not pista or not vc.connected or posicion >= segmento.fin:
+                    return
+                falta = (segmento.inicio - posicion) / 1000
+                if falta <= 0:
+                    break
+                await asyncio.sleep(max(PISO_DE_REVISION, min(falta, REVISAR_SEGMENTO)))
+            # Sale de la lista antes de actuar: el `track_end` que provoca el skip no tiene que cancelarla a medias.
+            if yo in est.segmentos:
+                est.segmentos.remove(yo)
+            titulo = resolver.titulo_de(pista)
+            if llega_al_final(segmento, getattr(pista, "length", 0) or 0):
+                log.info("Salteo %r: del segundo %.0f al final no es música", titulo, segmento.inicio / 1000)
+                await controller.skip(vc)
+            else:
+                log.info(
+                    "Salto la parte que no es música de %r: del segundo %.0f al %.0f",
+                    titulo, segmento.inicio / 1000, segmento.fin / 1000,
+                )
+                await vc.seek(segmento.fin)
+        except Exception:  # noqa: BLE001 - tarea suelta: nada de lo que pase puede escapar
+            log.warning("No pude saltar la parte que no es música de %r", resolver.titulo_de(pista), exc_info=True)
+        finally:
+            if yo in est.segmentos:
+                est.segmentos.remove(yo)
+
     # --- wavelink events -----------------------------------------------------
     @commands.Cog.listener()
     async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload):
@@ -323,6 +400,10 @@ class Music(commands.Cog):
             self.locutor.borrar_clip(payload.track)
         if not vc or not vc.guild:
             return
+
+        # Los vigías de segmentos son de esta canción: la que siga programa los suyos.
+        if est := self._estaciones.get(vc.guild.id):
+            est.cancelar_segmentos()
 
         # Empieza a correr el hueco hasta la próxima pista, sea canción o clip.
         # Un skip también cuenta: es silencio que se escucha.
@@ -473,6 +554,8 @@ class Music(commands.Cog):
         # Que arranque una canción es la única prueba de que esto funciona. El corte
         # del DJ no cuenta: si contara, taparía para siempre que no suena música.
         self.salud.sono()
+
+        self._programar_saltos(vc, sonando)
 
         await self._post_panel(vc.guild, vc)
 

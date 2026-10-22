@@ -11,6 +11,11 @@ def archivo_de_colas(tmp_path, monkeypatch):
     return ruta
 
 
+@pytest.fixture(autouse=True)
+def sin_sponsorblock(monkeypatch):
+    """Ningún test sale a la red a preguntar por segmentos: los que prueban SponsorBlock lo arman a mano."""
+    monkeypatch.setattr(config, "SPONSORBLOCK", False)
+
 
 @pytest.fixture(autouse=True)
 def ajustes_y_voces(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ from core.reintentos import CAIDAS_SEGUIDAS_MAX, REINTENTOS_POR_PISTA
 from core.resolver import Resolver
 from core.salud import Salud
 from core.spotify import Lista
+from core.sponsorblock import Segmento, SponsorBlock
 
 
 class FakeTrack:
@@ -2312,3 +2313,340 @@ async def test_si_el_aviso_no_sale_la_cola_sigue_sonando(cog, discord_falso):
     vc = guild.canales[10].player
     assert vc.connected
     assert vc.llamadas
+
+
+# --- saltar las partes que no son música -----------------------------------------------
+
+class Escenario:
+    """Un tema sonando con reloj, posición y reportes de Lavalink simulados (uno cada 5 s, solo mientras suena)."""
+
+    def __init__(self, monkeypatch, vc):
+        self.vc, self.ns, self.t, self.pos, self.reporte, self.eventos = vc, 10**12, 0.0, 0, 0.0, []
+        vc.escenario = self
+        original = asyncio.sleep
+        monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: self.ns, monotonic=time.monotonic))
+
+        async def dormir(segundos, *a):
+            self.avanzar(segundos)
+            await original(0)
+
+        monkeypatch.setattr(music_mod.asyncio, "sleep", dormir)
+
+    def a_los(self, segundos, accion):
+        """Algo que pasa cuando el reloj llega a ese segundo: una pausa, un seek del usuario…"""
+        self.eventos = sorted([*self.eventos, (segundos, accion)], key=lambda e: e[0])
+
+    def avanzar(self, segundos):
+        while segundos > 0:
+            paso = min(segundos, 0.5)
+            segundos -= paso
+            self.ns += int(paso * 1e9)
+            self.t += paso
+            if not self.vc.paused:
+                self.pos += int(paso * 1000)
+                if self.t - self.reporte >= 5:
+                    self.reporte = self.t
+                    self.vc._last_update, self.vc._last_position = self.ns, self.pos
+            while self.eventos and self.eventos[0][0] <= self.t:
+                self.eventos.pop(0)[1]()
+
+
+class PlayerQueSalta(FakePlayer):
+    """Un player donde se ven los seeks y los skips, cada uno con la posición real del momento."""
+
+    def __init__(self, pista):
+        super().__init__(playing=True)
+        self.current = pista
+        self.text_channel = FakeCanalTexto()
+        self.seeks, self.skips = [], []
+        self.falla_el_seek = False
+
+    async def seek(self, ms):
+        if self.falla_el_seek:
+            raise RuntimeError("Lavalink dijo que no")
+        self.seeks.append((ms, self.escenario.pos))
+        self.escenario.pos = ms
+
+    async def skip(self, force=True):
+        self.skips.append(self.escenario.pos)
+
+
+def _tema(id_="abc", largo=200_000):
+    tema = FakeTrack(id_)
+    tema.length = largo
+    tema.source = "youtube"
+    tema.uri = f"https://www.youtube.com/watch?v={id_}"
+    return tema
+
+
+async def _arrancar(cog, monkeypatch, segmentos, *, arranque=0, pista=None):
+    """Arranca un tema de 200 s con esos segmentos ya en la caché y devuelve (player, escenario, estación, pista)."""
+    pista = pista or _tema()
+    vc = PlayerQueSalta(pista)
+    sb = SponsorBlock(activo=True)
+    sb._cache["abc"] = tuple(segmentos)
+    vc.resolver = Resolver(sponsorblock=sb)
+    vc.arranque_ms = arranque
+    escenario = Escenario(monkeypatch, vc)
+    escenario.pos = arranque
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
+    return vc, escenario, cog.estacion(vc.guild.id), pista
+
+
+async def _terminar(est):
+    """Deja correr los vigías hasta que acaben, con tope por si alguno se queda dando vueltas."""
+    await asyncio.wait_for(asyncio.gather(*list(est.segmentos), return_exceptions=True), timeout=5)
+
+
+def _lineas_de_salto(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "music" and "no es música" in r.getMessage()]
+
+
+async def test_una_parte_del_medio_se_salta_con_seek_a_su_final(cog, sin_panel, monkeypatch, caplog):
+    with caplog.at_level("INFO", logger="music"):
+        vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 75_000, 200_000)])
+        assert len(est.segmentos) == 1
+        await _terminar(est)
+
+    [(destino, donde)] = vc.seeks
+    assert destino == 75_000 and 60_000 <= donde <= 62_500
+    assert vc.skips == [] and est.segmentos == []
+    [linea] = _lineas_de_salto(caplog)
+    assert "abc" in linea and "60" in linea and "75" in linea
+
+
+@pytest.mark.parametrize("fin", [195_000, 198_000, 200_000])
+async def test_la_parte_que_llega_al_final_salta_al_tema_siguiente(cog, sin_panel, monkeypatch, caplog, fin):
+    with caplog.at_level("INFO", logger="music"):
+        vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(170_000, fin, 200_000)])
+        await _terminar(est)
+
+    [donde] = vc.skips
+    assert 170_000 <= donde <= 172_500
+    assert vc.seeks == []
+    assert len(_lineas_de_salto(caplog)) == 1
+
+
+async def test_una_parte_que_termina_lejos_del_final_no_salta_de_tema(cog, sin_panel, monkeypatch):
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(170_000, 190_000, 200_000)])
+
+    await _terminar(est)
+
+    assert [d for d, _ in vc.seeks] == [190_000] and vc.skips == []
+
+
+async def test_cada_parte_tiene_su_vigia_y_se_saltan_en_orden(cog, sin_panel, monkeypatch):
+    partes = [Segmento(30_000, 40_000, 200_000), Segmento(100_000, 110_000, 200_000), Segmento(180_000, 200_000, 200_000)]
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, partes)
+    assert len(est.segmentos) == 3
+
+    await _terminar(est)
+
+    assert [d for d, _ in vc.seeks] == [40_000, 110_000]
+    assert len(vc.skips) == 1 and 180_000 <= vc.skips[0] <= 186_000
+    assert est.segmentos == []
+
+
+async def test_una_pausa_del_usuario_corre_los_tiempos(cog, sin_panel, monkeypatch):
+    """Pausa de 30 s a los 50: dormir 60 s desde el arranque saltaría 10 s de canción."""
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)])
+    escenario.a_los(50, lambda: setattr(vc, "paused", True))
+    escenario.a_los(80, lambda: setattr(vc, "paused", False))
+
+    await _terminar(est)
+
+    [(destino, donde)] = vc.seeks
+    assert destino == 70_000 and 60_000 <= donde <= 62_500
+    assert escenario.t >= 89
+
+
+async def test_un_seek_del_usuario_hacia_adelante_se_nota_y_nunca_se_vuelve_atras(cog, sin_panel, monkeypatch):
+    partes = [Segmento(60_000, 70_000, 200_000), Segmento(100_000, 110_000, 200_000)]
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, partes)
+    escenario.a_los(10, lambda: setattr(escenario, "pos", 95_000))
+
+    await _terminar(est)
+
+    [(destino, donde)] = vc.seeks
+    assert destino == 110_000 and 100_000 <= donde <= 107_000
+
+
+@pytest.mark.parametrize("pasa", ["otra pista", "desconectado"])
+async def test_no_actua_si_la_pista_cambio_o_el_player_se_fue(cog, sin_panel, monkeypatch, pasa):
+    vc, escenario, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)])
+    if pasa == "otra pista":
+        escenario.a_los(20, lambda: setattr(vc, "current", _tema("otra")))
+    else:
+        escenario.a_los(20, lambda: setattr(vc, "connected", False))
+
+    await _terminar(est)
+
+    assert vc.seeks == [] and vc.skips == []
+    assert est.segmentos == []
+
+
+async def test_un_reintento_que_retoma_despues_de_la_parte_no_vuelve_atras(cog, sin_panel, monkeypatch):
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)], arranque=80_000)
+
+    await _terminar(est)
+
+    assert vc.seeks == [] and vc.skips == []
+
+
+async def test_la_intro_ya_saltada_al_arrancar_no_se_salta_otra_vez(cog, sin_panel, monkeypatch):
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(0, 12_500, 200_000)], arranque=12_500)
+
+    await _terminar(est)
+
+    assert vc.seeks == []
+
+
+async def test_una_intro_que_llego_tarde_se_salta_con_seek(cog, sin_panel, monkeypatch):
+    """Si las marcas llegaron después de `play()`, el vigía recupera la intro."""
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(0, 12_500, 200_000)])
+
+    await _terminar(est)
+
+    [(destino, donde)] = vc.seeks
+    assert destino == 12_500 and donde <= 2_500
+
+
+async def test_si_el_seek_falla_se_avisa_y_no_escapa_ninguna_excepcion(cog, sin_panel, monkeypatch, caplog):
+    vc, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)])
+    vc.falla_el_seek = True
+    tareas = list(est.segmentos)
+
+    with caplog.at_level("WARNING", logger="music"):
+        resultados = await asyncio.wait_for(asyncio.gather(*tareas, return_exceptions=True), timeout=5)
+
+    assert resultados == [None]
+    assert "No pude saltar" in caplog.text
+
+
+async def test_al_terminar_la_cancion_se_cancelan_los_vigias(cog, sin_panel, monkeypatch):
+    vc, _, est, pista = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)])
+    vc.queue.append(FakeTrack("la que sigue"))
+    tareas = list(est.segmentos)
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, pista, reason="replaced"))
+    await asyncio.gather(*tareas, return_exceptions=True)
+
+    assert all(t.cancelled() for t in tareas)
+    assert est.segmentos == [] and vc.seeks == []
+
+
+async def test_el_final_de_un_servidor_sin_estacion_no_la_crea(cog):
+    vc = FakePlayer()
+    vc.queue.append(FakeTrack("la que sigue"))
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la que terminó"), reason="replaced"))
+
+    assert cog._estaciones == {}
+
+
+async def test_el_vigia_que_ya_esta_actuando_no_se_cancela_con_el_final_que_provoca(cog, sin_panel, monkeypatch):
+    """El skip de un vigía dispara el `track_end` del tema: no puede cortarle el skip a medias."""
+    vc, _, est, pista = await _arrancar(cog, monkeypatch, [Segmento(180_000, 200_000, 200_000)])
+    vc.queue.append(FakeTrack("la que sigue"))
+    [vigia] = est.segmentos
+    skip = vc.skip
+
+    async def _skip_con_final(force=True):
+        await skip(force)
+        await cog.on_wavelink_track_end(FakePayloadFin(vc, pista, reason="replaced"))
+
+    vc.skip = _skip_con_final
+    await asyncio.wait_for(vigia, timeout=5)
+
+    assert not vigia.cancelled() and len(vc.skips) == 1
+
+
+async def test_un_corte_del_dj_no_programa_saltos(cog, sin_panel, monkeypatch):
+    clip = _tema()
+    clip.is_dj_clip = True
+
+    _, _, est, _ = await _arrancar(cog, monkeypatch, [Segmento(60_000, 70_000, 200_000)], pista=clip)
+
+    assert est.segmentos == []
+
+
+async def test_un_tema_sin_marcas_no_programa_nada(cog, sin_panel, monkeypatch):
+    _, _, est, _ = await _arrancar(cog, monkeypatch, [])
+
+    assert est.segmentos == []
+
+
+async def test_con_sponsorblock_apagado_no_se_programa_ni_se_consulta_nada(cog, sin_panel):
+    pista = _tema()
+    vc = PlayerQueSalta(pista)
+    vc.resolver = Resolver()
+    assert vc.resolver.sponsorblock.activo is False
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
+
+    assert cog.estacion(1).segmentos == []
+    assert vc.resolver.sponsorblock._http is None and vc.resolver.sponsorblock._en_curso == {}
+
+
+async def test_si_el_resolver_no_sabe_de_segmentos_el_panel_sale_igual(cog, monkeypatch, caplog):
+    publicados = []
+
+    async def _panel(self, guild, vc):
+        publicados.append(vc)
+
+    monkeypatch.setattr(Music, "_post_panel", _panel)
+    pista = _tema()
+    vc = PlayerQueSalta(pista)
+    vc.resolver = ResolverQueAnota()
+
+    with caplog.at_level("WARNING", logger="music"):
+        await cog.on_wavelink_track_start(FakePayloadInicio(vc, pista))
+
+    assert publicados == [vc]
+    assert cog.estacion(1).segmentos == []
+    assert "partes que no son música" in caplog.text
+
+
+async def test_al_descargar_el_cog_se_cierra_el_resolver(cog):
+    cerrado = []
+
+    async def _cerrar():
+        cerrado.append(True)
+
+    cog.resolver.cerrar = _cerrar
+    await cog.cog_unload()
+
+    assert cerrado == [True]
+
+
+@pytest.mark.parametrize("segundos_desde_el_reporte, pausado, esperado", [
+    (3, False, 53_000),
+    (6, False, 56_000),
+    (7, False, 50_000),
+    (300, False, 50_000),
+    (3, True, 50_000),
+])
+def test_la_posicion_solo_se_extrapola_de_un_reporte_reciente_y_sin_pausa(
+    monkeypatch, segundos_desde_el_reporte, pausado, esperado
+):
+    """Tras una pausa larga el reporte viejo adelantaría la cuenta y se saltaría música."""
+    reporte = 5 * 10**9
+    ahora = reporte + segundos_desde_el_reporte * 10**9
+    monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: ahora))
+    vc = SimpleNamespace(_last_update=reporte, _last_position=50_000, _inicio_ns=10**9, paused=pausado)
+
+    assert Music._posicion_viva(vc) == esperado
+
+
+def test_antes_del_primer_reporte_la_posicion_cuenta_desde_donde_arranco_el_tema(monkeypatch):
+    monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: 4 * 10**9))
+    vc = SimpleNamespace(_last_update=None, _inicio_ns=10**9, arranque_ms=12_500, paused=False)
+
+    assert Music._posicion_viva(vc) == 15_500
+
+
+def test_un_reporte_del_tema_anterior_no_cuenta(monkeypatch):
+    monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: 4 * 10**9))
+    vc = SimpleNamespace(_last_update=5 * 10**8, _last_position=170_000, _inicio_ns=10**9, arranque_ms=0, paused=False)
+
+    assert Music._posicion_viva(vc) == 3_000

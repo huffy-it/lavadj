@@ -323,3 +323,71 @@ async def test_si_el_servidor_deja_de_estar_atascado_pierde_la_marca(cog):
     await cog._vigilar_una_vez([vc])
 
     assert cog.estacion(1).atascado is False
+
+
+# --- los vigías de las partes que no son música ---------------------------------------------
+
+def test_una_estacion_nueva_no_tiene_vigias_ni_los_comparte():
+    a, b = Estacion(), Estacion()
+    assert a.segmentos == []
+    a.segmentos.append(object())
+    assert b.segmentos == []
+
+
+async def test_cancelar_segmentos_corta_todos_y_vacia_la_lista():
+    est = Estacion()
+    est.segmentos = [await _tarea_en_marcha(), await _tarea_en_marcha()]
+    tareas = list(est.segmentos)
+
+    est.cancelar_segmentos()
+
+    await _terminadas(*tareas)
+    assert all(t.cancelled() for t in tareas)
+    assert est.segmentos == []
+
+
+async def test_cancelar_idle_y_spotify_no_tocan_los_vigias():
+    est = Estacion()
+    est.idle = await _tarea_en_marcha()
+    vigia = await _tarea_en_marcha()
+    est.segmentos = [vigia]
+
+    est.cancelar_idle()
+    est.cancelar_spotify()
+
+    assert not vigia.cancelled() and est.segmentos == [vigia]
+    est.cancelar_segmentos()
+
+
+async def test_cancelar_tareas_corta_tambien_los_vigias():
+    est = Estacion()
+    est.segmentos = [await _tarea_en_marcha()]
+    vigia = est.segmentos[0]
+
+    est.cancelar_tareas()
+
+    await _terminadas(vigia)
+    assert vigia.cancelled() and est.segmentos == []
+
+
+async def test_teardown_corta_los_vigias(cog):
+    vc = FakePlayer()
+    est = await _estacion_cargada(cog)
+    est.segmentos.append(await _tarea_en_marcha())
+    vigia = est.segmentos[0]
+
+    await cog.teardown(vc.guild)
+
+    await _terminadas(vigia)
+    assert vigia.cancelled()
+
+
+async def test_cog_unload_corta_los_vigias(cog):
+    est = cog.estacion(1)
+    est.segmentos.append(await _tarea_en_marcha())
+    vigia = est.segmentos[0]
+
+    await cog.cog_unload()
+
+    await _terminadas(vigia)
+    assert vigia.cancelled()

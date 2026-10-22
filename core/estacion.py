@@ -17,6 +17,7 @@ class Estacion:
     caidas: int = 0                         # temas seguidos perdidos tras gastar sus reintentos
     arranque: asyncio.Lock = field(default_factory=asyncio.Lock)   # un arranque a la vez
     atascado: bool = False                  # la revisión anterior lo vio atascado
+    segmentos: list[asyncio.Task] = field(default_factory=list)     # vigías de las partes que no son música del tema en curso
 
     def cancelar_idle(self) -> None:
         if self.idle:
@@ -28,6 +29,12 @@ class Estacion:
             self.spotify.cancel()
             self.spotify = None
 
+    def cancelar_segmentos(self) -> None:
+        for tarea in self.segmentos:
+            tarea.cancel()
+        self.segmentos.clear()
+
     def cancelar_tareas(self) -> None:
         self.cancelar_idle()
         self.cancelar_spotify()
+        self.cancelar_segmentos()

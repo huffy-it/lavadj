@@ -17,6 +17,9 @@ presenta el tema que viene y lee titulares de noticias con voz sintética.
 - Un **DJ de radio** mete cortes hablados entre canciones (voz de `espeak-ng` o,
   si la eliges, una voz neuronal de Piper; con filtro de radio vía ffmpeg).
 - **Autoplay**: al acabarse la cola sigue solo con temas parecidos.
+- **Salta lo que no es música** de los videoclips (intros habladas, sketches, finales)
+  con las marcas públicas de SponsorBlock, sin cuenta y enviando solo un prefijo del
+  hash del video. Si el servicio no responde, el tema suena entero.
 - **Retoma la cola si se reinicia el bot**: la guarda en `estado/colas.json` y, al
   volver, entra al canal donde haya gente y sigue por donde iba (hasta 6 horas
   después). Un `!stop` o la salida por inactividad la borran.
@@ -164,6 +167,8 @@ en `.gitignore`).
 | `YTDLP_CLIENTES` | `android,android_vr,ios,mweb,web,tv_simply,web_embedded` | Clientes que el bot prueba, en ese orden, cuando el actual deja de dar audio |
 | `YTDLP_AUTOACTUALIZAR` | `true` | Actualizar yt-dlp solo cuando está viejo o ningún cliente suena; `false` para hacerlo tú |
 | `YTDLP_TIMEOUT` | `30` | Segundos que se le aguantan a yt-dlp por canción |
+| `SPONSORBLOCK` | `true` | Saltar las partes de un videoclip que no son la canción, según SponsorBlock |
+| `SPONSORBLOCK_CATEGORIAS` | `music_offtopic` | Categorías de SponsorBlock que se saltan, separadas por comas |
 | `SILENCIO_PARA_MUDO` | `300` | Segundos al aire, con cola y sin sonar nada, para dar el bot por mudo |
 
 Si cambias la contraseña de Lavalink, cámbiala en `LAVALINK_PASSWORD` y también

@@ -27,6 +27,10 @@ El título, el autor y la carátula que muestra el panel salen de la pista
 original de YouTube: la fuente `http` no trae metadatos y sin esto todo se
 vería como "Unknown title".
 
+**Las partes que no son música.** Las marcas de SponsorBlock (`core/sponsorblock.py`)
+se piden junto con la URL: la intro se salta arrancando la pista en su final y las
+del medio las vigila el cog. Si SponsorBlock falla, el tema suena entero.
+
 **Por qué el estado vive en una instancia.** Lo que cambia con el tiempo —los
 videos que no van a sonar, la versión de yt-dlp y el cliente de YouTube que se
 le pide— está en `Resolver` y no en variables del módulo. Así cada test arma el
@@ -55,6 +59,7 @@ from urllib.parse import parse_qs, urlparse
 import wavelink
 
 from core import config
+from core.sponsorblock import Segmento, SponsorBlock, fin_de_intro, utiles
 
 log = logging.getLogger("resolver")
 
@@ -212,6 +217,15 @@ def _pagina_de(pista: wavelink.Playable) -> str:
     return _origen(pista).get("uri") or ""
 
 
+def video_de(pista: wavelink.Playable) -> str:
+    """El id de YouTube de la pista; vacío si no es de YouTube (los clips del DJ)."""
+    return id_de_cancion(pista) if _pagina_de(pista) else ""
+
+
+def _largo_ms(pista: wavelink.Playable) -> int:
+    return int(_duracion_en_s(pista) * 1000)
+
+
 def _hoy() -> datetime.date:
     """Aparte para que los tests puedan pararse en un día fijo."""
     return datetime.date.today()
@@ -303,6 +317,7 @@ class Resolver:
         clientes: tuple[str, ...] | None = None,
         autoactualizar: bool | None = None,
         reloj: Callable[[], float] | None = None,
+        sponsorblock: SponsorBlock | None = None,
     ):
         self.binario = config.YTDLP_BIN if binario is None else binario
         # Público y modificable: cuando YouTube cierra un cliente, quien lo note
@@ -314,6 +329,7 @@ class Resolver:
         self.autoactualizar = config.YTDLP_AUTOACTUALIZAR if autoactualizar is None else autoactualizar
         self.timeout = config.YTDLP_TIMEOUT if timeout is None else timeout
         self._reloj = reloj or time.monotonic
+        self.sponsorblock = sponsorblock or SponsorBlock()
         # Los videos que ya sabemos que no van a funcionar, por uri de YouTube.
         self._sin_caso: "OrderedDict[str, str]" = OrderedDict()
         self._estado_ytdlp: dict = {"version": None, "dias": None, "viejo": False}
@@ -344,6 +360,21 @@ class Resolver:
         to confirm you're not a bot" que tumbó al plugin.
         """
         return f"youtube:player_client={cliente}"
+
+    def segmentos_de(self, pista: wavelink.Playable) -> tuple[Segmento, ...]:
+        """Las partes que no son música de la pista según la caché; vacío si no hay o aún no llegaron."""
+        video = video_de(pista)
+        guardados = self.sponsorblock.en_cache(video) if video else None
+        return utiles(guardados or (), _largo_ms(pista))
+
+    async def intro_de(self, pista: wavelink.Playable) -> int:
+        """Ms donde termina la intro que no es música (0 si no hay); espera la consulta como mucho su tiempo límite."""
+        video = video_de(pista)
+        segmentos = await self.sponsorblock.segmentos(video) if video else ()
+        return fin_de_intro(utiles(segmentos, _largo_ms(pista)))
+
+    async def cerrar(self) -> None:
+        await self.sponsorblock.cerrar()
 
     def olvidar_motivos(self) -> None:
         """Vacía la tabla de videos sin caso."""
@@ -737,6 +768,7 @@ class Resolver:
         titulo = titulo_de(pista)
         log.debug("Precargando la URL de %r", titulo)
         self._precargas[clave] = asyncio.create_task(self._precarga(pagina, titulo))
+        self.sponsorblock.precargar(clave)
         while len(self._precargas) > PRECARGAS_MAXIMAS:
             _, vieja = self._precargas.popitem(last=False)
             # Si sigue en curso, no tiene sentido terminarla: nadie va a esperarla.
@@ -816,6 +848,8 @@ class ResolvingPlayer(wavelink.Player):
         # falso (wavelink recién marca el tema al mandárselo a Lavalink) y quien
         # mirara solo eso largaría otro tema encima de este.
         self.resolviendo = 0
+        # Ms por donde arrancó el tema en curso: de ahí cuenta el cog hasta el primer reporte de Lavalink.
+        self.arranque_ms = 0
 
     async def play(self, track: wavelink.Playable, *args, **kwargs):
         inicio = self.reanudar.pop(id_de_cancion(track), 0)
@@ -823,7 +857,8 @@ class ResolvingPlayer(wavelink.Player):
             kwargs["start"] = inicio
         self.resolviendo += 1
         try:
-            resuelta = await self.resolver.resolve(track)
+            # La consulta de SponsorBlock corre junto a yt-dlp: no suma demora.
+            resuelta, intro = await asyncio.gather(self.resolver.resolve(track), self.resolver.intro_de(track))
             # Resolver tarda segundos y en ese rato pudo llegar un `!stop`, la
             # desconexión por inactividad o el corte por canal vacío. Si ahora
             # se llamara a `super().play()`, wavelink haría el PATCH igual y
@@ -831,6 +866,10 @@ class ResolvingPlayer(wavelink.Player):
             if not self.connected:
                 log.debug("El player se desconectó mientras se resolvía %r: no toco", titulo_de(track))
                 return None
+            if intro > (kwargs.get("start") or 0):
+                kwargs["start"] = intro
+                log.info("Salto la intro que no es música de %r: empiezo en el segundo %.0f", titulo_de(track), intro / 1000)
+            self.arranque_ms = kwargs.get("start") or 0
             return await super().play(resuelta, *args, **kwargs)
         finally:
             self.resolviendo -= 1

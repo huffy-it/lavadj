@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from core import resolver
+from core.sponsorblock import Segmento, SponsorBlock
 
 
 @pytest.fixture
@@ -1790,3 +1791,220 @@ def test_los_argumentos_del_constructor_ganan_para_los_clientes_y_la_actualizaci
     res = resolver.Resolver(clientes=["web"], autoactualizar=True)
     assert res.clientes == ("web",)
     assert res.autoactualizar is True
+
+
+# --- SponsorBlock: las partes que no son música ----------------------------------------
+
+class SBQueAnota(SponsorBlock):
+    """SponsorBlock sin red: responde con `respuestas` y anota por qué videos le preguntaron."""
+
+    def __init__(self, respuestas=None):
+        super().__init__(activo=True)
+        self.respuestas = respuestas or {}
+        self.preguntados = []
+
+    async def _traer(self, video):
+        self.preguntados.append(video)
+        self._cache[video] = tuple(self.respuestas.get(video, ()))
+        return self._cache[video]
+
+
+def _player_con(monkeypatch, sb, reanudar=None):
+    """Un `ResolvingPlayer` con ese SponsorBlock; devuelve los kwargs con que llega a `Player.play`."""
+    import wavelink
+
+    vc = resolver.ResolvingPlayer.__new__(resolver.ResolvingPlayer)
+    vc.resolver = resolver.Resolver(sponsorblock=sb)
+    vc.reanudar = reanudar or {}
+    vc.resolviendo = 0
+    vc.arranque_ms = 0
+    recibidos = []
+
+    async def _resolve(pista):
+        return pista
+
+    async def _play(self, pista, *a, **kw):
+        recibidos.append(kw)
+        return pista
+
+    monkeypatch.setattr(vc.resolver, "resolve", _resolve)
+    monkeypatch.setattr(wavelink.Player, "play", _play)
+    monkeypatch.setattr(wavelink.Player, "connected", property(lambda self: True))
+    return vc, recibidos
+
+
+INTRO = Segmento(0, 12_500, 200_000)
+DEL_MEDIO = Segmento(90_000, 100_000, 200_000)
+
+
+async def test_la_intro_que_no_es_musica_se_salta_arrancando_en_su_final(monkeypatch, caplog):
+    vc, recibidos = _player_con(monkeypatch, SBQueAnota({"abc": [INTRO, DEL_MEDIO]}))
+
+    with caplog.at_level("INFO", logger="resolver"):
+        await vc.play(FakePlayable())
+
+    assert recibidos == [{"start": 12_500}]
+    assert vc.arranque_ms == 12_500
+    assert "Salto la intro" in caplog.text and "Un tema" in caplog.text
+
+
+async def test_un_start_mayor_gana_a_la_intro(monkeypatch):
+    vc, recibidos = _player_con(monkeypatch, SBQueAnota({"abc": [INTRO]}), reanudar={"abc": 60_000})
+
+    await vc.play(FakePlayable())
+    await vc.play(FakePlayable(), start=45_000)
+
+    assert [r["start"] for r in recibidos] == [60_000, 45_000]
+    assert vc.arranque_ms == 45_000
+
+
+async def test_un_start_menor_que_la_intro_cede(monkeypatch):
+    vc, recibidos = _player_con(monkeypatch, SBQueAnota({"abc": [INTRO]}))
+
+    await vc.play(FakePlayable(), start=5_000)
+
+    assert recibidos == [{"start": 12_500}]
+
+
+async def test_sin_intro_el_start_no_se_toca(monkeypatch):
+    vc, recibidos = _player_con(monkeypatch, SBQueAnota({"abc": [DEL_MEDIO]}))
+
+    await vc.play(FakePlayable())
+    await vc.play(FakePlayable(identifier="otro", uri="https://www.youtube.com/watch?v=otro"))
+
+    assert recibidos == [{}, {}]
+    assert vc.arranque_ms == 0
+
+
+async def test_una_intro_que_se_come_la_cancion_entera_no_se_salta(monkeypatch):
+    sb = SBQueAnota({"abc": [Segmento(0, 199_000, 200_000)]})
+    vc, recibidos = _player_con(monkeypatch, sb)
+
+    await vc.play(FakePlayable())
+
+    assert recibidos == [{}]
+
+
+async def test_la_consulta_de_sponsorblock_corre_junto_a_yt_dlp(monkeypatch):
+    """Si esperara a que yt-dlp terminara, esta resolución no terminaría nunca."""
+    sb = SBQueAnota({"abc": [INTRO]})
+    vc, recibidos = _player_con(monkeypatch, sb)
+
+    async def _resolve_que_espera_la_consulta(pista):
+        while not sb.preguntados:
+            await asyncio.sleep(0)
+        return pista
+
+    monkeypatch.setattr(vc.resolver, "resolve", _resolve_que_espera_la_consulta)
+
+    await asyncio.wait_for(vc.play(FakePlayable()), timeout=2)
+
+    assert recibidos == [{"start": 12_500}]
+
+
+async def test_las_pistas_que_no_son_de_youtube_no_preguntan_nada(monkeypatch):
+    sb = SBQueAnota({"abc": [INTRO]})
+    vc, recibidos = _player_con(monkeypatch, sb)
+
+    await vc.play(FakePlayable(source="local", uri="file:///dj_cache/corte.wav", identifier="corte"))
+
+    assert sb.preguntados == [] and recibidos == [{}]
+
+
+async def test_si_sponsorblock_no_responde_la_cancion_suena_entera(monkeypatch, caplog):
+    sb = SponsorBlock(activo=True, url="http://127.0.0.1:9/api/skipSegments", timeout=0.3)
+    vc, recibidos = _player_con(monkeypatch, sb)
+
+    with caplog.at_level("WARNING", logger="sponsorblock"):
+        assert await vc.play(FakePlayable()) is not None
+    await sb.cerrar()
+
+    assert recibidos == [{}]
+    assert "SponsorBlock no respondió" in caplog.text
+
+
+async def test_con_sponsorblock_apagado_no_se_consulta_nada(monkeypatch):
+    sb = SponsorBlock()
+    assert sb.activo is False
+    vc, recibidos = _player_con(monkeypatch, sb)
+    pista = FakePlayable()
+    _dobles(vc.resolver, monkeypatch)
+
+    await vc.play(pista)
+    vc.resolver.precargar(pista)
+    await _esperar_precargas(vc.resolver)
+
+    assert recibidos == [{}]
+    assert sb._http is None and sb._en_curso == {}
+    assert await vc.resolver.intro_de(pista) == 0
+    assert vc.resolver.segmentos_de(pista) == ()
+
+
+async def test_precargar_tambien_pide_los_segmentos_de_la_que_viene(monkeypatch):
+    sb = SBQueAnota({"abc": [INTRO, DEL_MEDIO]})
+    res = resolver.Resolver(sponsorblock=sb)
+    _dobles(res, monkeypatch)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await asyncio.sleep(0)
+
+    assert sb.preguntados == ["abc"]
+    assert res.segmentos_de(pista) == (INTRO, DEL_MEDIO)
+
+
+async def test_precargar_no_pide_segmentos_de_un_clip_ni_de_un_video_sin_caso(monkeypatch):
+    sb = SBQueAnota()
+    res = resolver.Resolver(sponsorblock=sb)
+    _dobles(res, monkeypatch)
+    bloqueado = _de_youtube("bloqueado")
+    res._anotar_sin_caso(bloqueado.uri, "está bloqueada")
+
+    res.precargar(FakePlayable(source="local", uri="file:///dj_cache/corte.wav", identifier="corte"))
+    res.precargar(bloqueado)
+    await asyncio.sleep(0)
+
+    assert sb.preguntados == []
+
+
+def test_segmentos_de_lee_solo_la_cache_y_descarta_los_de_otra_edicion():
+    sb = SBQueAnota()
+    res = resolver.Resolver(sponsorblock=sb)
+    otra_edicion = Segmento(50_000, 60_000, 300_000)
+    sb._cache["abc"] = (INTRO, otra_edicion)
+
+    assert res.segmentos_de(FakePlayable()) == (INTRO,)
+    assert res.segmentos_de(_de_youtube("sin_cache")) == ()
+    assert res.segmentos_de(FakePlayable(source="local", uri="file:///x.wav", identifier="abc")) == ()
+    assert sb.preguntados == []
+
+
+def test_el_video_de_una_pista_sale_del_origen_si_ya_estaba_resuelta():
+    assert resolver.video_de(FakePlayable()) == "abc"
+    assert resolver.video_de(pista_ya_resuelta()) == "abc"
+    assert resolver.video_de(pista_http()) == ""
+    assert resolver.video_de(FakePlayable(source="local", uri="file:///x.wav")) == ""
+
+
+async def test_cerrar_el_resolver_cierra_la_sesion_de_sponsorblock():
+    sb = SBQueAnota()
+    cerrado = []
+
+    async def _cerrar():
+        cerrado.append(True)
+
+    sb.cerrar = _cerrar
+    await resolver.Resolver(sponsorblock=sb).cerrar()
+
+    assert cerrado == [True]
+
+
+def test_cada_resolver_tiene_su_sponsorblock_y_lo_toma_de_la_configuracion(monkeypatch):
+    monkeypatch.setattr(resolver.config, "SPONSORBLOCK", True)
+
+    uno, otro = resolver.Resolver(), resolver.Resolver()
+
+    assert uno.sponsorblock is not otro.sponsorblock
+    assert uno.sponsorblock.activo is True

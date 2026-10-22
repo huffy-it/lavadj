@@ -57,6 +57,7 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/static/panel.html` | Panel web (multiplataforma) |
 | `core/panel.py` | Panel de botones de Discord que acompaña a la canción |
 | `core/resolver.py` | El audio de YouTube: yt-dlp saca la URL, Lavalink la toca |
+| `core/sponsorblock.py` | Partes de un videoclip que no son música (`music_offtopic`) por la API pública de SponsorBlock con k-anonimato, con caché. La intro se salta arrancando en su final (`ResolvingPlayer.play`); las del medio las vigila el cog con `seek` o skip. Si falla o está apagado (`SPONSORBLOCK`), el tema suena entero |
 | `core/dj.py`, `tts.py`, `feeds.py` | DJ de radio: noticias → Piper o espeak-ng (cae a espeak si Piper falla) → ffmpeg → `dj_cache/*.wav`. Piper es GPL y va **siempre como subproceso** (`python -m piper`), nunca importado |
 | `core/voces.py` | Voces de Piper: catálogo curado (id, tamaño y md5 fijos, URLs a `rhasspy/piper-voices`), descarga verificada a `voces/` (no se versiona) y voces instaladas |
 | `core/ajustes.py` | Ajustes persistentes de los paneles en `estado/ajustes.json` (`voz`, `filtro_radio`); escritura atómica |

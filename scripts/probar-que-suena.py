@@ -613,6 +613,8 @@ async def cerrar(client: ClientePrueba, vc, sesion, sesion_http) -> None:
         await wavelink.Pool.close()
     except Exception:  # noqa: BLE001
         pass
+    if getattr(client, "resolver", None) is not None:
+        await client.resolver.cerrar()
     try:
         await client.close()
     except Exception:  # noqa: BLE001
