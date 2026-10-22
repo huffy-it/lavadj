@@ -8,12 +8,14 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
-from core import api
+from core import ajustes, api, config, tts, voces
 from core.dj import DJ
 from core.feeds import FeedCache
+from core.guionista import Guionista
 from core.resolver import Resolver
 from core.salud import Salud
 
@@ -243,7 +245,345 @@ async def test_sin_cog_cargado_el_estado_no_revienta():
     assert datos["salud"] is None
 
 
+# --- voces del DJ -----------------------------------------------------------
+
+ALD = "es_MX-ald-medium"
+
+
+@pytest.fixture
+def voz_instalada(monkeypatch):
+    """Piper disponible y ALD instalada."""
+    monkeypatch.setattr(voces, "piper_disponible", lambda: True)
+    config.CARPETA_DE_VOCES.mkdir(parents=True)
+    voces.ruta_modelo(ALD).write_bytes(b"onnx")
+    voces.ruta_config(ALD).write_bytes(b"{}")
+
+
+@pytest.fixture
+def descargas(monkeypatch):
+    """Un gestor de descargas de mentira que solo anota qué se le pidió."""
+    class Falso:
+        pedidas = []
+        fallo = None      # el mensaje con el que `iniciar` se niega
+
+        def iniciar(self, voz_id):
+            if self.fallo:
+                raise voces.ErrorDeVoz(self.fallo)
+            self.pedidas.append(voz_id)
+
+        def activa(self, voz_id):
+            return voz_id in self.pedidas
+
+        def progreso(self, voz_id):
+            return 40 if voz_id in self.pedidas else None
+
+        def error(self, voz_id):
+            return None
+
+    falso = Falso()
+    falso.pedidas = []
+    monkeypatch.setattr(voces, "descargas", falso)
+    return falso
+
+
+_HANDLERS = {
+    "/api/voz": "handle_voz", "/api/voz/filtro": "handle_voz_filtro",
+    "/api/voces/descargar": "handle_voces_descargar", "/api/voces/borrar": "handle_voces_borrar",
+}
+
+
+def post(ruta):
+    return asyncio.run(getattr(api, _HANDLERS[ruta.split("?")[0]])(pedido("POST", ruta)))
+
+
+def test_get_voces_trae_el_catalogo_la_voz_en_uso_y_el_filtro(voz_instalada):
+    datos = cuerpo(asyncio.run(api.handle_voces(pedido("GET", "/api/voces"))))
+
+    assert [v["id"] for v in datos["voces"]] == list(voces.CATALOGO)
+    assert datos["en_uso"] == "espeak" and datos["filtro_radio"] is True and datos["piper"] is True
+    ald = next(v for v in datos["voces"] if v["id"] == ALD)
+    assert ald["instalada"] and not ald["descargando"] and ald["pais"] == "México"
+
+
+def test_get_voces_avisa_si_falta_piper(monkeypatch):
+    monkeypatch.setattr(voces, "piper_disponible", lambda: False)
+    assert cuerpo(asyncio.run(api.handle_voces(pedido("GET", "/api/voces"))))["piper"] is False
+
+
+def test_elegir_una_voz_instalada(voz_instalada):
+    respuesta = post(f"/api/voz?voz={ALD}")
+
+    assert respuesta.status == 200
+    assert cuerpo(respuesta)["en_uso"] == ALD
+    assert ajustes.obtener("voz") == ALD
+
+
+def test_elegir_una_voz_sin_instalar_es_409_y_no_cambia_nada():
+    respuesta = post(f"/api/voz?voz={ALD}")
+
+    assert respuesta.status == 409 and "instalada" in cuerpo(respuesta)["error"]
+    assert ajustes.obtener("voz") == "espeak"
+
+
+@pytest.mark.parametrize("ruta", [
+    "/api/voz?voz=es_XX-nada-low", "/api/voz", "/api/voz?voz=../../etc",
+    "/api/voces/descargar?voz=http://evil.example/x", "/api/voces/borrar?voz=es_XX-nada-low",
+])
+def test_una_voz_que_no_esta_en_el_catalogo_es_404(ruta, descargas):
+    respuesta = post(ruta)
+
+    assert respuesta.status == 404
+    assert descargas.pedidas == []
+
+
+def test_descargar_arranca_la_descarga_y_devuelve_el_estado(descargas):
+    respuesta = post(f"/api/voces/descargar?voz={ALD}")
+
+    assert respuesta.status == 200
+    assert descargas.pedidas == [ALD]
+    ald = next(v for v in cuerpo(respuesta)["voces"] if v["id"] == ALD)
+    assert ald["descargando"] and ald["progreso"] == 40
+
+
+def test_descargar_lo_que_no_se_puede_es_409(descargas):
+    descargas.fallo = "ya se está descargando"
+
+    respuesta = post(f"/api/voces/descargar?voz={ALD}")
+
+    assert respuesta.status == 409 and cuerpo(respuesta)["error"] == "ya se está descargando"
+
+
+def test_borrar_una_voz_instalada(voz_instalada):
+    respuesta = post(f"/api/voces/borrar?voz={ALD}")
+
+    assert respuesta.status == 200
+    assert not voces.instalada(ALD)
+
+
+def test_no_se_borra_la_voz_en_uso_ni_la_de_siempre(voz_instalada):
+    ajustes.guardar(voz=ALD)
+
+    assert post(f"/api/voces/borrar?voz={ALD}").status == 409
+    assert post("/api/voces/borrar?voz=espeak").status == 409
+    assert voces.instalada(ALD)
+
+
+def test_el_filtro_de_radio_se_apaga_y_se_enciende():
+    apagado = post("/api/voz/filtro?activo=0")
+    assert cuerpo(apagado)["filtro_radio"] is False and ajustes.obtener("filtro_radio") is False
+
+    assert cuerpo(post("/api/voz/filtro?activo=1"))["filtro_radio"] is True
+
+
+@pytest.mark.parametrize("ruta", ["/api/voz/filtro", "/api/voz/filtro?activo=quizá", "/api/voz/filtro?activo=2"])
+def test_el_filtro_con_basura_es_400(ruta):
+    assert post(ruta).status == 400
+    assert ajustes.obtener("filtro_radio") is True
+
+
+@pytest.fixture
+def sintesis(monkeypatch, tmp_path):
+    """tts.synthesize de mentira: deja un wav y anota con qué voz se lo pidieron."""
+    pedidos = []
+
+    async def falsa(texto, voice=tts.VOICE, volume=100, voz=None):
+        pedidos.append((texto, voz))
+        if voz == "falla":
+            return None
+        ruta = tmp_path / "dj_muestra.wav"
+        ruta.write_bytes(b"RIFF....WAVE")
+        return ruta
+
+    monkeypatch.setattr(tts, "synthesize", falsa)
+    return pedidos
+
+
+def muestra(voz):
+    return asyncio.run(api.handle_voces_muestra(pedido("GET", f"/api/voces/muestra?voz={voz}")))
+
+
+def test_la_muestra_devuelve_un_wav_y_borra_el_archivo(voz_instalada, sintesis, tmp_path):
+    respuesta = muestra(ALD)
+
+    assert respuesta.status == 200 and respuesta.content_type == "audio/wav"
+    assert respuesta.body == b"RIFF....WAVE"
+    assert sintesis == [(api.MUESTRA, ALD)]
+    assert not (tmp_path / "dj_muestra.wav").exists()
+
+
+def test_la_muestra_de_espeak_no_pide_instalar_nada(sintesis):
+    assert muestra("espeak").status == 200
+    assert sintesis == [(api.MUESTRA, "espeak")]
+
+
+def test_la_muestra_de_una_voz_sin_instalar_es_409(sintesis):
+    assert muestra(ALD).status == 409
+    assert sintesis == []
+
+
+def test_la_muestra_de_una_voz_desconocida_es_404(sintesis):
+    assert muestra("es_XX-nada-low").status == 404
+    assert sintesis == []
+
+
+def test_si_no_se_puede_sintetizar_la_muestra_es_503(monkeypatch, sintesis):
+    monkeypatch.setitem(voces.CATALOGO, "falla", voces.Voz("falla"))
+    assert muestra("falla").status == 503
+
+
+# --- guionista del DJ -------------------------------------------------------
+
+@pytest.fixture
+def guionista(monkeypatch):
+    """Un Guionista de verdad (sin elección en ajustes) cuyo `disponibles` no sale a la red: se mueve con `.estan`."""
+    monkeypatch.setattr(config, "DJ_GUIONISTA", "frases")
+    monkeypatch.setattr(config, "DJ_GUIONISTA_MODELO", "claude-opus-5-5")
+    monkeypatch.setattr(config, "OLLAMA_MODELO", "llama3.2:3b")
+    g = Guionista()
+    g.estan, g.sesiones = {"frases": True, "claude": True, "ollama": True}, []
+
+    async def disponibles(session=None):
+        g.sesiones.append(session)
+        return dict(g.estan)
+
+    monkeypatch.setattr(g, "disponibles", disponibles)
+    return g
+
+
+def con_guionista(metodo, ruta, guionista, bot=None):
+    bot = bot or FakeBot(FakeCog(dj=DJ(guionista=guionista), session="la sesión"))
+    return asyncio.run(api.handle_guionista(pedido(metodo, ruta, bot)))
+
+
+def test_get_guionista_trae_el_activo_los_disponibles_el_error_y_los_modelos(guionista):
+    guionista.elegir("claude")
+    guionista.ultimo_error = "claude: la API respondió 500"
+    guionista.estan["ollama"] = False
+
+    respuesta = con_guionista("GET", "/api/guionista", guionista)
+
+    assert respuesta.status == 200
+    assert cuerpo(respuesta) == {
+        "activo": "claude",
+        "disponibles": {"frases": True, "claude": True, "ollama": False},
+        "ultimo_error": "claude: la API respondió 500",
+        "modelos": {"claude": "claude-opus-5-5", "ollama": "llama3.2:3b"},
+    }
+    assert guionista.sesiones == ["la sesión"]
+
+
+def test_get_guionista_sin_errores_ni_eleccion_guardada(guionista):
+    datos = cuerpo(con_guionista("GET", "/api/guionista", guionista))
+
+    assert datos["activo"] == "frases" and datos["ultimo_error"] is None
+    assert ajustes.obtener("guionista") is None
+
+
+@pytest.mark.parametrize("nombre", ["claude", "ollama"])
+def test_post_guionista_cambia_en_caliente_y_guarda_la_eleccion(guionista, nombre):
+    respuesta = con_guionista("POST", f"/api/guionista?nombre={nombre}", guionista)
+
+    assert respuesta.status == 200
+    assert cuerpo(respuesta)["activo"] == nombre
+    assert guionista.activo == nombre
+    assert ajustes.obtener("guionista") == nombre
+
+
+def test_la_eleccion_guardada_por_la_api_es_la_que_arranca_la_proxima_vez(guionista):
+    con_guionista("POST", "/api/guionista?nombre=ollama", guionista)
+
+    assert Guionista().activo == "ollama"
+
+
+@pytest.mark.parametrize("ruta", [
+    "/api/guionista?nombre=gpt", "/api/guionista", "/api/guionista?nombre=", "/api/guionista?nombre=Claude",
+    "/api/guionista?nombre=../../etc",
+])
+def test_post_guionista_con_un_nombre_que_no_existe_es_400(guionista, ruta):
+    guionista.elegir("ollama")
+
+    respuesta = con_guionista("POST", ruta, guionista)
+
+    assert respuesta.status == 400 and "desconocido" in cuerpo(respuesta)["error"]
+    assert guionista.activo == "ollama"
+    assert ajustes.obtener("guionista") is None
+
+
+@pytest.mark.parametrize("nombre", ["claude", "ollama"])
+def test_post_de_un_motor_que_no_esta_disponible_es_409_y_no_cambia_nada(guionista, nombre):
+    guionista.estan[nombre] = False
+
+    respuesta = con_guionista("POST", f"/api/guionista?nombre={nombre}", guionista)
+
+    assert respuesta.status == 409 and nombre in cuerpo(respuesta)["error"]
+    assert guionista.activo == "frases"
+    assert ajustes.obtener("guionista") is None
+
+
+def test_las_frases_siempre_se_pueden_elegir_aunque_nada_este_disponible(guionista):
+    guionista.elegir("claude")
+    guionista.estan = {"frases": False, "claude": False, "ollama": False}
+
+    respuesta = con_guionista("POST", "/api/guionista?nombre=frases", guionista)
+
+    assert respuesta.status == 200 and cuerpo(respuesta)["activo"] == "frases"
+    assert guionista.activo == "frases"
+    assert ajustes.obtener("guionista") == "frases"
+
+
+def test_si_no_se_puede_guardar_la_eleccion_es_500_y_no_cambia_nada(guionista, monkeypatch):
+    def falla(**_):
+        raise OSError("disco lleno")
+
+    monkeypatch.setattr(ajustes, "guardar", falla)
+
+    respuesta = con_guionista("POST", "/api/guionista?nombre=claude", guionista)
+
+    assert respuesta.status == 500 and "disco lleno" in cuerpo(respuesta)["error"]
+    assert guionista.activo == "frases"
+
+
+@pytest.mark.parametrize("metodo, ruta", [("GET", "/api/guionista"), ("POST", "/api/guionista?nombre=claude")])
+def test_guionista_sin_cog_es_503(guionista, metodo, ruta):
+    respuesta = con_guionista(metodo, ruta, guionista, bot=FakeBot(None))
+
+    assert respuesta.status == 503
+    assert ajustes.obtener("guionista") is None
+
+
+async def test_las_rutas_del_guionista_existen_y_pasan_por_la_proteccion(guionista, monkeypatch):
+    async def disponibles(self, session=None):
+        return dict(guionista.estan)
+
+    monkeypatch.setattr(Guionista, "disponibles", disponibles)
+
+    async def prueba(cliente, puerto, app):
+        r = await cliente.get("/api/guionista")
+        assert r.status == 200 and (await r.json())["activo"] == "frases"
+        assert (await cliente.get("/api/guionista", headers={"Host": "evil.example.com"})).status == 403
+
+        r = await cliente.post("/api/guionista?nombre=claude", headers={"Origin": "http://evil.example.com"})
+        assert r.status == 403 and ajustes.obtener("guionista") is None
+
+        r = await cliente.post("/api/guionista?nombre=claude", headers={"Origin": f"http://127.0.0.1:{puerto}"})
+        assert r.status == 200 and ajustes.obtener("guionista") == "claude"
+
+    await _con_servidor(prueba)
+
+
 # --- panel web --------------------------------------------------------------
+
+def test_la_pagina_del_panel_trae_la_seccion_de_voces():
+    pagina = asyncio.run(api.handle_pagina(pedido("GET", "/"))).text
+    for pieza in ("api('voces')", "voces/descargar", "voces/borrar", "voz/filtro", "voces/muestra", "esc("):
+        assert pieza in pagina
+
+
+def test_la_pagina_del_panel_trae_la_seccion_del_guionista():
+    pagina = asyncio.run(api.handle_pagina(pedido("GET", "/"))).text
+    for pieza in ("api('guionista", "Guionista del DJ", "Frases fijas", "Claude (API, cobra por uso)", "Ollama (local)", "esc("):
+        assert pieza in pagina
+
 
 def test_la_pagina_del_panel_se_sirve():
     respuesta = asyncio.run(api.handle_pagina(pedido("GET", "/")))
@@ -326,5 +666,26 @@ async def test_post_sin_origin_funciona():
         r = await cliente.post("/api/stop")
         assert r.status == 200
         assert app["apagar"].is_set()
+
+    await _con_servidor(prueba)
+
+
+async def test_las_rutas_de_voces_existen_y_pasan_por_la_proteccion(sintesis):
+    async def prueba(cliente, puerto, app):
+        r = await cliente.get("/api/voces")
+        assert r.status == 200 and "voces" in await r.json()
+
+        r = await cliente.get("/api/voces/muestra?voz=espeak")
+        assert r.status == 200 and r.content_type == "audio/wav"
+
+        for ruta in ("/api/voces", "/api/voces/muestra?voz=espeak"):
+            assert (await cliente.get(ruta, headers={"Host": "evil.example.com"})).status == 403
+        for ruta in ("/api/voz?voz=espeak", "/api/voz/filtro?activo=0",
+                     f"/api/voces/descargar?voz={ALD}", f"/api/voces/borrar?voz={ALD}"):
+            assert (await cliente.post(ruta, headers={"Origin": "http://evil.example.com"})).status == 403
+        assert ajustes.obtener("filtro_radio") is True
+
+        r = await cliente.post("/api/voz/filtro?activo=0", headers={"Origin": f"http://127.0.0.1:{puerto}"})
+        assert r.status == 200 and ajustes.obtener("filtro_radio") is False
 
     await _con_servidor(prueba)

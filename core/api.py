@@ -19,11 +19,12 @@ from pathlib import Path
 import wavelink
 from aiohttp import web
 
-from core import config
+from core import ajustes, config, tts, voces
 from core.feeds import invalidate_all as invalidate_feeds
 from core.feeds import refresh_all as refresh_feeds
+from core.guionista import CLAUDE, FRASES, NOMBRES, OLLAMA
 
-log = logging.getLogger("api")
+log =logging.getLogger("api")
 
 HOST = config.API_HOST
 
@@ -189,6 +190,105 @@ async def handle_dj_volume(request: web.Request) -> web.Response:
     return web.json_response({"volumen": dj.volume, "disponible": dj.available()})
 
 
+MUESTRA = "Buenas noches, estás escuchando LavaDJ. Esta es mi voz."
+
+
+def _estado_de_voces() -> dict:
+    return {
+        "voces": voces.listar(),
+        "en_uso": ajustes.obtener("voz"),
+        "filtro_radio": ajustes.obtener("filtro_radio"),
+        "piper": voces.piper_disponible(),
+    }
+
+
+def _con_voz(request: web.Request, accion) -> web.Response:
+    """Aplica `accion(id)` a la voz de `?voz=` y devuelve el estado de las voces."""
+    voz_id = request.query.get("voz", "")
+    if voz_id not in voces.CATALOGO:
+        return web.json_response({"error": f"voz desconocida: {voz_id!r}"}, status=404)
+    try:
+        accion(voz_id)
+    except voces.ErrorDeVoz as error:
+        return web.json_response({"error": str(error)}, status=409)
+    return web.json_response(_estado_de_voces())
+
+
+async def handle_voces(request: web.Request) -> web.Response:
+    """El catálogo de voces con su estado, la que está en uso y el filtro de radio."""
+    return web.json_response(_estado_de_voces())
+
+
+async def handle_voz(request: web.Request) -> web.Response:
+    """Elige la voz del DJ; solo una instalada."""
+    return _con_voz(request, voces.elegir)
+
+
+async def handle_voces_descargar(request: web.Request) -> web.Response:
+    """Empieza a bajar una voz en segundo plano; el progreso sale en `/api/voces`."""
+    return _con_voz(request, voces.descargas.iniciar)
+
+
+async def handle_voces_borrar(request: web.Request) -> web.Response:
+    return _con_voz(request, voces.borrar)
+
+
+async def handle_voz_filtro(request: web.Request) -> web.Response:
+    """Enciende (`?activo=1`) o apaga (`?activo=0`) el filtro de radio."""
+    activo = request.query.get("activo", "")
+    if activo not in ("0", "1"):
+        return web.json_response({"error": f"activo inválido: {activo!r}"}, status=400)
+    try:
+        voces.poner_filtro(activo == "1")
+    except voces.ErrorDeVoz as error:
+        return web.json_response({"error": str(error)}, status=500)
+    return web.json_response(_estado_de_voces())
+
+
+async def handle_voces_muestra(request: web.Request) -> web.Response:
+    """Una frase corta con la voz de `?voz=` y el filtro actual, en wav, para escucharla antes de elegirla."""
+    voz_id = request.query.get("voz", "")
+    if voz_id not in voces.CATALOGO:
+        return web.json_response({"error": f"voz desconocida: {voz_id!r}"}, status=404)
+    if not voces.instalada(voz_id):
+        return web.json_response({"error": "esa voz no está instalada"}, status=409)
+    ruta = await tts.synthesize(MUESTRA, voz=voz_id)
+    if ruta is None:
+        return web.json_response({"error": "no pude sintetizar la muestra"}, status=503)
+    try:
+        audio = await asyncio.to_thread(ruta.read_bytes)
+    finally:
+        tts.cleanup(ruta)
+    return web.Response(body=audio, content_type="audio/wav")
+
+
+async def handle_guionista(request: web.Request) -> web.Response:
+    """Lee el guionista del DJ; con POST `?nombre=` lo cambia en caliente y guarda la elección."""
+    dj = _dj(request)
+    if dj is None:
+        return _sin_cog()
+    guionista = dj.guionista
+    session = getattr(request.app["bot"].get_cog(COG), "_session", None)
+    if request.method == "POST":
+        nombre = request.query.get("nombre", "")
+        if nombre not in NOMBRES:
+            return web.json_response({"error": f"guionista desconocido: {nombre!r} (hay {', '.join(NOMBRES)})"}, status=400)
+        if nombre != FRASES and not (await guionista.disponibles(session))[nombre]:
+            return web.json_response({"error": f"{nombre} no está disponible ahora"}, status=409)
+        try:
+            ajustes.guardar(guionista=nombre)
+        except OSError as error:
+            return web.json_response({"error": f"no pude guardar el ajuste: {error}"}, status=500)
+        guionista.elegir(nombre)
+        log.info("API: guionista del DJ a %s", nombre)
+    return web.json_response({
+        "activo": guionista.activo,
+        "disponibles": await guionista.disponibles(session),
+        "ultimo_error": guionista.ultimo_error,
+        "modelos": {CLAUDE: config.DJ_GUIONISTA_MODELO, OLLAMA: config.OLLAMA_MODELO},
+    })
+
+
 async def handle_pagina(request: web.Request) -> web.Response:
     """El panel web: la alternativa multiplataforma al panel GTK."""
     return web.Response(text=PAGINA.read_text(encoding="utf-8"), content_type="text/html")
@@ -269,6 +369,14 @@ def crear_app(bot, apagar: asyncio.Event, puerto: int) -> web.Application:
         web.get("/api/headlines", handle_headlines),
         web.get("/api/dj_volume", handle_dj_volume),
         web.post("/api/dj_volume", handle_dj_volume),
+        web.get("/api/voces", handle_voces),
+        web.get("/api/voces/muestra", handle_voces_muestra),
+        web.post("/api/voz", handle_voz),
+        web.post("/api/voz/filtro", handle_voz_filtro),
+        web.post("/api/voces/descargar", handle_voces_descargar),
+        web.post("/api/voces/borrar", handle_voces_borrar),
+        web.get("/api/guionista", handle_guionista),
+        web.post("/api/guionista", handle_guionista),
         web.post("/api/refresh_news", handle_refresh),
         web.post("/api/stop", handle_stop),
     ])

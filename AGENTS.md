@@ -57,7 +57,10 @@ rehacer la capa en cada actualización del sistema. (En Windows no hay contenedo
 | `core/static/panel.html` | Panel web (multiplataforma) |
 | `core/panel.py` | Panel de botones de Discord que acompaña a la canción |
 | `core/resolver.py` | El audio de YouTube: yt-dlp saca la URL, Lavalink la toca |
-| `core/dj.py`, `tts.py`, `feeds.py` | DJ de radio: noticias → espeak-ng → `dj_cache/*.wav` |
+| `core/dj.py`, `tts.py`, `feeds.py` | DJ de radio: noticias → Piper o espeak-ng (cae a espeak si Piper falla) → ffmpeg → `dj_cache/*.wav`. Piper es GPL y va **siempre como subproceso** (`python -m piper`), nunca importado |
+| `core/voces.py` | Voces de Piper: catálogo curado (id, tamaño y md5 fijos, URLs a `rhasspy/piper-voices`), descarga verificada a `voces/` (no se versiona) y voces instaladas |
+| `core/ajustes.py` | Ajustes persistentes de los paneles en `estado/ajustes.json` (`voz`, `filtro_radio`); escritura atómica |
+| `core/guionista.py` | Guionista opcional del DJ (`frases` \| `claude` \| `ollama`, `DJ_GUIONISTA`): escribe la presentación de cada tema; si falla devuelve `None` y el DJ cae a sus frases. Claude va por el SDK `anthropic`; se cambia en caliente con `elegir()` |
 | `core/spotify.py` | Embed público: de Spotify salen **solo nombres**, nunca audio |
 | `core/salud.py`, `config.py` | Salud de la transmisión, configuración |
 | `core/persistencia.py` | La cola de cada servidor en `estado/colas.json` (no se versiona): el cog la guarda sola y el bot la retoma al volver, si hay gente en el canal y no pasaron 6 h |

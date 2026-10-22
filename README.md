@@ -14,8 +14,8 @@ presenta el tema que viene y lee titulares de noticias con voz sintética.
   letras y botones de control en el chat.
 - Acepta links de Spotify, pero **solo toma los nombres** de los temas: el audio
   siempre sale de YouTube.
-- Un **DJ de radio** mete cortes hablados entre canciones (voz de `espeak-ng` con
-  filtro de radio vía ffmpeg).
+- Un **DJ de radio** mete cortes hablados entre canciones (voz de `espeak-ng` o,
+  si la eliges, una voz neuronal de Piper; con filtro de radio vía ffmpeg).
 - **Autoplay**: al acabarse la cola sigue solo con temas parecidos.
 - **Retoma la cola si se reinicia el bot**: la guarda en `estado/colas.json` y, al
   volver, entra al canal donde haya gente y sigue por donde iba (hasta 6 horas
@@ -46,6 +46,7 @@ flowchart LR
 | Lavalink 4 | contenedor con `podman` | `Lavalink.jar` con Java 21 |
 | `yt-dlp` | en `requirements.txt` | en `requirements.txt` (lo instala `setup.ps1`) |
 | `espeak-ng` | lo instalas tú | lo instala `setup.ps1` |
+| `piper-tts` (opcional: voces neuronales) | en `requirements.txt` | en `requirements.txt` |
 | `ffmpeg` | lo instalas tú (recomendado) | lo instala `setup.ps1` |
 | `python3-gobject` con GTK4/libadwaita | solo para el panel GTK | no aplica |
 
@@ -154,6 +155,10 @@ en `.gitignore`).
 | `INACTIVE_CHANNEL_TOKENS` | `3` | Canciones seguidas sin humanos en el canal antes de cortar |
 | `IDLE_TIMEOUT` | `300` | Segundos sin música antes de irse del canal |
 | `DJ_VOLUME` | `100` | Volumen inicial de la voz del DJ (0-200) |
+| `DJ_GUIONISTA` | `frases` | Quién escribe lo que dice el DJ: `frases`, `claude` u `ollama` (ver [Guionista del DJ](#guionista-del-dj)) |
+| `DJ_GUIONISTA_MODELO` | `claude-opus-5-5` | Modelo de Claude del guionista |
+| `ANTHROPIC_API_KEY` | — | Credencial de la API de Anthropic, solo con `DJ_GUIONISTA=claude` |
+| `OLLAMA_URL` / `OLLAMA_MODELO` | `http://127.0.0.1:11434`, `llama3.2:3b` | El Ollama local y su modelo, solo con `DJ_GUIONISTA=ollama` |
 | `YTDLP_BIN` | autodetectado | Ruta a `yt-dlp` |
 | `YTDLP_PLAYER_CLIENT` | `android` | Cliente de YouTube que usa yt-dlp |
 | `YTDLP_CLIENTES` | `android,android_vr,ios,mweb,web,tv_simply,web_embedded` | Clientes que el bot prueba, en ese orden, cuando el actual deja de dar audio |
@@ -234,7 +239,7 @@ Ambos son clientes HTTP de la API del bot; ninguno comparte proceso con él.
 
 **Panel web.** Con el bot en marcha, abre <http://127.0.0.1:9876/> (el puerto es
 `API_PORT`). Muestra el estado del bot, de Lavalink y de yt-dlp, qué suena en
-cada servidor, el volumen de la voz del DJ, los titulares pendientes, el log
+cada servidor, el volumen y la voz del DJ (se elige entre las de Piper), los titulares pendientes, el log
 reciente y un botón para apagar el bot. Funciona en cualquier sistema.
 
 **Panel de escritorio GTK4 (solo Linux).** `scripts/lavadj-panel.py`. Enciende y
@@ -257,6 +262,13 @@ que no sea `127.0.0.1`, `localhost` o `[::1]` con su puerto, y los POST cuyo
 | `/api/log` | GET | Últimas líneas de `bot.log` (`?lineas=1-500`) |
 | `/api/headlines` | GET | Titulares que el DJ tiene en cola |
 | `/api/dj_volume` | GET/POST | Lee o fija el volumen del DJ (`?valor=0-200`) |
+| `/api/voces` | GET | Catálogo de voces con su estado, la voz en uso y el filtro de radio |
+| `/api/voces/muestra` | GET | Frase de muestra en `audio/wav` (`?voz=<id>`) |
+| `/api/voz` | POST | Elige la voz del DJ, solo una instalada (`?voz=<id>`) |
+| `/api/voz/filtro` | POST | Enciende o apaga el filtro de radio (`?activo=1\|0`) |
+| `/api/voces/descargar` | POST | Baja una voz en segundo plano (`?voz=<id>`) |
+| `/api/voces/borrar` | POST | Borra una voz instalada que no esté en uso (`?voz=<id>`) |
+| `/api/guionista` | GET/POST | Guionista en uso, cuáles están disponibles y su modelo; con POST lo cambia y guarda la elección (`?nombre=frases\|claude\|ollama`) |
 | `/api/refresh_news` | POST | Rebaja los titulares ahora mismo |
 | `/api/stop` | POST | Cierre limpio del bot |
 
@@ -285,6 +297,46 @@ paneles, los renueva al momento.
 
 `dj_cache/` se monta dentro del contenedor de Lavalink con la **misma ruta
 absoluta** que usa el bot. Si mueves el proyecto de carpeta, reinicia Lavalink.
+
+### Voz del DJ
+
+Por defecto habla `espeak-ng`. Con [Piper](https://github.com/OHF-Voice/piper1-gpl)
+puedes darle una voz neuronal en español (Argentina, España o México), mucho más
+natural. Se elige en el panel web, sección **Voz del DJ** (en el panel GTK, el botón
+**Voces…** lo abre):
+
+- **▶ Escuchar** sintetiza una frase con esa voz y el filtro actual.
+- **Descargar** baja la voz a `voces/` (de 28 a 114 MB). Solo se baja lo que está en
+  el catálogo de `core/voces.py` (sale de `rhasspy/piper-voices`) y se verifica su md5.
+- **Usar** la activa desde el próximo corte; **Borrar** libera el espacio de una que
+  no uses.
+- **Filtro de radio**, encendido por defecto, vale para cualquier voz: apágalo si
+  prefieres la voz limpia.
+
+La elección se guarda en `estado/ajustes.json`. Si Piper falla o no está instalado, el
+DJ sigue con `espeak-ng` y lo avisa en el log. `piper-tts` es GPL-3.0 y LavaDJ es MIT:
+por eso corre siempre como proceso aparte (`python -m piper`) y el código no lo importa.
+
+### Guionista del DJ
+
+Por defecto el DJ presenta las canciones con frases fijas. Con un guionista, un
+modelo de lenguaje escribe cada presentación a partir del título, el artista, quién
+pidió el tema, la hora y, a veces, un titular de noticias. Si el modelo no responde
+o se niega, ese corte sale con las frases de siempre. Se elige con `DJ_GUIONISTA`
+en el `.env`:
+
+- `frases` (por defecto): sin guionista y sin costo.
+- `claude`: usa la API de Anthropic y **cobra por uso**, una llamada por
+  presentación. Pon `ANTHROPIC_API_KEY` en el `.env` (o inicia sesión con
+  `ant auth login`). El modelo por defecto es `claude-opus-5-5`;
+  `DJ_GUIONISTA_MODELO=claude-haiku-5-5` es bastante más barato.
+- `ollama`: usa un modelo local, gratis. Instala [Ollama](https://ollama.com), baja
+  el modelo (`ollama pull llama3.2:3b`) y déjalo corriendo; `OLLAMA_URL` y
+  `OLLAMA_MODELO` lo ajustan. Si el modelo tarda en cargarse, esa presentación sale
+  con las frases.
+
+También se elige en caliente desde el panel web (sección **Guionista del DJ**): esa
+elección se guarda en `estado/ajustes.json` y gana sobre el `.env`.
 
 ## Cuando YouTube deja de sonar
 

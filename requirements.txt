@@ -2,5 +2,7 @@ discord.py[voice]
 wavelink
 python-dotenv
 aiohttp
+anthropic
 feedparser
+piper-tts
 yt-dlp

@@ -18,10 +18,11 @@ dos: una lámpara de ON AIR no cambia de color según la luz de la sala.
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 from lavadj_panel_logica import (
-    LINEAS_MONITOR, LOG_FILE, REFRESCO, START_LOG, aviso_de_salud,
+    API_BASE, LINEAS_MONITOR, LOG_FILE, REFRESCO, START_LOG, aviso_de_salud,
     aviso_sin_titulares, botones_activos, consultar, estado_bot, guardar_ajuste,
     lavalink_arriba, leer_ajustes, levantar_bot, levantar_lavalink, lineas_de_log,
     motivo_de_la_caida, postear, resumen_de_titulares, texto_de_estado,
@@ -205,6 +206,11 @@ class Panel(Adw.ApplicationWindow):
         self.eco_volumen = Gtk.Label(css_classes=["detalle"], width_chars=4, xalign=1)
         fila.append(self.eco_volumen)
         self._mostrar_volumen()
+
+        voces = Gtk.Button(label="Voces…", css_classes=["flat"],
+                           tooltip_text="Elegir y descargar voces: abre el panel web")
+        voces.connect("clicked", self.abrir_voces)
+        fila.append(voces)
         return fila
 
     def _legend(self, texto: str) -> Gtk.Label:
@@ -328,6 +334,13 @@ class Panel(Adw.ApplicationWindow):
     def _mostrar_volumen(self) -> None:
         valor = int(self.volumen.get_value())
         self.eco_volumen.set_text("MUDO" if valor == 0 else f"{valor}%")
+
+    def abrir_voces(self, _boton):
+        """El selector de voces vive en el panel web: aquí solo se lo abre."""
+        if not self.esta_al_aire:
+            self.avisar("El bot está fuera del aire: sin él no hay panel de voces.")
+        elif not webbrowser.open(API_BASE.removesuffix("/api") + "/"):
+            self.avisar("No pude abrir el navegador.", falla=True)
 
     def volumen_movido(self, _escala):
         """Espera a que la mano se quede quieta antes de molestar al bot."""

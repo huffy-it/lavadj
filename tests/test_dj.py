@@ -13,6 +13,12 @@ class FakeTrack:
         self.source = source
 
 
+@pytest.fixture(autouse=True)
+def sin_guionista(monkeypatch):
+    """Un `.env` con el guionista encendido no puede llevar los tests a la API real."""
+    monkeypatch.setattr(dj_mod.config, "DJ_GUIONISTA", "frases")
+
+
 @pytest.fixture
 def dj(tmp_path, monkeypatch):
     instance = DJ()
@@ -335,3 +341,153 @@ def test_el_aviso_habla_aunque_el_dj_este_apagado(dj, monkeypatch, tmp_path):
 def test_sin_espeak_el_aviso_no_revienta(dj, monkeypatch):
     monkeypatch.setattr(dj_mod.tts, "available", lambda: False)
     assert asyncio.run(dj.aviso("se cortó todo")) is None
+
+
+# --- guionista ---------------------------------------------------------------
+
+@pytest.fixture
+def guion(dj, monkeypatch):
+    """El DJ con el guionista de Claude encendido y `escribir` suplantado: ninguna llamada sale de aquí."""
+    dj.guionista.elegir("claude")
+    dj.guionista.pedidos = []
+    dj.guionista.respuesta = "Ahora suena Daft Punk, que lo disfrutes."
+
+    async def falso_escribir(titulo, **datos):
+        dj.guionista.pedidos.append({"titulo": titulo, **datos})
+        if isinstance(dj.guionista.respuesta, Exception):
+            raise dj.guionista.respuesta
+        return dj.guionista.respuesta
+
+    monkeypatch.setattr(dj.guionista, "escribir", falso_escribir)
+    return dj
+
+
+async def test_con_guionista_se_usa_su_texto_y_la_fuente_es_guion(guion):
+    texto, nombra, fuente = await guion.build_text("Around the World", "Daft Punk", None, "Ana")
+
+    assert (texto, nombra, fuente) == ("Ahora suena Daft Punk, que lo disfrutes.", True, "guion")
+    (pedido,) = guion.guionista.pedidos
+    assert pedido["titulo"] == "Around the World"
+    assert pedido["artista"] == "Daft Punk"
+    assert pedido["pidio"] == "Ana"
+    assert pedido["max_chars"] == dj_mod.MAX_CHARS
+
+
+async def test_si_el_guionista_devuelve_none_se_cae_al_banco(guion, monkeypatch):
+    guion.guionista.respuesta = None
+    monkeypatch.setattr(guion, "_pick_source", lambda has_track: "slang")
+
+    assert await guion.build_text("Tema", "Artista", None) == ("no aura", False, "slang")
+    assert len(guion.guionista.pedidos) == 1   # lo intentó primero
+
+
+async def test_si_el_guionista_revienta_se_cae_al_banco(guion, monkeypatch):
+    guion.guionista.respuesta = RuntimeError("se rompió")
+    monkeypatch.setattr(guion, "_pick_source", lambda has_track: "slang")
+
+    assert await guion.build_text("Tema", "Artista", None) == ("no aura", False, "slang")
+
+
+async def test_con_el_guionista_apagado_no_se_lo_llama_nunca(dj, monkeypatch):
+    llamadas = []
+
+    async def no_deberia(*args, **kwargs):
+        llamadas.append(1)
+
+    monkeypatch.setattr(dj.guionista, "escribir", no_deberia)
+    monkeypatch.setattr(dj, "_pick_source", lambda has_track: "slang")
+    assert dj.guionista.activo == "frases"
+
+    assert await dj.build_text("Tema", "Artista", None) == ("no aura", False, "slang")
+    assert llamadas == []
+
+
+async def test_sin_titulo_no_se_llama_al_guionista(guion, monkeypatch):
+    monkeypatch.setattr(guion, "_pick_source", lambda has_track: "slang")
+    await guion.build_text("", "", None)
+    assert guion.guionista.pedidos == []
+
+
+def test_la_voz_de_la_fuente_guion_es_la_espanola():
+    from core import tts
+    assert DJ.voice_for("guion") == tts.VOICE_ES
+
+
+async def test_prepare_con_guionista_sintetiza_con_voz_espanola_y_liga_el_clip_a_la_cancion(guion, monkeypatch, tmp_path):
+    monkeypatch.setattr(dj_mod.tts, "available", lambda: True)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"RIFF")
+    sintetizado = {}
+
+    async def falso_synthesize(text, voice=None, volume=100):
+        sintetizado.update(texto=text, voz=voice)
+        return wav
+
+    monkeypatch.setattr(dj_mod.tts, "synthesize", falso_synthesize)
+    guion.guionista.respuesta = "Va Daft Punk 🎵 https://x.com/y con Ana."
+    track = FakeTrack()
+    track.requester = "Ana"
+    guion.force(1)
+
+    await guion.prepare(1, track, session=None)
+
+    assert sintetizado == {"texto": "Va Daft Punk con Ana.", "voz": dj_mod.tts.VOICE_ES}   # pasó por sanitize
+    clip = guion._pending[1]
+    assert clip.kind == "guion"
+    assert clip.for_source == "https://x/1"   # nombra la canción: si hay skip, se descarta
+    pedido = guion.guionista.pedidos[0]
+    assert (pedido["artista"], pedido["pidio"]) == ("Daft Punk", "Ana")
+
+
+async def test_el_guion_largo_se_corta_al_tope(guion, monkeypatch, tmp_path):
+    monkeypatch.setattr(dj_mod.tts, "available", lambda: True)
+    wav = tmp_path / "clip.wav"
+    wav.write_bytes(b"RIFF")
+    dicho = []
+
+    async def falso_synthesize(text, voice=None, volume=100):
+        dicho.append(text)
+        return wav
+
+    monkeypatch.setattr(dj_mod.tts, "synthesize", falso_synthesize)
+    guion.guionista.respuesta = "palabra " * 100
+    guion.force(1)
+
+    await guion.prepare(1, FakeTrack(), session=None)
+
+    assert len(dicho[0]) <= dj_mod.MAX_CHARS
+
+
+async def test_el_titular_va_al_guionista_solo_a_veces(guion, monkeypatch):
+    class FakeFeeds:
+        async def next_headline(self, session):
+            return "Alcalde inaugura puente sin río"
+
+    guion.feeds = FakeFeeds()
+
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    await guion.build_text("Tema", "Artista", None)
+    monkeypatch.setattr(random, "random", lambda: 0.99)
+    await guion.build_text("Tema", "Artista", None)
+
+    con, sin = guion.guionista.pedidos
+    assert con["titular"] == "Alcalde inaugura puente sin río"
+    assert sin["titular"] == ""
+
+
+async def test_sin_feeds_el_guionista_no_recibe_titular(guion, monkeypatch):
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    guion.feeds = None
+    await guion.build_text("Tema", "Artista", None)
+    assert guion.guionista.pedidos[0]["titular"] == ""
+
+
+def test_el_dj_acepta_un_guionista_inyectado():
+    from core.guionista import Guionista
+    g = Guionista("ollama")
+    assert DJ(guionista=g).guionista is g
+
+
+def test_por_defecto_el_dj_arranca_sin_guionista():
+    d = DJ()
+    assert d.guionista.activo == "frases" and not d.guionista.encendido

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from core import config, tts
 from core.feeds import FeedCache
+from core.guionista import Guionista
 
 log = logging.getLogger("dj")
 
@@ -29,6 +30,9 @@ FEEDS_FILE = PROJECT_ROOT / "dj_feeds.json"
 SPEAK_CHANCE = 1 / 3
 
 MAX_CHARS = 200
+
+# De cada 3 presentaciones del guionista, 1 lleva un titular de noticias.
+TITULAR_CHANCE = 1 / 3
 
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -83,9 +87,10 @@ class Clip:
 
 
 class DJ:
-    def __init__(self, feed_cache: FeedCache | None = None):
+    def __init__(self, feed_cache: FeedCache | None = None, guionista: Guionista | None = None):
         self.phrases = self._load_phrases()
         self.feeds = feed_cache
+        self.guionista = guionista if guionista is not None else Guionista()
         self.enabled = True
         self.volume = config.DJ_VOLUME_DEFAULT
         # Estado por servidor.
@@ -214,8 +219,25 @@ class DJ:
         templates = self.phrases.get("noticia") or ["{titular}."]
         return random.choice(templates).format(titular=headline)
 
-    async def build_text(self, title: str, artist: str, session) -> tuple[str, bool, str]:
+    async def _guion(self, title: str, artist: str, pidio: str, session) -> str | None:
+        """Lo que escribe el guionista, a veces con un titular; None si falla."""
+        try:
+            titular = ""
+            if self.feeds and random.random() < TITULAR_CHANCE:
+                titular = await self.feeds.next_headline(session) or ""
+            return await self.guionista.escribir(
+                title, artista=artist, pidio=pidio, titular=titular, max_chars=MAX_CHARS, session=session
+            )
+        except Exception:
+            log.exception("el guionista falló; el DJ usa sus frases")
+            return None
+
+    async def build_text(self, title: str, artist: str, session, pidio: str = "") -> tuple[str, bool, str]:
         """(texto, nombra_la_cancion, fuente). Cae al banco si la fuente falla."""
+        if title and self.guionista.encendido:
+            texto = await self._guion(title, artist, pidio, session)
+            if texto:
+                return texto, True, "guion"
         source = self._pick_source(bool(title))
 
         if source == "slang":
@@ -246,9 +268,10 @@ class DJ:
         artist = ""
         if title and " - " in title:
             artist = title.split(" - ", 1)[0].strip()
+        pidio = str(getattr(track, "requester", None) or "").strip()
 
         try:
-            raw, names_track, kind = await self.build_text(title, artist, session)
+            raw, names_track, kind = await self.build_text(title, artist, session, pidio)
             text = sanitize(raw)
             if not text:
                 return

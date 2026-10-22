@@ -1,4 +1,7 @@
-"""Voz del DJ: espeak-ng → ffmpeg → wav.
+"""Voz del DJ: Piper o espeak-ng → ffmpeg → wav.
+
+Piper (voz neuronal, core/voces.py) corre como subproceso y manda cuando la voz
+elegida es suya; si falla o no está, habla espeak y el DJ nunca se queda mudo.
 
 espeak suena a robot, que es exactamente lo que se busca: el filtro de radio
 (ver RADIO_FILTER) lo convierte en locutor de emisora pirata en vez de lector
@@ -18,8 +21,11 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
+
+from core import ajustes, voces
 
 log = logging.getLogger("tts")
 
@@ -52,7 +58,10 @@ VOICE = VOICE_ES
 SPEED = "155"     # palabras por minuto
 PITCH = "35"      # más grave que el default (50)
 
+PIPER_LENGTH_SCALE = 1.0    # duración de cada fonema: más de 1 habla más lento
+
 TIMEOUT = 10
+PIPER_TIMEOUT = 30    # cada clip arranca onnxruntime y carga el modelo
 
 # Banda telefónica + compresión: esto es lo que suena a radio.
 RADIO_FILTER = "highpass=f=400,lowpass=f=3400,acompressor"
@@ -65,27 +74,31 @@ BASE_GAIN = 1.6
 MAX_VOLUME = 200
 
 
-def filter_chain(volume: int) -> str:
-    """La cadena de ffmpeg para un volumen dado, en porcentaje (0-200)."""
+def filter_chain(volume: int, radio: bool = True) -> str:
+    """La cadena de ffmpeg para un volumen dado, en porcentaje (0-200), con o sin filtro de radio."""
     pct = max(0, min(MAX_VOLUME, volume))
+    if not radio:
+        # El limitador evita que subir de 100% sature a Piper, que ya sale al tope.
+        return f"volume={pct / 100:.2f},alimiter=limit=0.95:level=disabled"
     return f"{RADIO_FILTER},volume={BASE_GAIN * pct / 100:.2f}"
 
 
 def available() -> bool:
-    return ESPEAK_BIN is not None
+    return ESPEAK_BIN is not None or (voces.piper_disponible() and bool(voces.instaladas()))
 
 
-async def _correr(args: list[str], que: str) -> bool:
-    """Corre un binario sin shell. True si terminó bien."""
+async def _correr(args: list[str], que: str, timeout: int = TIMEOUT, entrada: bytes | None = None) -> bool:
+    """Corre un binario sin shell, con `entrada` por stdin si hay. True si terminó bien."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
+            stdin=None if entrada is None else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT)
+        _, stderr = await asyncio.wait_for(proc.communicate(entrada), timeout=timeout)
     except asyncio.TimeoutError:
-        log.warning("%s no respondió en %ss", que, TIMEOUT)
+        log.warning("%s no respondió en %ss", que, timeout)
         proc.kill()
         await proc.wait()      # sin esto queda zombi hasta que muera el bot
         return False
@@ -104,27 +117,60 @@ def _tiene_audio(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
-async def synthesize(text: str, voice: str = VOICE, volume: int = 100) -> Path | None:
-    """Genera el wav del clip. Devuelve None si falla (el DJ nunca es fatal)."""
-    if not ESPEAK_BIN:
+def _voz_piper(forzada: str | None) -> str | None:
+    """La voz de Piper con la que hablar, o None si toca espeak."""
+    voz = forzada or ajustes.obtener("voz")
+    if voz == voces.ESPEAK and not ESPEAK_BIN:
+        voz = next(iter(voces.instaladas()), voz)
+    if voz == voces.ESPEAK:
         return None
+    if voces.piper_disponible() and voces.instalada(voz):
+        return voz
+    log.warning("La voz %s no está disponible (¿falta piper-tts o la descarga?): uso espeak", voz)
+    return None
 
+
+async def _hablar(args: list[str], que: str, texto: str, crudo: Path, **kwargs) -> bool:
+    """Corre el sintetizador y comprueba que dejó audio en `crudo`."""
+    ok = await _correr(args, que, **kwargs)
+    if ok and not _tiene_audio(crudo):
+        log.warning("%s no escribió audio para %r", que, texto[:60])
+        ok = False
+    if not ok:
+        cleanup(crudo)
+    return ok
+
+
+async def synthesize(text: str, voice: str = VOICE, volume: int = 100, voz: str | None = None) -> Path | None:
+    """Genera el wav del clip. Devuelve None si falla (el DJ nunca es fatal).
+
+    `voice` es el código de espeak; la voz de Piper sale de los ajustes, salvo que se fuerce con `voz`.
+    """
     nombre = uuid.uuid4().hex
     crudo = CACHE_DIR / f"dj_{nombre}.crudo.wav"
-    args = [
-        ESPEAK_BIN,
-        "-v", voice,
-        "-s", SPEED,
-        "-p", PITCH,
-        "-w", str(crudo),
-        "--", text,          # -- corta el parseo de flags: el texto no es una opción
-    ]
-    if not await _correr(args, "espeak"):
-        cleanup(crudo)
-        return None
-    if not _tiene_audio(crudo):
-        log.warning("espeak no escribió audio para %r", text[:60])
-        cleanup(crudo)
+    hablado = False
+    # Las frases en inglés del banco las lee espeak: las voces de Piper del catálogo son en español.
+    if piper := (_voz_piper(voz) if voz or voice != VOICE_EN or not ESPEAK_BIN else None):
+        args = [
+            sys.executable, "-X", "utf8", "-m", "piper",
+            "-m", str(voces.ruta_modelo(piper)), "-c", str(voces.ruta_config(piper)),
+            "-f", str(crudo), "--length-scale", str(PIPER_LENGTH_SCALE),
+        ]
+        # El texto va por stdin: como argumento, Piper lo leería como opciones.
+        hablado = await _hablar(args, "piper", text, crudo, timeout=PIPER_TIMEOUT, entrada=text.encode("utf-8"))
+        if not hablado:
+            log.warning("Piper falló con la voz %s: sigo con espeak", piper)
+    if not hablado and ESPEAK_BIN:
+        args = [
+            ESPEAK_BIN,
+            "-v", voice,
+            "-s", SPEED,
+            "-p", PITCH,
+            "-w", str(crudo),
+            "--", text,          # -- corta el parseo de flags: el texto no es una opción
+        ]
+        hablado = await _hablar(args, "espeak", text, crudo)
+    if not hablado:
         return None
 
     if not FFMPEG_BIN:
@@ -136,7 +182,7 @@ async def synthesize(text: str, voice: str = VOICE, volume: int = 100) -> Path |
     filtro = [
         FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(crudo),
-        "-af", filter_chain(volume),
+        "-af", filter_chain(volume, ajustes.obtener("filtro_radio")),
         str(filtrado),
     ]
     if not await _correr(filtro, "ffmpeg") or not _tiene_audio(filtrado):

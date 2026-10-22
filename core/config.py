@@ -120,6 +120,16 @@ SILENCIO_PARA_MUDO = _entero("SILENCIO_PARA_MUDO", 300)
 # la API y recuerda su propia última posición. 0 = DJ mudo.
 DJ_VOLUME_DEFAULT = _entero("DJ_VOLUME", 100)
 
+# --- Guionista del DJ ----------------------------------------------------------
+# Quién escribe lo que dice el DJ: `frases` (su banco, sin costo), `claude` (API de
+# Anthropic, cobra por uso) u `ollama` (modelo local). Viene apagado: nadie paga
+# una API sin pedirlo. Las credenciales de Claude las resuelve el SDK (core/guionista.py).
+DJ_GUIONISTA = (os.getenv("DJ_GUIONISTA") or "frases").strip().lower()
+DJ_GUIONISTA_MODELO = os.getenv("DJ_GUIONISTA_MODELO") or "claude-opus-5-5"
+OLLAMA_URL = os.getenv("OLLAMA_URL") or "http://127.0.0.1:11434"
+# Chico, corre en CPU y Meta lo documenta con español.
+OLLAMA_MODELO = os.getenv("OLLAMA_MODELO") or "llama3.2:3b"
+
 # --- Colas -------------------------------------------------------------------
 # Tope duro de la cola. Sin esto, dos playlists seguidas dejan al bot con miles
 # de temas encolados y el `!queue` inmanejable.
@@ -146,3 +156,10 @@ IDLE_TIMEOUT = _entero("IDLE_TIMEOUT", 300)
 # --- Estado en disco -----------------------------------------------------------
 # La cola de cada servidor, para retomarla si el bot se reinicia (core/persistencia.py).
 ARCHIVO_DE_COLAS = PROJECT_ROOT / "estado" / "colas.json"
+
+# Lo que se elige desde el panel y debe sobrevivir al reinicio: voz del DJ, filtro de radio (core/ajustes.py).
+ARCHIVO_DE_AJUSTES = PROJECT_ROOT / "estado" / "ajustes.json"
+
+# --- Voces neuronales (Piper) --------------------------------------------------
+# Las voces descargadas desde el panel (core/voces.py); no se versionan, pesan decenas de MB.
+CARPETA_DE_VOCES = PROJECT_ROOT / "voces"

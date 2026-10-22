@@ -23,6 +23,13 @@
   input[type=range] { flex:1; min-width:120px; }
   ul { margin:0; padding-left:18px; } li.leido { color:var(--mut); text-decoration:line-through; }
   pre { margin:0; max-height:300px; overflow:auto; font:12px/1.4 ui-monospace,Consolas,monospace; white-space:pre-wrap; }
+  .pais { margin:10px 0 2px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
+  .voz { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px 12px; padding:3px 0; }
+  .voz small { color:var(--mut); } .voz .uso { color:var(--ok); font-weight:600; }
+  .voz .botones { display:flex; gap:6px; align-items:center; }
+  .voz button { padding:3px 10px; } button.sec { background:transparent; color:var(--fg); border:1px solid var(--mut); }
+  .voz progress { width:90px; } .err { color:var(--bad); font-size:13px; }
+  .guion { display:flex; align-items:center; gap:8px; padding:3px 0; } .guion small { color:var(--mut); }
 </style>
 </head>
 <body>
@@ -46,6 +53,18 @@
       <input id="vol" type="range" min="0" max="200" step="5">
       <b id="volTxt">–</b>
     </div>
+    <label class="row"><span>Filtro de radio</span><input id="filtro" type="checkbox"></label>
+    <div id="sinPiper" class="err" hidden>Falta Piper, el motor de las voces neuronales: instálalo con <code>pip install piper-tts</code> en el venv del bot y reinicia.</div>
+    <div id="voces"></div>
+    <div id="vocesError" class="err"></div>
+    <audio id="muestra"></audio>
+  </div>
+
+  <div class="card">
+    <h2>Guionista del DJ</h2>
+    <div id="guionistas"></div>
+    <div id="guionistaFallo" class="err"></div>
+    <div id="guionistaError" class="err"></div>
   </div>
 
   <div class="card">
@@ -92,6 +111,7 @@ async function actualizar() {
   try {
     const d = await api('dj_volume');
     if (!moviendo) { $('vol').value = d.volumen; $('volTxt').textContent = d.volumen + '%' + (d.disponible ? '' : ' (DJ no disponible)'); }
+    if (!sondeoVoces) await cargarVoces();
     const h = await api('headlines');
     $('edad').textContent = h.edad == null ? 'sin bajar' : 'hace ' + dur(Math.floor(h.edad));
     $('titulares').innerHTML = (h.titulares || []).map(t => `<li class="${t.leido ? 'leido' : ''}">${esc(t.texto)}</li>`).join('');
@@ -99,6 +119,7 @@ async function actualizar() {
     const caja = $('log'), abajo = caja.scrollTop + caja.clientHeight >= caja.scrollHeight - 20;
     caja.textContent = l.lineas.join('\n');
     if (abajo) caja.scrollTop = caja.scrollHeight;
+    await cargarGuionista();    // al final: preguntar si Ollama responde puede tardar y no debe frenar lo demás
   } catch (_) {}
 }
 
@@ -118,6 +139,89 @@ $('parar').onclick = async () => {
   b.disabled = true; b.textContent = 'Apagando…';
   try { await api('stop?motivo=panel+web', {method:'POST'}); } catch (_) {}
   setTimeout(actualizar, 1500);
+};
+
+const CALIDAD = {x_low:'muy baja', low:'baja', medium:'media', high:'alta'};
+let datosVoces = null, vistaVoces = '', escuchando = null, sondeoVoces = null;
+
+function pintarVoces() {
+  const d = datosVoces;
+  if (!d) return;
+  $('sinPiper').hidden = d.piper;
+  $('filtro').checked = d.filtro_radio;
+  const grupos = {};
+  d.voces.forEach(v => (grupos[v.pais || 'De siempre'] = grupos[v.pais || 'De siempre'] || []).push(v));
+  const boton = (a, v, texto, clase = '') => `<button class="${clase}" data-a="${a}" data-v="${esc(v.id)}">${texto}</button>`;
+  const vista = Object.entries(grupos).map(([pais, lista]) => `<div class="pais">${esc(pais)}</div>` + lista.map(v => {
+    const detalle = v.calidad ? ` <small>${esc(CALIDAD[v.calidad] || v.calidad)} · ${Math.round(v.tamano / 1e6)} MB</small>` : '';
+    let acciones = boton('escuchar', v, escuchando === v.id ? '…' : '▶ Escuchar', 'sec');
+    if (v.descargando) acciones += `<progress max="100" value="${v.progreso || 0}"></progress> ${v.progreso || 0}%`;
+    else if (!v.instalada) acciones += boton('descargar', v, 'Descargar');
+    else {
+      if (!v.en_uso) acciones += boton('usar', v, 'Usar');
+      if (!v.en_uso && v.calidad) acciones += boton('borrar', v, 'Borrar', 'bad');
+    }
+    return `<div class="voz"><span>${esc(v.nombre || 'espeak')}${detalle}${v.en_uso ? ' <span class="uso">· en uso</span>' : ''}` +
+      `${v.error ? `<br><span class="err">${esc(v.error)}</span>` : ''}</span><span class="botones">${acciones}</span></div>`;
+  }).join('')).join('');
+  if (vista !== vistaVoces) { vistaVoces = vista; $('voces').innerHTML = vista; }   // sin rehacerla igual: un click a medias se perdería
+}
+
+async function cargarVoces(datos) {
+  datosVoces = datos || await api('voces');
+  pintarVoces();
+  clearTimeout(sondeoVoces);
+  // Mientras algo se baja, el progreso se mira cada segundo y no cada 3.
+  sondeoVoces = datosVoces.voces.some(v => v.descargando) ? setTimeout(() => cargarVoces().catch(() => { sondeoVoces = null; }), 1000) : null;
+}
+
+async function accionDeVoz(accion, id) {
+  const ruta = {usar: 'voz', descargar: 'voces/descargar', borrar: 'voces/borrar'}[accion];
+  const r = await api(ruta + '?voz=' + encodeURIComponent(id), {method:'POST'});
+  $('vocesError').textContent = r.error || '';
+  if (!r.error) cargarVoces(r);
+}
+
+$('voces').onclick = e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.a !== 'escuchar') return accionDeVoz(b.dataset.a, b.dataset.v).catch(err => { $('vocesError').textContent = err.message; });
+  if (escuchando) return;    // una muestra a la vez: cada una lanza Piper
+  escuchando = b.dataset.v; $('vocesError').textContent = ''; pintarVoces();
+  $('muestra').src = '/api/voces/muestra?voz=' + encodeURIComponent(escuchando) + '&t=' + Date.now();
+  $('muestra').play().catch(() => {});    // si falla, lo cuenta onerror
+};
+$('muestra').onplaying = () => { escuchando = null; pintarVoces(); };
+$('muestra').onerror = () => { if (escuchando) $('vocesError').textContent = 'No pude reproducir la muestra de esa voz.'; escuchando = null; pintarVoces(); };
+$('filtro').onchange = async () => {
+  const r = await api('voz/filtro?activo=' + ($('filtro').checked ? 1 : 0), {method:'POST'});
+  $('vocesError').textContent = r.error || '';
+  cargarVoces(r.error ? null : r);
+};
+
+const GUIONISTAS = [['frases', 'Frases fijas'], ['claude', 'Claude (API, cobra por uso)'], ['ollama', 'Ollama (local)']];
+const SIN_GUIONISTA = {claude: 'falta el SDK de anthropic', ollama: 'no responde'};
+let vistaGuionistas = '';
+
+async function cargarGuionista(datos) {
+  const d = datos || await api('guionista');
+  if (d.error) { $('guionistaFallo').textContent = d.error; return; }
+  $('guionistaFallo').textContent = d.ultimo_error || '';
+  const vista = GUIONISTAS.map(([id, nombre]) => {
+    const ok = d.disponibles[id], nota = [(d.modelos || {})[id], ok ? '' : SIN_GUIONISTA[id]].filter(Boolean).join(' · ');
+    return `<label class="guion"><input type="radio" name="guionista" value="${id}"${d.activo === id ? ' checked' : ''}${ok ? '' : ' disabled'}>` +
+      `<span>${nombre}${nota ? ` <small>${esc(nota)}</small>` : ''}</span></label>`;
+  }).join('');
+  if (vista !== vistaGuionistas) { vistaGuionistas = vista; $('guionistas').innerHTML = vista; }
+}
+
+$('guionistas').onchange = async e => {
+  try {
+    const r = await api('guionista?nombre=' + encodeURIComponent(e.target.value), {method:'POST'});
+    $('guionistaError').textContent = r.error || '';
+    vistaGuionistas = '';    // tras un error el radio quedó marcado de más: se repinta con lo que hay de verdad
+    await cargarGuionista(r.error ? null : r);
+  } catch (err) { $('guionistaError').textContent = err.message; }
 };
 
 actualizar(); setInterval(() => { if (!document.hidden) actualizar(); }, 3000);
