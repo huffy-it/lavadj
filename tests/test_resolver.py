@@ -6,6 +6,8 @@ tumbe la reproducción: ante la duda, se devuelve la pista original.
 """
 
 import asyncio
+import gc
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +29,8 @@ class FakePlayable:
         self.source = source
         self.uri = uri
         self.title = title
+        self.identifier = identifier
+        self.length = 200_000
         self.raw_data = {
             "encoded": f"encoded-{identifier}",
             "info": {
@@ -203,6 +207,36 @@ async def test_el_texto_va_como_argumento_nunca_por_shell(res, monkeypatch):
     await res.direct_url("https://youtu.be/abc; rm -rf /")
     assert argumentos["args"][-1] == "https://youtu.be/abc; rm -rf /"
     assert argumentos["args"][0] == resolver.config.YTDLP_BIN
+
+
+async def test_cancelar_direct_url_mata_a_yt_dlp(res, monkeypatch):
+    """Una precarga descartada se cancela a mitad: yt-dlp no puede quedar huérfano."""
+    import asyncio
+
+    matado = []
+    lanzado = asyncio.Event()
+
+    class ProcesoLento:
+        returncode = None
+
+        async def communicate(self):
+            lanzado.set()
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            matado.append(True)
+
+    async def _exec(*args, **kwargs):
+        return ProcesoLento()
+
+    monkeypatch.setattr(resolver.asyncio, "create_subprocess_exec", _exec)
+    tarea = asyncio.create_task(res.direct_url("https://youtu.be/abc"))
+    await lanzado.wait()
+    tarea.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await tarea
+    assert matado == [True]
 
 
 def _falso_proceso(monkeypatch, salida=b"", error=b"", codigo=0):
@@ -673,3 +707,375 @@ def test_el_player_arma_el_suyo_si_el_bot_no_tiene():
 
     assert isinstance(uno.resolver, resolver.Resolver)
     assert uno.resolver is not otro.resolver
+
+
+# --- precargar la que viene ------------------------------------------------------
+
+def _url_que_vence_en(segundos):
+    """Una URL de googlevideo con `expire`, como las que entrega yt-dlp."""
+    return f"https://rr4.googlevideo.com/videoplayback?itag=18&expire={int(time.time() + segundos)}&x=1"
+
+
+def _de_youtube(id_):
+    """Una pista de YouTube distinta por cada `id_`, para llenar la tabla."""
+    return FakePlayable(
+        uri=f"https://www.youtube.com/watch?v={id_}", title=f"Tema {id_}", identifier=id_
+    )
+
+
+def _dobles(res, monkeypatch, url=None, frenar=None):
+    """yt-dlp y Lavalink de mentira. Devuelve la lista de páginas que se le pidieron.
+
+    Con `frenar` (un `asyncio.Event`), yt-dlp se queda esperando hasta que alguien
+    lo suelte: así una precarga puede quedar en curso mientras pasa otra cosa.
+    """
+    pedidas = []
+
+    async def _url(pagina):
+        pedidas.append(pagina)
+        if frenar is not None:
+            await frenar.wait()
+        return url or _url_que_vence_en(6 * 3600)
+
+    async def _encontrar(identifier):
+        return [pista_http()]
+
+    monkeypatch.setattr(res, "direct_url", _url)
+    monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _encontrar)
+    monkeypatch.setattr(resolver.wavelink, "Playable", lambda datos: datos)
+    return pedidas
+
+
+async def _esperar_precargas(res):
+    """Deja terminar las precargas sin recoger su resultado ni su excepción."""
+    tareas = list(res._precargas.values())
+    if tareas:
+        await asyncio.wait(tareas)
+
+
+async def test_resolve_usa_la_url_precargada_sin_volver_a_pedirla(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    datos = await res.resolve(pista)
+
+    assert pedidas == [pista.uri]
+    assert datos["encoded"] == "encoded-http"
+    assert datos["info"]["title"] == "Un tema"
+    assert datos["userData"][resolver.CLAVE_ORIGEN]["identifier"] == "abc"
+
+
+async def test_resolve_espera_a_la_precarga_que_sigue_en_curso(res, monkeypatch):
+    """Un skip apurado llega con yt-dlp todavía trabajando: no se lanza otro."""
+    frenar = asyncio.Event()
+    pedidas = _dobles(res, monkeypatch, frenar=frenar)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await asyncio.sleep(0)           # la tarea arranca y queda esperando a yt-dlp
+    resolviendo = asyncio.create_task(res.resolve(pista))
+    await asyncio.sleep(0)
+    assert not resolviendo.done()
+
+    frenar.set()
+    datos = await resolviendo
+
+    assert pedidas == [pista.uri]
+    assert datos["encoded"] == "encoded-http"
+
+
+async def test_una_precarga_vencida_se_descarta_y_se_resuelve_de_nuevo(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch, url=_url_que_vence_en(-60))
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await res.resolve(pista)
+
+    assert pedidas == [pista.uri, pista.uri]
+
+
+async def test_la_precarga_tiene_que_cubrir_la_duracion_y_el_margen(res, monkeypatch):
+    """No basta con que la URL siga viva al arrancar: tiene que durar todo el tema."""
+    pista = FakePlayable()      # dura 200 s
+    duracion = pista.length / 1000
+
+    justa = _dobles(
+        res, monkeypatch,
+        url=_url_que_vence_en(duracion + resolver.MARGEN_DE_VENCIMIENTO - 30),
+    )
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await res.resolve(pista)
+    assert len(justa) == 2        # le faltaban 30 s de margen: se pidió otra
+
+    sobrada = _dobles(
+        res, monkeypatch,
+        url=_url_que_vence_en(duracion + resolver.MARGEN_DE_VENCIMIENTO + 60),
+    )
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await res.resolve(pista)
+    assert len(sobrada) == 1      # con un minuto de sobra, alcanza
+
+
+async def test_sin_duracion_conocida_basta_con_el_margen(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch, url=_url_que_vence_en(resolver.MARGEN_DE_VENCIMIENTO + 60))
+    pista = FakePlayable()
+    pista.length = 0
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await res.resolve(pista)
+
+    assert len(pedidas) == 1
+
+
+async def test_sin_expire_se_supone_una_vida_corta(res, monkeypatch):
+    """Sin `expire` la URL vive `VIDA_SIN_EXPIRE`: sirve para un tema corto, no para uno largo."""
+    sin_expire = "https://rr4.googlevideo.com/videoplayback?itag=18&x=1"
+    pedidas = _dobles(res, monkeypatch, url=sin_expire)
+
+    corta = FakePlayable()
+    res.precargar(corta)
+    await _esperar_precargas(res)
+    await res.resolve(corta)
+    assert len(pedidas) == 1
+
+    larga = FakePlayable()
+    larga.length = (resolver.VIDA_SIN_EXPIRE + 60) * 1000
+    res.precargar(larga)
+    await _esperar_precargas(res)
+    await res.resolve(larga)
+    assert len(pedidas) == 3      # la precarga no alcanzó: una de más
+
+
+async def test_si_yt_dlp_no_pudo_precargar_se_resuelve_por_el_camino_normal(res, monkeypatch):
+    respuestas = [None, _url_que_vence_en(6 * 3600)]
+    pedidas = []
+
+    async def _url(pagina):
+        pedidas.append(pagina)
+        return respuestas.pop(0)
+
+    async def _encontrar(identifier):
+        return [pista_http()]
+
+    monkeypatch.setattr(res, "direct_url", _url)
+    monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _encontrar)
+    monkeypatch.setattr(resolver.wavelink, "Playable", lambda datos: datos)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    datos = await res.resolve(pista)
+
+    assert len(pedidas) == 2
+    assert datos["encoded"] == "encoded-http"
+
+
+async def test_si_lavalink_no_pudo_precargar_se_resuelve_por_el_camino_normal(res, monkeypatch):
+    monkeypatch.setattr(resolver, "PAUSA_ENTRE_CARGAS", 0)
+    pedidas = _dobles(res, monkeypatch)
+    intentos = []
+
+    async def _fetch(identifier):
+        intentos.append(identifier)
+        if len(intentos) <= resolver.INTENTOS_DE_CARGA:
+            raise RuntimeError("Read timed out")      # se rinde toda la precarga
+        return [pista_http()]
+
+    monkeypatch.setattr(resolver.wavelink.Pool, "fetch_tracks", _fetch)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    datos = await res.resolve(pista)
+
+    assert len(pedidas) == 2
+    assert datos["encoded"] == "encoded-http"
+
+
+async def test_una_precarga_que_revienta_no_escapa_como_tarea_no_recuperada(res, monkeypatch, caplog):
+    """Nadie mira la tarea hasta que le toca sonar, y a lo mejor nunca."""
+    sin_atender = []
+    asyncio.get_running_loop().set_exception_handler(lambda loop, contexto: sin_atender.append(contexto))
+    pedidas = _dobles(res, monkeypatch)
+    original = res._cargar
+    llamadas = []
+
+    async def _cargar_que_revienta(pagina, titulo):
+        llamadas.append(pagina)
+        if len(llamadas) == 1:
+            raise RuntimeError("algo que nadie previó")
+        return await original(pagina, titulo)
+
+    monkeypatch.setattr(res, "_cargar", _cargar_que_revienta)
+    pista = FakePlayable()
+
+    with caplog.at_level("WARNING", logger="resolver"):
+        res.precargar(pista)
+        await _esperar_precargas(res)
+        # Se suelta la tarea sin consumirla: es el caso que antes se perdía.
+        res._precargas.clear()
+        gc.collect()
+        await asyncio.sleep(0)
+
+    assert sin_atender == []
+    assert "Falló la precarga" in caplog.text
+
+    # Y la pista suena igual, por el camino normal.
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    datos = await res.resolve(pista)
+    assert datos["encoded"] == "encoded-http"
+    assert len(pedidas) == 1
+
+
+async def test_cada_precarga_se_usa_una_sola_vez(res, monkeypatch):
+    """En un reintento tras un fallo no puede volver la misma URL."""
+    pedidas = _dobles(res, monkeypatch)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    await res.resolve(pista)
+    assert pedidas == [pista.uri]
+    assert res._precargas == {}
+
+    await res.resolve(pista)
+
+    assert pedidas == [pista.uri, pista.uri]
+
+
+async def test_la_precarga_se_muestra_con_la_cara_de_la_pista_actual(res, monkeypatch):
+    """Entre precargar y sonar la pista pudo cambiar: la cara no sale de la vieja."""
+    _dobles(res, monkeypatch)
+    res.precargar(FakePlayable(title="Cómo se llamaba antes"))
+    await _esperar_precargas(res)
+
+    datos = await res.resolve(FakePlayable(title="Cómo se llama ahora"))
+
+    assert datos["info"]["title"] == "Cómo se llama ahora"
+    assert datos["userData"][resolver.CLAVE_ORIGEN]["title"] == "Cómo se llama ahora"
+
+
+async def test_la_precarga_no_se_contamina_con_la_cara_de_otro_uso(res, monkeypatch):
+    """`_con_la_cara_del_original` copia: la pista guardada no queda pisada."""
+    _dobles(res, monkeypatch)
+    pista = FakePlayable()
+    res.precargar(pista)
+    await _esperar_precargas(res)
+    tarea = next(iter(res._precargas.values()))
+
+    await res.resolve(pista)
+
+    http, _ = tarea.result()
+    assert http.raw_data["info"]["title"] == "Unknown title"
+
+
+def test_el_vencimiento_sale_del_parametro_expire():
+    assert resolver._vencimiento("https://rr4.googlevideo.com/v?itag=18&expire=1893456000&x=1") == 1893456000.0
+
+
+@pytest.mark.parametrize("url", [
+    "https://rr4.googlevideo.com/v?itag=18&x=1",
+    "https://rr4.googlevideo.com/v",
+    "https://rr4.googlevideo.com/v?expire=",
+    "https://rr4.googlevideo.com/v?expire=pronto",
+    "https://rr4.googlevideo.com/v?expire=nan",
+    "",
+])
+def test_sin_un_expire_valido_no_hay_vencimiento(url):
+    assert resolver._vencimiento(url) is None
+
+
+@pytest.mark.parametrize("length, segundos", [
+    (200_000, 200.0), (0, 0.0), (None, 0.0), (-1, 0.0), ("raro", 0.0),
+])
+def test_la_duracion_se_lee_en_segundos_y_nunca_revienta(length, segundos):
+    pista = FakePlayable()
+    pista.length = length
+    assert resolver._duracion_en_s(pista) == segundos
+    assert resolver._duracion_en_s(SimpleNamespace()) == 0.0      # sin `length`
+
+
+async def test_el_tope_descarta_la_precarga_mas_vieja_y_cancela_su_tarea(res, monkeypatch):
+    monkeypatch.setattr(resolver, "PRECARGAS_MAXIMAS", 2)
+    frenar = asyncio.Event()
+    _dobles(res, monkeypatch, frenar=frenar)
+
+    res.precargar(_de_youtube("a"))
+    vieja = res._precargas["a"]
+    await asyncio.sleep(0)           # `a` ya está dentro de yt-dlp: sigue en curso
+    res.precargar(_de_youtube("b"))
+    res.precargar(_de_youtube("c"))
+    # Con timeout: si no se cancelara, `a` seguiría frenada y esto colgaría el test.
+    await asyncio.wait([vieja], timeout=1)
+
+    assert list(res._precargas) == ["b", "c"]
+    assert vieja.cancelled()
+
+    frenar.set()
+    await _esperar_precargas(res)
+
+
+async def test_pedir_dos_veces_la_misma_precarga_no_lanza_dos_yt_dlp(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch)
+    pista = FakePlayable()
+
+    res.precargar(pista)
+    tarea = res._precargas["abc"]
+    res.precargar(pista)
+    await _esperar_precargas(res)
+
+    assert pedidas == [pista.uri]
+    assert res._precargas["abc"] is tarea
+    assert len(res._precargas) == 1
+
+
+async def test_los_clips_del_dj_y_las_pistas_sin_pagina_no_se_precargan(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch)
+
+    res.precargar(FakePlayable(source="local", uri="/tmp/dj_abc.wav", identifier="dj_abc"))
+    res.precargar(FakePlayable(source="youtube", uri="", identifier="sin-uri"))
+
+    assert res._precargas == {}
+    await asyncio.sleep(0)
+    assert pedidas == []
+
+
+async def test_una_pista_ya_resuelta_se_precarga_por_su_origen_guardado(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch)
+
+    res.precargar(pista_ya_resuelta())
+    await _esperar_precargas(res)
+
+    assert pedidas == ["https://www.youtube.com/watch?v=abc"]
+    assert list(res._precargas) == ["abc"]
+
+
+async def test_un_video_que_ya_se_sabe_sin_caso_no_se_precarga(res, monkeypatch):
+    pedidas = _dobles(res, monkeypatch)
+    pista = FakePlayable()
+    res._sin_caso[pista.uri] = "la borraron"
+
+    res.precargar(pista)
+
+    assert res._precargas == {}
+    await asyncio.sleep(0)
+    assert pedidas == []
+
+
+async def test_resolve_sin_precarga_sigue_siendo_igual(res, monkeypatch):
+    """La precarga es opcional: sin ella, una sola pasada por yt-dlp como siempre."""
+    pedidas = _dobles(res, monkeypatch)
+    pista = FakePlayable()
+
+    datos = await res.resolve(pista)
+
+    assert pedidas == [pista.uri]
+    assert datos["encoded"] == "encoded-http"
+    assert res._precargas == {}

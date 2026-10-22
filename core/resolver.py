@@ -17,6 +17,12 @@ La URL se pide **en el momento de reproducir**, nunca al encolar: las de
 googlevideo caducan en unas horas y una cola larga las mataría antes de que les
 llegue el turno.
 
+**La única excepción es el tema que viene.** Pedir la URL y cargarla en Lavalink
+tarda segundos, y son el silencio que se oye entre canciones. Por eso, mientras
+suena un tema, el cog pide `precargar()` del siguiente: la URL se adelanta unos
+minutos, no horas, y solo de esa pista. Cada precarga se usa una vez y solo si le
+queda vida de sobra para toda la canción; si no, se resuelve como siempre.
+
 El título, el autor y la carátula que muestra el panel salen de la pista
 original de YouTube: la fuente `http` no trae metadatos y sin esto todo se
 vería como "Unknown title".
@@ -86,6 +92,24 @@ MOTIVOS_DEFINITIVOS = (
 # quemar reintentos, no un registro histórico.
 RECUERDO_MAXIMO = 100
 
+# Cuántas URLs adelantadas guarda cada `Resolver`. El cog pide una por cada tema
+# que arranca (la que viene) y otra cuando arranca el corte del DJ (la que viene
+# después de él), así que casi nunca hay más de dos vivas; el resto del tope es
+# holgura por si alguien reordena la cola. Al pasarse se tira la más vieja: es la
+# que más probablemente quedó sin uso porque la sacaron de la cola.
+PRECARGAS_MAXIMAS = 4
+
+# Si la URL no trae `expire` no se sabe cuándo caduca. Se supone poco (lo normal
+# en googlevideo son horas): equivocarse hacia lo corto solo cuesta volver a
+# pedirla, y hacia lo largo corta la canción a la mitad.
+VIDA_SIN_EXPIRE = 30 * 60
+
+# Cuánto le tiene que sobrar a una precarga, además de lo que dura la canción,
+# para usarla. No basta con que siga viva al arrancar: Lavalink puede volver a
+# abrir la URL a mitad de tema (un `seek`, un corte de red, un `Read timed out`
+# que se reintenta) y si ya venció, ese segundo intento falla con el tema sonando.
+MARGEN_DE_VENCIMIENTO = 10 * 60
+
 # yt-dlp es el punto único de falla de toda la música y nadie lo mira. Su
 # versión es una fecha, así que la antigüedad se calcula sin pedirle nada a la
 # red: si quedó viejo, se ve en el panel.
@@ -108,6 +132,28 @@ def _resumen_url(url: str) -> str:
     return f"host={urlparse(url).hostname} itag={consulta.get('itag', ['?'])[0]} expire={caduca}"
 
 
+def _vencimiento(url: str) -> float | None:
+    """El momento en que caduca la URL (epoch en segundos), o None si no lo dice.
+
+    googlevideo lo pone en el parámetro `expire`, que es una hora epoch entera.
+    """
+    try:
+        return float(int(parse_qs(urlparse(url).query)["expire"][0]))
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
+def _duracion_en_s(pista: wavelink.Playable) -> float:
+    """Lo que dura la canción, en segundos; 0 si no se sabe.
+
+    `length` viene en milisegundos y puede faltar o ser 0.
+    """
+    try:
+        return max(0.0, float(getattr(pista, "length", 0) or 0)) / 1000
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _origen(pista: wavelink.Playable) -> dict:
     """De qué video de YouTube salió esta pista. Vacío si no se sabe."""
     try:
@@ -127,6 +173,17 @@ def id_de_cancion(pista: wavelink.Playable) -> str:
     cambio, es el mismo en todas las vueltas.
     """
     return _origen(pista).get("identifier") or getattr(pista, "identifier", "")
+
+
+def _pagina_de(pista: wavelink.Playable) -> str:
+    """La página de YouTube de la que sale esta pista; vacío si no es de YouTube.
+
+    Una pista de YouTube se resuelve por su uri; una ya resuelta (el reintento)
+    llega con la uri de googlevideo, así que la buena sale del origen guardado.
+    """
+    if getattr(pista, "source", None) == "youtube":
+        return pista.uri or ""
+    return _origen(pista).get("uri") or ""
 
 
 def _hoy() -> datetime.date:
@@ -216,6 +273,11 @@ class Resolver:
         # Los videos que ya sabemos que no van a funcionar, por uri de YouTube.
         self._sin_caso: "OrderedDict[str, str]" = OrderedDict()
         self._estado_ytdlp: dict = {"version": None, "dias": None, "viejo": False}
+        # Las URLs adelantadas, por id de YouTube, de la más vieja a la más nueva.
+        # Guardan la tarea y no su resultado porque `resolve()` tiene que poder
+        # esperar a una que sigue en curso. También son la única referencia fuerte
+        # a esas tareas: el loop solo guarda débiles y se las llevaría el GC.
+        self._precargas: "OrderedDict[str, asyncio.Task]" = OrderedDict()
 
     def _extractor_args(self) -> str:
         """El cliente de YouTube que se le pide a yt-dlp, leído en cada llamada.
@@ -271,6 +333,14 @@ class Resolver:
             await proceso.wait()
             log.warning("yt-dlp se pasó de %ss con %s", self.timeout, webpage_url)
             return None
+        except asyncio.CancelledError:
+            # Una precarga descartada se cancela en plena resolución: sin esto el
+            # yt-dlp seguiría corriendo huérfano hasta terminar solo.
+            try:
+                proceso.kill()
+            except ProcessLookupError:
+                pass
+            raise
 
         if proceso.returncode != 0:
             detalle = error.decode(errors="replace").strip()[:200]
@@ -339,23 +409,47 @@ class Resolver:
         Cualquier otra cosa —los clips del DJ, que no tienen origen guardado— pasa
         derecho. Y ante cualquier tropiezo se devuelve la original en vez de
         reventar: si mañana el plugin vuelve a funcionar, el camino viejo sigue ahí.
+
+        Si el cog ya pidió `precargar()` de esta pista, primero se mira esa URL
+        adelantada (ver `_tomar_precarga`); sin precarga, o si no sirve, todo
+        sigue igual que siempre.
         """
-        origen = _origen(pista)
-        if getattr(pista, "source", None) == "youtube":
-            pagina = pista.uri or ""
-        else:
-            pagina = origen.get("uri") or ""
+        pagina = _pagina_de(pista)
         if not pagina:
             return pista
 
+        pista_http = await self._tomar_precarga(pista)
+        if pista_http is None:
+            cargada = await self._cargar(pagina, titulo_de(pista))
+            if cargada is None:
+                return pista
+            pista_http = cargada[0]
+
+        # La cara sale de la pista de ahora y no de la que se precargó: entre una
+        # y otra pudo cambiar (un reintento ya trae el origen guardado).
+        return _con_la_cara_del_original(pista_http, pista)
+
+    async def _cargar(
+        self, pagina: str, titulo: str
+    ) -> tuple[wavelink.Playable, float] | None:
+        """De la página de YouTube a una pista http ya cargada en Lavalink.
+
+        Devuelve la pista tal como la entrega Lavalink (sin la cara del original,
+        que se le pone al usarla) y el momento en que vence su URL (epoch en
+        segundos), o None si yt-dlp o Lavalink no pudieron. `titulo` es solo para
+        los logs.
+        """
         inicio = time.monotonic()
         url = await self.direct_url(pagina)
         if not url:
-            log.warning("yt-dlp no entregó URL para %r", titulo_de(pista))
-            return pista
+            log.warning("yt-dlp no entregó URL para %r", titulo)
+            return None
+        # La hora se toma al tener la URL y no al terminar de cargarla: si falta
+        # `expire`, es desde aquí que corre la vida que se le supone.
+        resuelta_a = time.time()
         log.info(
             "URL resuelta para %r en %.1fs (%s)",
-            titulo_de(pista), time.monotonic() - inicio, _resumen_url(url),
+            titulo, time.monotonic() - inicio, _resumen_url(url),
         )
 
         encontradas = None
@@ -365,7 +459,7 @@ class Resolver:
             except Exception as error:  # noqa: BLE001
                 log.warning(
                     "Lavalink no pudo cargar la URL de %r (intento %s/%s): %s",
-                    titulo_de(pista), intento, INTENTOS_DE_CARGA, error,
+                    titulo, intento, INTENTOS_DE_CARGA, error,
                 )
                 encontradas = None
             else:
@@ -373,15 +467,91 @@ class Resolver:
                     break
                 log.warning(
                     "Lavalink no devolvió nada para la URL de %r (intento %s/%s)",
-                    titulo_de(pista), intento, INTENTOS_DE_CARGA,
+                    titulo, intento, INTENTOS_DE_CARGA,
                 )
             if intento < INTENTOS_DE_CARGA:
                 await asyncio.sleep(PAUSA_ENTRE_CARGAS)
 
         if not encontradas:
-            return pista
+            return None
 
-        return _con_la_cara_del_original(encontradas[0], pista)
+        vence = _vencimiento(url)
+        if vence is None:
+            vence = resuelta_a + VIDA_SIN_EXPIRE
+        return encontradas[0], vence
+
+    def precargar(self, pista: wavelink.Playable) -> None:
+        """Adelanta en segundo plano la URL de una pista que va a sonar pronto.
+
+        Es síncrona a propósito —el cog la llama desde un listener y no tiene que
+        esperar nada—, pero necesita un loop en marcha. Las pistas sin página de
+        YouTube (los clips del DJ) y los videos que ya se sabe que no suenan no se
+        tocan, y pedir dos veces la misma no lanza dos yt-dlp.
+        """
+        pagina = _pagina_de(pista)
+        clave = id_de_cancion(pista)
+        if not pagina or not clave or clave in self._precargas:
+            return
+        if self.motivo_definitivo(pista):
+            return
+
+        titulo = titulo_de(pista)
+        log.debug("Precargando la URL de %r", titulo)
+        self._precargas[clave] = asyncio.create_task(self._precarga(pagina, titulo))
+        while len(self._precargas) > PRECARGAS_MAXIMAS:
+            _, vieja = self._precargas.popitem(last=False)
+            # Si sigue en curso, no tiene sentido terminarla: nadie va a esperarla.
+            vieja.cancel()
+
+    async def _precarga(
+        self, pagina: str, titulo: str
+    ) -> tuple[wavelink.Playable, float] | None:
+        """`_cargar` para correr suelta: nada de lo que pase escapa de la tarea.
+
+        Nadie mira la tarea hasta que a la pista le toca sonar (y a lo mejor
+        nunca), así que una excepción sin atrapar se perdería como "Task exception
+        was never retrieved". Aquí queda en el log y la precarga cuenta como fallida.
+        """
+        try:
+            return await self._cargar(pagina, titulo)
+        except Exception:  # noqa: BLE001
+            log.warning("Falló la precarga de %r", titulo, exc_info=True)
+            return None
+
+    async def _tomar_precarga(self, pista: wavelink.Playable) -> wavelink.Playable | None:
+        """La pista http precargada para esta, si la hay y todavía sirve.
+
+        Se saca de la tabla (`pop`) para que cada precarga se use una sola vez: en
+        el reintento tras un fallo tiene que pedirse una URL nueva, no volver la
+        misma. Si la tarea sigue en curso se espera en vez de lanzar otro yt-dlp
+        en paralelo por la misma URL: es lo que pasa con un skip apurado.
+        """
+        tarea = self._precargas.pop(id_de_cancion(pista), None)
+        if tarea is None:
+            return None
+
+        titulo = titulo_de(pista)
+        espera = time.monotonic()
+        cargada = await tarea
+        espera = time.monotonic() - espera
+        if cargada is None:
+            log.info("La precarga de %r no dio nada: se resuelve de nuevo", titulo)
+            return None
+
+        pista_http, vence = cargada
+        queda = vence - time.time()
+        if queda <= _duracion_en_s(pista) + MARGEN_DE_VENCIMIENTO:
+            log.info(
+                "La URL precargada de %r no alcanza para toda la canción "
+                "(le quedan %.0f min): se resuelve de nuevo", titulo, queda / 60,
+            )
+            return None
+
+        log.info(
+            "URL precargada para %r (esperé %.1f s, le quedan %.0f min)",
+            titulo, espera, queda / 60,
+        )
+        return pista_http
 
 
 class ResolvingPlayer(wavelink.Player):

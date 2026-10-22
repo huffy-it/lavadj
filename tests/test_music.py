@@ -1117,3 +1117,119 @@ async def test_el_cog_saltea_el_video_que_marco_el_resolver_compartido(sin_esper
 
     assert list(vc.queue) == []
     assert "la borraron" in vc.text_channel.enviados[-1]
+
+
+# --- precargar la URL del tema que viene -------------------------------------------
+
+class ResolverQueAnota:
+    """Un resolver que solo anota qué pistas le pidieron adelantar."""
+
+    def __init__(self):
+        self.precargadas = []
+
+    def precargar(self, pista):
+        self.precargadas.append(pista)
+
+
+def _clip_del_dj():
+    clip = FakeTrack("corte del DJ")
+    clip.is_dj_clip = True
+    return clip
+
+
+@pytest.mark.asyncio
+async def test_al_arrancar_una_cancion_se_precarga_la_que_sigue(cog, sin_panel):
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueAnota()
+    siguiente = FakeTrack("la que sigue")
+    vc.queue.extend([siguiente, FakeTrack("la de después")])
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+
+    # Solo la próxima: las demás esperan su turno, porque la URL caduca.
+    assert vc.resolver.precargadas == [siguiente]
+
+
+@pytest.mark.asyncio
+async def test_si_la_cola_esta_vacia_se_precarga_la_que_puso_el_autoplay(cog, sin_panel):
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueAnota()
+    sugerida = FakeTrack("la sugerida")
+    vc.auto_queue.append(sugerida)
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+
+    assert vc.resolver.precargadas == [sugerida]
+
+
+@pytest.mark.asyncio
+async def test_al_arrancar_un_corte_del_dj_se_precarga_la_que_viene_despues(cog, sin_panel):
+    """El rato de la voz es justo el que hace falta para resolver la que sigue."""
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueAnota()
+    despues_del_corte = FakeTrack("la que viene después del corte")
+    vc.queue.append(despues_del_corte)
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, _clip_del_dj()))
+
+    assert vc.resolver.precargadas == [despues_del_corte]
+
+
+@pytest.mark.asyncio
+async def test_sin_nada_que_venga_no_se_precarga(cog, sin_panel):
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueAnota()
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, _clip_del_dj()))
+
+    assert vc.resolver.precargadas == []
+
+
+@pytest.mark.asyncio
+async def test_si_lo_que_viene_es_un_corte_del_dj_no_se_precarga(cog, sin_panel):
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueAnota()
+    vc.queue.append(_clip_del_dj())
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+
+    assert vc.resolver.precargadas == []
+
+
+@pytest.mark.asyncio
+async def test_sin_resolver_en_el_player_se_usa_el_del_cog(cog, sin_panel):
+    """Por si el player no es un `ResolvingPlayer` y no trae resolver propio."""
+    vc = _reproductor_con_canal()
+    assert not hasattr(vc, "resolver")
+    cog.resolver = ResolverQueAnota()
+    siguiente = FakeTrack("la que sigue")
+    vc.queue.append(siguiente)
+
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+
+    assert cog.resolver.precargadas == [siguiente]
+
+
+@pytest.mark.asyncio
+async def test_si_la_precarga_falla_el_panel_sale_igual(cog, monkeypatch, caplog):
+    """Es una optimización: no puede llevarse por delante lo que sigue en el listener."""
+    publicados = []
+
+    async def _panel(self, guild, vc):
+        publicados.append(vc)
+    monkeypatch.setattr(Music, "_post_panel", _panel)
+
+    class ResolverQueRevienta:
+        def precargar(self, pista):
+            raise RuntimeError("sin loop")
+
+    vc = _reproductor_con_canal()
+    vc.resolver = ResolverQueRevienta()
+    vc.queue.append(FakeTrack("la que sigue"))
+
+    with caplog.at_level("WARNING", logger="music"):
+        await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que suena")))
+
+    assert publicados == [vc]
+    assert "precargar" in caplog.text

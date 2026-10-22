@@ -290,6 +290,24 @@ class Music(commands.Cog):
             return vc.auto_queue[0]
         return None
 
+    def _precargar_siguiente(self, vc: wavelink.Player) -> None:
+        """Le pide al resolver que adelante la URL del tema que viene.
+
+        Los clips del DJ no tienen URL que adelantar. Es una optimización: si
+        falla, que no se lleve por delante el panel ni el corte del DJ que siguen
+        al listener.
+        """
+        siguiente = self._proximo(vc)
+        if siguiente is None or getattr(siguiente, "is_dj_clip", False):
+            return
+        # El del player, que es el que va a resolver después; en la práctica es el
+        # mismo que `self.resolver` (`_connect_voice` los empareja).
+        quien = getattr(vc, "resolver", None) or self.resolver
+        try:
+            quien.precargar(siguiente)
+        except Exception:
+            log.warning("No pude precargar la URL del tema que viene", exc_info=True)
+
     def _cancelar_spotify(self, guild_id: int) -> None:
         task = self._spotify_tasks.pop(guild_id, None)
         if task:
@@ -539,6 +557,14 @@ class Music(commands.Cog):
                 "Hueco de %.1f s hasta %r",
                 hueco, "corte del DJ" if es_clip else resolver.titulo_de(sonando),
             )
+
+        # La URL del tema que viene se adelanta con lo que suena ya en marcha, para
+        # que el cambio no espere a yt-dlp. Va antes del `return` de los clips a
+        # propósito: al arrancar la canción `_proximo` es la que sigue, pero el
+        # corte del DJ entra a la cola después y se interpone; cuando el corte
+        # arranca, `_proximo` ya es la que viene tras él, y el rato de la voz es
+        # justo el que hace falta para resolverla. `precargar` deduplica.
+        self._precargar_siguiente(vc)
 
         if es_clip:
             return
