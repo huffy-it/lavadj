@@ -181,6 +181,7 @@ class Music(commands.Cog):
         for clave in [k for k in self._reintentos if k[0] == guild.id]:
             del self._reintentos[clave]
         self._caidas.pop(guild.id, None)
+        self.salud.sin_siguiente(guild.id)
         if vc:
             # Los cortes del DJ que quedaron esperando en la cola no van a sonar
             # nunca: sin esto sus wavs se quedan en dj_cache hasta el próximo
@@ -346,6 +347,10 @@ class Music(commands.Cog):
         if not vc or not vc.guild:
             return
 
+        # Empieza a correr el hueco hasta la próxima pista, sea canción o clip.
+        # Un skip también cuenta: es silencio que se escucha.
+        self.salud.termino(vc.guild.id)
+
         # Terminó bien: el contador de reintentos ya no sirve. No se limpia al
         # arrancar: un tema que arranca y revienta al decodificar reiniciaba el
         # contador y se reintentaba sin fin.
@@ -363,6 +368,9 @@ class Music(commands.Cog):
         if vc.queue or vc.auto_queue or payload.reason == "replaced":
             return
 
+        # Nada más que sonar: lo que arranque después es un `!play` nuevo, no
+        # una transición, y no tiene que medirse contra este final.
+        self.salud.sin_siguiente(vc.guild.id)
         await self._delete_panel(vc.guild.id)
         self.dj.drop(vc.guild.id)
         await self._schedule_idle_disconnect(vc.guild, vc)
@@ -517,7 +525,19 @@ class Music(commands.Cog):
         # `payload.track` viene deserializado del evento de Lavalink y NO trae
         # los atributos que le colgamos nosotros; el que sí es `payload.original`.
         sonando = payload.original or payload.track
-        if getattr(sonando, "is_dj_clip", False):
+        es_clip = getattr(sonando, "is_dj_clip", False)
+
+        # El hueco se mide con cualquier pista, también con el clip del DJ: el
+        # silencio antes de un corte lo oye igual quien escucha. Por eso va
+        # antes del `return` de los clips y aparte de `sono()`.
+        hueco = self.salud.arranco(vc.guild.id)
+        if hueco is not None:
+            log.info(
+                "Hueco de %.1f s hasta %r",
+                hueco, "corte del DJ" if es_clip else resolver.titulo_de(sonando),
+            )
+
+        if es_clip:
             return
 
         # Que arranque una canción es la única prueba de que esto funciona. El corte

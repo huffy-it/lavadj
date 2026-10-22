@@ -171,6 +171,22 @@ async def test_el_estado_dice_como_viene_la_transmision():
 
     assert datos["salud"]["estado"] == "bien"
     assert datos["salud"]["fallos_seguidos"] == 0
+    assert datos["salud"]["hueco"] is None      # todavía no hubo ninguna transición
+
+
+async def test_el_estado_expone_el_hueco_entre_pistas():
+    marca = {"t": 0.0}
+    salud = Salud(reloj=lambda: marca["t"])
+    salud.termino(1)
+    marca["t"] = 2.5
+    salud.arranco(1)
+    bot = FakeBot(FakeCog(salud=salud))
+
+    datos = cuerpo(await api.handle_status(pedido("GET", "/api/status", bot)))
+
+    assert datos["salud"]["hueco"] == {
+        "ultimo": 2.5, "promedio": 2.5, "maximo": 2.5, "muestras": 1,
+    }
 
 
 async def test_el_estado_delata_al_bot_que_viene_fallando():

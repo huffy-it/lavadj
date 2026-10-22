@@ -15,6 +15,7 @@ from cogs import music as music_mod
 from cogs.music import Music
 from core import config
 from core.dj import Clip
+from core.salud import Salud
 
 
 class FakeTrack:
@@ -920,3 +921,130 @@ async def test_un_tema_que_falla_antes_del_primer_reporte_igual_se_reintenta(cog
     await cog.on_wavelink_track_exception(FakePayloadExcepcion(vc, caida))
 
     assert list(vc.queue) == [caida]
+
+
+# --- el hueco entre pistas ----------------------------------------------------
+
+@pytest.fixture
+def reloj(cog):
+    """La salud del cog con un reloj que solo se mueve cuando uno lo empuja."""
+    marca = {"t": 0.0}
+    cog.salud = Salud(reloj=lambda: marca["t"])
+
+    def avanzar(segundos):
+        marca["t"] += segundos
+
+    return avanzar
+
+
+@pytest.fixture
+def sin_panel(monkeypatch):
+    """El panel necesita un player de verdad y aquí no es lo que se prueba."""
+    async def _sin_panel(self, guild, vc):
+        return None
+    monkeypatch.setattr(Music, "_post_panel", _sin_panel)
+
+
+def _hueco_medido(cog):
+    return cog.salud.estado(al_aire=True, hay_cola=True)["hueco"]
+
+
+@pytest.mark.asyncio
+async def test_el_hueco_entre_dos_canciones_queda_registrado(cog, reloj, sin_panel, caplog):
+    vc = _reproductor_con_canal()
+    vc.queue.append(FakeTrack("la que sigue"))
+
+    with caplog.at_level("INFO", logger="music"):
+        await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la que terminó")))
+        reloj(3.0)
+        await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que sigue")))
+
+    assert _hueco_medido(cog)["ultimo"] == 3.0
+    assert "3.0 s" in caplog.text
+    assert "la que sigue" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_el_hueco_tambien_cuenta_con_un_corte_del_dj(cog, reloj, sin_panel, caplog):
+    """El silencio antes de un clip lo oye igual quien escucha."""
+    vc = _reproductor_con_canal()
+    vc.queue.append(FakeTrack("el corte"))
+    clip = FakeTrack("corte del DJ")
+    clip.is_dj_clip = True
+
+    with caplog.at_level("INFO", logger="music"):
+        await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la que terminó")))
+        reloj(0.4)
+        await cog.on_wavelink_track_start(FakePayloadInicio(vc, clip))
+
+    assert _hueco_medido(cog)["ultimo"] == 0.4
+    assert "0.4 s" in caplog.text
+    assert "corte del DJ" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_un_skip_tambien_cuenta_como_hueco(cog, reloj, sin_panel):
+    vc = _reproductor_con_canal()
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("saltada"), reason="replaced"))
+    reloj(5.0)
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("la que sigue")))
+
+    assert _hueco_medido(cog)["ultimo"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_el_hueco_del_clip_no_pisa_a_sono(cog, reloj, sin_panel):
+    """Medir el hueco del clip no puede contar como que sonó música."""
+    vc = _reproductor_con_canal()
+    vc.queue.append(FakeTrack("la que sigue"))
+    clip = FakeTrack("corte del DJ")
+    clip.is_dj_clip = True
+    reloj(100)
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la que terminó")))
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, clip))
+
+    assert cog.salud.sin_sonar == 100
+
+
+@pytest.mark.asyncio
+async def test_si_la_cola_queda_vacia_lo_que_arranque_despues_no_es_un_hueco(
+    cog, reloj, sin_panel, monkeypatch
+):
+    """Un `!play` nuevo minutos después no es una transición entre temas."""
+    async def _sin_desconexion(self, guild, vc):
+        return None
+    monkeypatch.setattr(Music, "_schedule_idle_disconnect", _sin_desconexion)
+    vc = _reproductor_con_canal()
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la última")))
+    reloj(10.0)
+    await cog.on_wavelink_track_start(FakePayloadInicio(vc, FakeTrack("un !play nuevo")))
+
+    assert _hueco_medido(cog) is None
+
+
+@pytest.mark.asyncio
+async def test_si_la_cola_queda_vacia_se_avisa_a_la_salud(cog, sin_panel, monkeypatch):
+    async def _sin_desconexion(self, guild, vc):
+        return None
+    monkeypatch.setattr(Music, "_schedule_idle_disconnect", _sin_desconexion)
+    descartados = []
+    monkeypatch.setattr(cog.salud, "sin_siguiente", descartados.append)
+    vc = _reproductor_con_canal()
+
+    await cog.on_wavelink_track_end(FakePayloadFin(vc, FakeTrack("la última")))
+
+    assert descartados == [vc.guild.id]
+
+
+@pytest.mark.asyncio
+async def test_al_desconectar_el_final_pendiente_se_descarta(cog, reloj):
+    vc = PlayerDeSesionVieja()
+    cog.salud.termino(vc.guild.id)
+
+    await cog.teardown(vc.guild)
+    reloj(10.0)
+
+    assert cog.salud.arranco(vc.guild.id) is None
