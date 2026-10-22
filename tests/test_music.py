@@ -6,9 +6,11 @@ autoplay, y el par de banderas de estado.
 """
 
 import asyncio
+import re
 import time
 from types import SimpleNamespace
 
+import discord
 import pytest
 import wavelink
 from discord.ext import commands
@@ -86,14 +88,19 @@ class FakeTyping:
 
 
 class FakeCtx:
-    def __init__(self, vc=None, author=None, guild=None):
+    def __init__(self, vc=None, author=None, guild=None, interaction=None):
         self.voice_client = vc
         self.author = author or FakeAuthor()
         self.guild = guild or (vc.guild if vc else FakeGuild())
+        self.interaction = interaction
         self.enviados = []
+        self.eventos = []
 
     def typing(self):
         return FakeTyping()
+
+    async def defer(self, *, ephemeral=False):
+        self.eventos.append("defer")
 
     async def send(self, contenido=None, **kwargs):
         self.enviados.append(contenido)
@@ -2635,18 +2642,398 @@ def test_la_posicion_solo_se_extrapola_de_un_reporte_reciente_y_sin_pausa(
     monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: ahora))
     vc = SimpleNamespace(_last_update=reporte, _last_position=50_000, _inicio_ns=10**9, paused=pausado)
 
-    assert Music._posicion_viva(vc) == esperado
+    assert Music.posicion_viva(vc) == esperado
 
 
 def test_antes_del_primer_reporte_la_posicion_cuenta_desde_donde_arranco_el_tema(monkeypatch):
     monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: 4 * 10**9))
     vc = SimpleNamespace(_last_update=None, _inicio_ns=10**9, arranque_ms=12_500, paused=False)
 
-    assert Music._posicion_viva(vc) == 15_500
+    assert Music.posicion_viva(vc) == 15_500
 
 
 def test_un_reporte_del_tema_anterior_no_cuenta(monkeypatch):
     monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic_ns=lambda: 4 * 10**9))
     vc = SimpleNamespace(_last_update=5 * 10**8, _last_position=170_000, _inicio_ns=10**9, arranque_ms=0, paused=False)
 
-    assert Music._posicion_viva(vc) == 3_000
+    assert Music.posicion_viva(vc) == 3_000
+
+
+# --- comandos híbridos: `!` y `/` ------------------------------------------------
+
+HIBRIDOS = {
+    "play", "playnext", "autoplay", "pause", "resume", "skip", "stop", "queue", "nowplaying",
+    "panel", "loop", "shuffle", "volume", "remove", "dj", "lyrics",
+}
+CON_CONTROL = ("pause", "resume", "skip", "stop", "loop", "shuffle", "volume", "remove")
+ALIAS = {
+    "p": "play", "pn": "playnext", "next": "playnext", "ap": "autoplay", "r": "resume", "s": "skip",
+    "q": "queue", "np": "nowplaying", "l": "loop", "vol": "volume", "rm": "remove", "ly": "lyrics",
+    "buscar": "search",
+}
+
+
+@pytest.fixture
+async def bot_con_musica():
+    """Un `Bot` de verdad, sin conectarse, con el cog cargado: así se ve el cog como lo ve discord.py."""
+    bot = commands.Bot(command_prefix="!", intents=discord.Intents.none())
+    await bot.add_cog(Music(bot))
+    yield bot
+    await bot.remove_cog("Music")
+
+
+def _ctx_de_barra(bot, vc=None, author=None):
+    """Un contexto de mentira con el `interaction` que hace que discord.py corra los checks por el camino de `/`."""
+    ctx = FakeCtx(vc, author=author)
+    ctx.interaction = SimpleNamespace(client=bot)
+    ctx.interaction._baton = ctx
+    return ctx
+
+
+def test_los_comandos_de_musica_son_hibridos_menos_search():
+    comandos = {c.name: c for c in Music.__cog_commands__}
+
+    assert {n for n, c in comandos.items() if isinstance(c, commands.HybridCommand)} == HIBRIDOS
+    # Elige con reacciones sobre un mensaje y `/play` ya autocompleta: queda solo con prefijo.
+    assert set(comandos) == HIBRIDOS | {"search"}
+
+
+async def test_los_alias_valen_con_prefijo_y_el_arbol_de_barra_solo_trae_los_nombres(bot_con_musica):
+    for alias, nombre in ALIAS.items():
+        assert bot_con_musica.get_command(alias).name == nombre
+
+    assert {c.name for c in bot_con_musica.tree.get_commands()} == HIBRIDOS
+
+
+def test_nombres_y_descripciones_respetan_los_limites_de_discord():
+    nombre_valido = re.compile(r"[a-z0-9_-]{1,32}")
+    for comando in Music.__cog_commands__:
+        if comando.name not in HIBRIDOS:
+            continue
+        app = comando.app_command
+        assert nombre_valido.fullmatch(app.name), app.name
+        assert 1 <= len(app.description) <= 100 and app.description != "…", app.name
+        for parametro in app.parameters:
+            assert nombre_valido.fullmatch(parametro.name), (app.name, parametro.name)
+            assert 1 <= len(parametro.description) <= 100 and parametro.description != "…", (app.name, parametro.name)
+            assert all(len(c.name) <= 100 and len(str(c.value)) <= 100 for c in parametro.choices)
+
+
+def test_solo_query_de_play_y_playnext_se_autocompleta():
+    autocompletados = {
+        (c.name, p.name) for c in Music.__cog_commands__ if c.name in HIBRIDOS
+        for p in c.app_command.parameters if p.autocomplete
+    }
+
+    assert autocompletados == {("play", "query"), ("playnext", "query")}
+
+
+# --- `defer`: Discord da 3 s para contestar a una interacción ---------------------
+
+@pytest.mark.parametrize("comando, args", [
+    ("play", {"query": "algo"}), ("playnext", {"query": "algo"}), ("lyrics_cmd", {}), ("stop", {}), ("panel_cmd", {}),
+])
+async def test_los_comandos_lentos_difieren_la_respuesta_antes_de_hacer_nada(cog, monkeypatch, comando, args):
+    ctx = FakeCtx()
+
+    async def _sin_voz(self, ctx):
+        ctx.eventos.append("voz")
+
+    monkeypatch.setattr(Music, "_connect_voice", _sin_voz)
+
+    await getattr(cog, comando)(cog, ctx, **args)
+
+    assert ctx.eventos[0] == "defer"
+    if comando in ("play", "playnext"):
+        assert ctx.eventos == ["defer", "voz"]
+
+
+async def test_defer_con_prefijo_no_hace_nada_y_con_barra_difiere_la_interaccion():
+    """Lo que se da por hecho de discord.py: `Context.defer` es un no-op sin interacción."""
+    pedidos = []
+
+    async def _defer(*, ephemeral):
+        pedidos.append(ephemeral)
+
+    con_prefijo = commands.Context(message=SimpleNamespace(_state=None), bot=None, view=None)
+    con_barra = commands.Context(message=SimpleNamespace(_state=None), bot=None, view=None)
+    con_barra.interaction = SimpleNamespace(response=SimpleNamespace(defer=_defer))
+
+    await con_prefijo.defer()
+    assert pedidos == []
+
+    await con_barra.defer(ephemeral=True)
+    assert pedidos == [True]
+
+
+@pytest.mark.parametrize("interaccion, avisa", [(object(), True), (None, False)])
+async def test_con_barra_un_tema_que_arranca_directo_cierra_la_respuesta_diferida(cog, monkeypatch, interaccion, avisa):
+    """Con prefijo el panel ya es el aviso; con `/` la interacción en "pensando…" tiene que terminar en un mensaje."""
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", buscador([FakeTrack("única")]))
+    for comando in ("play", "playnext"):
+        vc = FakePlayer(playing=False)
+        ctx = FakeCtx(vc, interaction=interaccion)
+        monkeypatch.setattr(Music, "_connect_voice", lambda self, ctx, vc=vc: _listo(vc))
+
+        await getattr(cog, comando)(cog, ctx, query="única")
+
+        assert [t.title for t in vc.tocando] == ["única"]
+        assert ctx.enviados == (["▶️ **única**"] if avisa else [])
+
+
+@pytest.mark.parametrize("interaccion, avisa", [(object(), True), (None, False)])
+async def test_con_barra_el_panel_responde_aunque_se_publique_en_el_canal(cog, monkeypatch, interaccion, avisa):
+    publicados = []
+
+    async def _panel(self, guild, vc):
+        publicados.append(vc)
+
+    monkeypatch.setattr(Music, "_post_panel", _panel)
+    vc = FakePlayer(playing=True)
+    vc.current = FakeTrack()
+    ctx = FakeCtx(vc, interaction=interaccion)
+
+    await cog.panel_cmd(cog, ctx)
+
+    assert publicados == [vc]
+    assert ctx.enviados == (["Panel publicado."] if avisa else [])
+
+
+async def test_dj_acepta_volumen_como_alias_de_vol(cog):
+    ctx = FakeCtx()
+
+    await cog.dj_cmd(cog, ctx, "volumen", "50")
+
+    assert cog.dj.volume == 50
+
+
+# --- los checks también corren con `/` --------------------------------------------
+
+async def test_con_barra_el_cog_check_sigue_negando_los_mensajes_directos(bot_con_musica):
+    ctx = _ctx_de_barra(bot_con_musica)
+    ctx.guild = None
+
+    for nombre in ("play", "queue", "skip"):
+        with pytest.raises(commands.NoPrivateMessage):
+            await bot_con_musica.get_command(nombre).can_run(ctx)
+
+
+async def test_con_barra_los_controles_siguen_siendo_de_quien_escucha(bot_con_musica):
+    vc = FakePlayer()
+    afuera = _ctx_de_barra(bot_con_musica, vc, FakeAuthor(channel="otro-canal"))
+    adentro = _ctx_de_barra(bot_con_musica, vc, FakeAuthor(channel="canal-de-voz"))
+
+    for nombre in CON_CONTROL:
+        comando = bot_con_musica.get_command(nombre)
+        with pytest.raises(commands.CheckFailure, match="mismo canal"):
+            await comando.can_run(afuera)
+        assert await comando.can_run(adentro)
+
+
+# --- autocompletado de /play y /playnext ------------------------------------------
+
+class FakeResultado:
+    """Lo que el autocompletado lee de cada tema que devuelve la búsqueda."""
+
+    def __init__(self, titulo="Never Gonna Give You Up", autor="Rick Astley", largo=225_000,
+                 uri="https://www.youtube.com/watch?v=dQw4w9WgXcQ", en_vivo=False):
+        self.title, self.author, self.length, self.uri, self.is_stream = titulo, autor, largo, uri, en_vivo
+
+
+def _buscador_que_anota(monkeypatch, resultado):
+    """Cambia `Playable.search` y devuelve la lista donde anota cada consulta."""
+    consultas = []
+
+    async def _search(query, *a, **kw):
+        consultas.append(query)
+        if isinstance(resultado, Exception):
+            raise resultado
+        return resultado
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _search)
+    return consultas
+
+
+@pytest.mark.parametrize("texto", ["", "  ", "a", "ab", "  ab  "])
+async def test_con_menos_de_tres_caracteres_no_se_busca_ni_se_sugiere(cog, monkeypatch, texto):
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    assert await cog.buscar_sugerencias(texto) == []
+    assert consultas == []
+
+
+async def test_una_url_se_ofrece_tal_cual_sin_buscar(cog, monkeypatch):
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+    url = "https://www.youtube.com/watch?v=abc"
+
+    opciones = await cog.buscar_sugerencias(f"  {url} ")
+
+    assert [(o.name, o.value) for o in opciones] == [(url, url)]
+    assert consultas == []
+
+
+async def test_una_url_que_no_cabe_en_una_opcion_no_ofrece_nada(cog, monkeypatch):
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    assert await cog.buscar_sugerencias("https://www.youtube.com/playlist?list=" + "a" * 100) == []
+    assert consultas == []
+
+
+async def test_cada_opcion_es_artista_titulo_y_duracion_con_la_url_como_valor(cog, monkeypatch):
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado(), FakeResultado("Otro", "Alguien", 61_000, "https://youtu.be/x")])
+
+    opciones = await cog.buscar_sugerencias("never gonna")
+
+    assert [(o.name, o.value) for o in opciones] == [
+        ("Rick Astley – Never Gonna Give You Up (3:45)", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+        ("Alguien – Otro (1:01)", "https://youtu.be/x"),
+    ]
+    assert consultas == ["never gonna"]
+
+
+async def test_un_nombre_largo_se_recorta_a_100_sin_perder_la_duracion(cog, monkeypatch):
+    _buscador_que_anota(monkeypatch, [FakeResultado(titulo="T" * 300)])
+
+    (opcion,) = await cog.buscar_sugerencias("titulo largo")
+
+    assert len(opcion.name) == 100
+    assert opcion.name.startswith("Rick Astley – TTT") and opcion.name.endswith("… (3:45)")
+
+
+@pytest.mark.parametrize("uri", [None, "", "https://www.youtube.com/watch?v=" + "a" * 100])
+async def test_si_la_url_no_existe_o_no_cabe_el_valor_es_el_titulo(cog, monkeypatch, uri):
+    _buscador_que_anota(monkeypatch, [FakeResultado(uri=uri)])
+
+    (opcion,) = await cog.buscar_sugerencias("never gonna")
+
+    assert opcion.value == "Never Gonna Give You Up"
+
+
+async def test_el_valor_nunca_pasa_de_100_aunque_el_titulo_sea_enorme(cog, monkeypatch):
+    _buscador_que_anota(monkeypatch, [FakeResultado(titulo="T" * 300, uri=None)])
+
+    (opcion,) = await cog.buscar_sugerencias("titulo largo")
+
+    assert opcion.value == "T" * 100
+
+
+async def test_sin_artista_el_nombre_es_el_titulo_y_un_directo_no_lleva_duracion(cog, monkeypatch):
+    _buscador_que_anota(monkeypatch, [FakeResultado("Radio", "", 9_000_000_000, en_vivo=True), FakeResultado("Sin largo", "X", 0)])
+
+    opciones = await cog.buscar_sugerencias("radio")
+
+    assert [o.name for o in opciones] == ["Radio (en vivo)", "X – Sin largo"]
+
+
+async def test_hay_como_mucho_25_opciones_y_se_saltan_los_temas_sin_titulo(cog, monkeypatch):
+    resultados = [FakeResultado(titulo="")] + [FakeResultado(titulo=f"Tema {i}") for i in range(40)]
+    _buscador_que_anota(monkeypatch, resultados)
+
+    opciones = await cog.buscar_sugerencias("tema")
+
+    assert len(opciones) == 25
+    assert opciones[0].name.startswith("Rick Astley – Tema 0")
+
+
+async def test_una_playlist_no_se_sugiere(cog, monkeypatch):
+    lista = wavelink.Playlist.__new__(wavelink.Playlist)
+    lista.name, lista.tracks = "Una lista", [FakeResultado()]
+    _buscador_que_anota(monkeypatch, lista)
+
+    assert await cog.buscar_sugerencias("una lista") == []
+
+
+@pytest.fixture
+def reloj_de_sugerencias(monkeypatch):
+    """`time.monotonic` del cog, que solo avanza cuando uno lo empuja."""
+    marca = {"t": 1000.0}
+    monkeypatch.setattr(music_mod, "time", SimpleNamespace(monotonic=lambda: marca["t"]))
+
+    def avanzar(segundos):
+        marca["t"] += segundos
+
+    return avanzar
+
+
+async def test_la_misma_busqueda_sale_de_la_cache_hasta_que_vence(cog, monkeypatch, reloj_de_sugerencias):
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    primera = await cog.buscar_sugerencias("Never Gonna")
+    reloj_de_sugerencias(music_mod.SUGERENCIAS_VIGENCIA - 1)
+    otra = await cog.buscar_sugerencias("  never gonna ")
+
+    assert consultas == ["Never Gonna"]
+    assert otra == primera
+
+    reloj_de_sugerencias(2)
+    await cog.buscar_sugerencias("never gonna")
+
+    assert consultas == ["Never Gonna", "never gonna"]
+
+
+async def test_una_busqueda_sin_resultados_no_se_guarda(cog, monkeypatch, reloj_de_sugerencias):
+    consultas = _buscador_que_anota(monkeypatch, [])
+
+    await cog.buscar_sugerencias("nada de nada")
+    await cog.buscar_sugerencias("nada de nada")
+
+    assert len(consultas) == 2 and cog._sugerencias == {}
+
+
+async def test_la_cache_tiene_tope_y_suelta_primero_lo_mas_viejo(cog, monkeypatch, reloj_de_sugerencias):
+    monkeypatch.setattr(music_mod, "SUGERENCIAS_EN_CACHE", 2)
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    for texto in ("uno", "dos", "tres"):
+        await cog.buscar_sugerencias(texto)
+
+    assert list(cog._sugerencias) == ["dos", "tres"]
+    await cog.buscar_sugerencias("uno")
+    assert consultas == ["uno", "dos", "tres", "uno"]
+
+
+async def test_lo_vencido_se_limpia_al_guardar_algo_nuevo(cog, monkeypatch, reloj_de_sugerencias):
+    _buscador_que_anota(monkeypatch, [FakeResultado()])
+    await cog.buscar_sugerencias("viejo")
+
+    reloj_de_sugerencias(music_mod.SUGERENCIAS_VIGENCIA + 1)
+    await cog.buscar_sugerencias("nuevo")
+
+    assert list(cog._sugerencias) == ["nuevo"]
+
+
+async def test_si_lavalink_tarda_mas_del_plazo_no_hay_opciones(cog, monkeypatch):
+    async def _lenta(query, *a, **kw):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _lenta)
+    monkeypatch.setattr(music_mod, "SUGERENCIAS_ESPERA", 0.01)
+
+    assert await asyncio.wait_for(cog.buscar_sugerencias("tema lento"), 1) == []
+    assert cog._sugerencias == {}
+
+
+@pytest.mark.parametrize("error", [wavelink.InvalidNodeException("sin nodo"), RuntimeError("se cayó")])
+async def test_si_la_busqueda_falla_no_hay_opciones_y_nada_se_rompe(cog, monkeypatch, error):
+    _buscador_que_anota(monkeypatch, error)
+
+    assert await cog.buscar_sugerencias("tema roto") == []
+
+
+async def test_el_autocompletado_de_barra_busca_en_un_servidor_permitido(cog, monkeypatch):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({7}))
+    _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    opciones = await cog.autocompletar_busqueda(SimpleNamespace(guild_id=7), "never gonna")
+
+    assert [o.name for o in opciones] == ["Rick Astley – Never Gonna Give You Up (3:45)"]
+
+
+@pytest.mark.parametrize("permitidos, guild_id", [(frozenset({7}), 8), (frozenset(), None), (frozenset({7}), None)])
+async def test_el_autocompletado_no_busca_para_un_servidor_ajeno_ni_por_privado(cog, monkeypatch, permitidos, guild_id):
+    """Discord no pasa el autocompletado por los checks: el de servidores tiene que repetirse aquí."""
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", permitidos)
+    consultas = _buscador_que_anota(monkeypatch, [FakeResultado()])
+
+    assert await cog.autocompletar_busqueda(SimpleNamespace(guild_id=guild_id), "never gonna") == []
+    assert consultas == []

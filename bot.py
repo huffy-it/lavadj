@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -29,6 +30,8 @@ bot = commands.Bot(command_prefix=config.PREFIX, intents=intents)
 bot.resolver = Resolver()
 # Lo guardado en disco se retoma solo cuando el nodo queda listo por primera vez.
 guardadas_retomadas = False
+# El árbol de comandos de barra se sincroniza una sola vez por proceso.
+comandos_sincronizados = False
 
 
 class ServidorNoPermitido(commands.CheckFailure):
@@ -78,11 +81,33 @@ def avisar_lista_blanca(guilds) -> None:
             )
 
 
+async def sincronizar_comandos() -> None:
+    """Registra los comandos de barra en Discord, una sola vez por proceso; un fallo se anota y el bot sigue.
+
+    Con lista blanca se copian a cada servidor, donde aparecen al instante; sin ella son globales y pueden tardar en verse.
+    """
+    global comandos_sincronizados
+    if comandos_sincronizados:
+        return
+    comandos_sincronizados = True
+    for servidor in [discord.Object(id=g) for g in sorted(config.SERVIDORES_PERMITIDOS)] or [None]:
+        donde = f"en el servidor {servidor.id}" if servidor else "de forma global (pueden tardar en aparecer)"
+        try:
+            if servidor:
+                bot.tree.copy_global_to(guild=servidor)
+            comandos = await bot.tree.sync(guild=servidor)
+        except Exception:  # noqa: BLE001 - sin `/` el bot sigue sirviendo los comandos con prefijo
+            log.exception("No pude registrar los comandos de barra %s", donde)
+            continue
+        log.info("Comandos de barra: %s registrados %s", len(comandos), donde)
+
+
 @bot.event
 async def on_ready():
     log.info('Bot listo: %s (ID: %s)', bot.user, bot.user.id)
     print(f'Bot listo: {bot.user} (ID: {bot.user.id})')
     avisar_lista_blanca(bot.guilds)
+    await sincronizar_comandos()
 
 
 @bot.event
@@ -140,10 +165,11 @@ async def on_wavelink_inactive_player(player: wavelink.Player):
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # `ephemeral`: con `/` el aviso lo ve solo quien escribió; con prefijo se ignora.
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Falta un argumento: `{error.param.name}`")
+        await ctx.send(f"Falta un argumento: `{error.param.name}`", ephemeral=True)
     elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"Argumento inválido: {error}")
+        await ctx.send(f"Argumento inválido: {error}", ephemeral=True)
     elif isinstance(error, ServidorNoPermitido):
         # En silencio y antes de la rama de CheckFailure, que sí contesta: a un
         # servidor ajeno no hay nada que explicarle, y contestar sería hacer ruido.
@@ -151,12 +177,15 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     elif isinstance(error, (commands.NoPrivateMessage, commands.CheckFailure)):
         # El texto lo pone quien rechaza (cog_check, en_el_mismo_canal): son
         # mensajes escritos para que los lea un humano.
-        await ctx.send(str(error) or "No puedes usar ese comando aquí.")
+        await ctx.send(str(error) or "No puedes usar ese comando aquí.", ephemeral=True)
     elif not isinstance(error, commands.CommandNotFound):
+        if ctx.interaction:   # sin respuesta, el "pensando…" de Discord se queda colgado
+            with contextlib.suppress(discord.HTTPException):
+                await ctx.send("Algo falló de mi lado. Prueba de nuevo.", ephemeral=True)
         raise error
 
 
-@bot.command(name='refresh')
+@bot.hybrid_command(name='refresh', description="Vence los titulares del DJ para que baje noticias nuevas")
 async def refresh_news(ctx: commands.Context):
     """Vence la caché de titulares: el DJ baja noticias nuevas en el próximo corte."""
     tocadas = invalidate_feeds()

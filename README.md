@@ -182,13 +182,13 @@ Windows lo fuerza `lavalink.ps1`).
    crea una aplicación, añade un **Bot** y copia su token a `DISCORD_TOKEN`.
 2. En la pestaña **Bot**, activa el intent privilegiado **Message Content
    Intent**. Sin él el bot no puede leer los comandos con prefijo.
-3. Genera la invitación en **OAuth2 > URL Generator** con el scope `bot` y estos
+3. Genera la invitación en **OAuth2 > URL Generator** con los scopes `bot` y `applications.commands` y estos
    permisos: ver canales, enviar mensajes, insertar enlaces, leer el historial,
    añadir reacciones (`!search` las usa), conectar y hablar.
 4. Abre la URL e invita el bot a tu servidor.
 
 El bot no usa ningún otro intent privilegiado (solo los intents por defecto más
-el contenido de mensajes).
+el contenido de mensajes, que solo necesitan los comandos con prefijo: los `/` no lo usan).
 
 **Para que solo funcione en tus servidores**, pon sus IDs en
 `SERVIDORES_PERMITIDOS` (activa el modo desarrollador de Discord y usa *Copiar ID
@@ -204,6 +204,10 @@ enlace de instalación.
 ## Comandos de Discord
 
 El prefijo por defecto es `!` (se cambia con `PREFIX`). `!help` lista todos.
+Todos funcionan también como comandos de barra (`/play`, `/skip`...), menos
+`!search`, que elige con reacciones y solo existe con prefijo. `/play` y
+`/playnext` autocompletan: mientras escribes, el bot busca en YouTube Music y
+ofrece hasta 25 temas (con una URL pegada no hace falta elegir nada).
 
 | Comando | Alias | Qué hace |
 |---|---|---|
@@ -227,6 +231,12 @@ El prefijo por defecto es `!` (se cambia con `PREFIX`). `!help` lista todos.
 | `!dj on\|off` | | Enciende o apaga el DJ |
 | `!dj vol [0-200]` | | Muestra o ajusta el volumen de la voz del DJ (0 = mudo) |
 | `!refresh` | | Vence los titulares del DJ; se rebajan en el próximo corte |
+
+**Si los `/` no aparecen**, reinvita al bot con el permiso `applications.commands`
+(paso 3 de la invitación): sin él Discord no deja registrarlos. El bot los registra
+al arrancar: en cada servidor de `SERVIDORES_PERMITIDOS` (aparecen al instante) o,
+con la lista vacía, de forma global, y esto puede tardar en verse. El log dice
+cuántos registró y dónde.
 
 Los comandos de música no funcionan por mensaje directo. Pausa, reanudar, saltar,
 parar, loop, shuffle, volumen y quitar exigen estar en el mismo canal de voz que

@@ -6,6 +6,7 @@ import logging
 import sys
 from types import SimpleNamespace
 
+import discord
 import pytest
 from discord.ext import commands
 
@@ -251,13 +252,22 @@ def _servidor(id_, nombre="Servidor"):
 
 def _ctx(guild_id):
     """Un contexto de mentira: `guild_id=None` es un mensaje directo."""
-    enviados = []
+    enviados, opciones = [], []
 
-    async def send(texto):
+    async def send(texto, **kwargs):
         enviados.append(texto)
+        opciones.append(kwargs)
 
     guild = None if guild_id is None else SimpleNamespace(id=guild_id)
-    return SimpleNamespace(guild=guild, send=send, enviados=enviados)
+    return SimpleNamespace(guild=guild, send=send, enviados=enviados, opciones=opciones, interaction=None)
+
+
+def _ctx_de_barra(bot_mod, guild_id):
+    """Como `_ctx`, pero con el `interaction` que hace que discord.py corra los checks por el camino de `/`."""
+    ctx = _ctx(guild_id)
+    ctx.interaction = SimpleNamespace(client=bot_mod.bot)
+    ctx.interaction._baton = ctx
+    return ctx
 
 
 @pytest.mark.parametrize("crudo, validos, invalidos", [
@@ -444,3 +454,160 @@ def test_on_ready_avisa_de_los_servidores_ajenos_sin_salirse(bot_mod, monkeypatc
     assert "Propio" not in caplog.text
     # Un ID mal escrito no puede hacer que el bot abandone el servidor del dueño.
     assert propio.salidas == [] and ajeno.salidas == []
+
+
+# --- comandos de barra ---------------------------------------------------------
+
+class ArbolFalso:
+    """Lo único que bot.py le pide al árbol de comandos: copiar lo global a un servidor y sincronizar."""
+
+    def __init__(self, fallan=()):
+        self.copiados, self.sincronizados, self.fallan = [], [], set(fallan)
+
+    def copy_global_to(self, *, guild):
+        self.copiados.append(guild.id)
+
+    async def sync(self, *, guild=None):
+        destino = guild.id if guild else None
+        if destino in self.fallan:
+            raise RuntimeError("403 Missing Access")
+        self.sincronizados.append(destino)
+        return [object()] * 17
+
+
+def _con_arbol(bot_mod, monkeypatch, arbol, permitidos=()):
+    monkeypatch.setattr(bot_mod, "bot", SimpleNamespace(tree=arbol, user=SimpleNamespace(id=1), guilds=[]))
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset(permitidos))
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
+
+
+async def test_con_lista_blanca_se_copia_y_se_sincroniza_en_cada_servidor(bot_mod, monkeypatch, caplog):
+    arbol = ArbolFalso()
+    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={2, 1})
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.sincronizar_comandos()
+
+    assert arbol.copiados == [1, 2]
+    assert arbol.sincronizados == [1, 2]
+    assert "17 registrados en el servidor 1" in caplog.text and "17 registrados en el servidor 2" in caplog.text
+
+
+async def test_sin_lista_blanca_la_sincronizacion_es_global(bot_mod, monkeypatch, caplog):
+    arbol = ArbolFalso()
+    _con_arbol(bot_mod, monkeypatch, arbol)
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.sincronizar_comandos()
+
+    assert arbol.copiados == []
+    assert arbol.sincronizados == [None]
+    assert "17 registrados de forma global" in caplog.text and "tardar" in caplog.text
+
+
+async def test_los_comandos_de_barra_se_sincronizan_una_sola_vez_aunque_on_ready_se_repita(bot_mod, monkeypatch):
+    arbol = ArbolFalso()
+    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={1})
+
+    for _ in range(3):
+        await bot_mod.on_ready()
+
+    assert arbol.sincronizados == [1]
+
+
+async def test_un_error_al_sincronizar_no_tumba_al_bot_ni_a_los_demas_servidores(bot_mod, monkeypatch, caplog):
+    arbol = ArbolFalso(fallan={1})
+    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={1, 2})
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.sincronizar_comandos()
+
+    assert arbol.sincronizados == [2]
+    assert "No pude registrar los comandos de barra en el servidor 1" in caplog.text
+    assert "17 registrados en el servidor 2" in caplog.text
+
+
+async def test_un_error_en_la_sincronizacion_global_tampoco_tumba_al_bot(bot_mod, monkeypatch, caplog):
+    _con_arbol(bot_mod, monkeypatch, ArbolFalso(fallan={None}))
+
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.on_ready()
+
+    assert "No pude registrar los comandos de barra de forma global" in caplog.text
+
+
+def test_refresh_tambien_es_un_comando_de_barra(bot_mod):
+    comando = bot_mod.bot.get_command("refresh")
+
+    assert isinstance(comando, commands.HybridCommand)
+    assert bot_mod.bot.tree.get_command("refresh") is comando.app_command
+    assert 1 <= len(comando.app_command.description) <= 100
+
+
+async def test_el_check_global_tambien_corta_un_comando_de_barra_de_un_servidor_ajeno(bot_mod, monkeypatch):
+    """Con `/`, discord.py corre los checks del bot por otro camino (`HybridAppCommand._check_can_run`)."""
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    refresh = bot_mod.bot.get_command("refresh")
+
+    with pytest.raises(bot_mod.ServidorNoPermitido):
+        await refresh.can_run(_ctx_de_barra(bot_mod, 2))
+
+    assert await refresh.can_run(_ctx_de_barra(bot_mod, 1))
+    assert await refresh.can_run(_ctx_de_barra(bot_mod, None))
+
+
+@pytest.mark.parametrize("error", [
+    commands.MissingRequiredArgument(SimpleNamespace(name="query", displayed_name=None)),
+    commands.BadArgument("no es un número"),
+    commands.CheckFailure("Tienes que estar en el mismo canal de voz que yo."),
+    commands.NoPrivateMessage("Los comandos de música funcionan en un servidor."),
+])
+async def test_los_avisos_de_error_son_efimeros_con_barra_y_normales_con_prefijo(bot_mod, error):
+    de_barra = _ctx_de_barra(bot_mod, 1)
+    con_prefijo = _ctx(1)
+
+    await bot_mod.on_command_error(de_barra, error)
+    await bot_mod.on_command_error(con_prefijo, error)
+
+    assert de_barra.enviados == con_prefijo.enviados and len(de_barra.enviados) == 1
+    assert de_barra.opciones == [{"ephemeral": True}]
+
+
+async def test_un_servidor_no_permitido_sigue_mudo_tambien_con_barra(bot_mod):
+    ctx = _ctx_de_barra(bot_mod, 2)
+
+    await bot_mod.on_command_error(ctx, bot_mod.ServidorNoPermitido())
+
+    assert ctx.enviados == []
+
+
+async def test_un_error_inesperado_con_barra_avisa_a_quien_escribio_y_se_propaga(bot_mod):
+    """Sin respuesta, el "pensando…" de una interacción diferida se queda colgado hasta que Discord la da por perdida."""
+    ctx = _ctx_de_barra(bot_mod, 1)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await bot_mod.on_command_error(ctx, RuntimeError("boom"))
+
+    assert ctx.enviados == ["Algo falló de mi lado. Prueba de nuevo."]
+    assert ctx.opciones == [{"ephemeral": True}]
+
+
+async def test_un_error_inesperado_con_prefijo_se_propaga_sin_decir_nada(bot_mod):
+    ctx = _ctx(1)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await bot_mod.on_command_error(ctx, RuntimeError("boom"))
+
+    assert ctx.enviados == []
+
+
+async def test_si_el_aviso_de_error_tampoco_se_puede_enviar_se_propaga_el_error_original(bot_mod):
+    ctx = _ctx_de_barra(bot_mod, 1)
+
+    async def _send_roto(texto, **kwargs):
+        raise discord.HTTPException(SimpleNamespace(status=500, reason="boom"), "no se pudo")
+
+    ctx.send = _send_roto
+
+    with pytest.raises(RuntimeError, match="original"):
+        await bot_mod.on_command_error(ctx, RuntimeError("original"))

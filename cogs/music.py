@@ -4,6 +4,7 @@ import time
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 import wavelink
 
@@ -47,6 +48,14 @@ PISO_DE_REVISION = 0.25
 # Lavalink reporta la posición cada 5 s; con un reporte más viejo (tras una pausa larga) no se extrapola.
 REPORTE_VIGENTE_MS = 6000
 
+# Autocompletado de /play y /playnext. Discord da 3 s para contestar y recorta a 100 caracteres y 25 opciones.
+SUGERENCIAS_MIN = 3
+SUGERENCIAS_MAX = 25
+SUGERENCIAS_ESPERA = 2.5
+SUGERENCIAS_VIGENCIA = 300
+SUGERENCIAS_EN_CACHE = 64
+LARGO_DISCORD = 100
+
 
 def en_el_mismo_canal():
     """Los controles son de quien está escuchando, no de cualquiera del server.
@@ -74,6 +83,25 @@ def format_duration(milliseconds: int) -> str:
     mins, secs = divmod(seconds, 60)
     return f"{mins}:{secs:02d}"
 
+
+def es_url(texto: str) -> bool:
+    return texto.lower().startswith(("http://", "https://"))
+
+
+def opcion_de(pista: wavelink.Playable) -> app_commands.Choice[str] | None:
+    """Una sugerencia "Artista – Título (3:45)"; vale la URL del tema si cabe en el límite de Discord, si no el título."""
+    titulo = (pista.title or "").strip()
+    if not titulo:
+        return None
+    autor = (pista.author or "").strip()
+    duracion = " (en vivo)" if pista.is_stream else f" ({format_duration(pista.length)})" if pista.length else ""
+    nombre = f"{autor} – {titulo}" if autor else titulo
+    if len(nombre) + len(duracion) > LARGO_DISCORD:
+        nombre = nombre[:LARGO_DISCORD - len(duracion) - 1] + "…"
+    uri = pista.uri or ""
+    return app_commands.Choice(name=nombre + duracion, value=uri if uri and len(uri) <= LARGO_DISCORD else titulo[:LARGO_DISCORD])
+
+
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -81,6 +109,8 @@ class Music(commands.Cog):
         self._estaciones: dict[int, Estacion] = {}
         # Una preferencia del servidor, no estado de la transmisión: sobrevive a `teardown`.
         self._autoplay: dict[int, bool] = {}
+        # Lo ya buscado para el autocompletado: texto -> (vence, opciones). Mientras se teclea se repiten las consultas.
+        self._sugerencias: dict[str, tuple[float, list[app_commands.Choice[str]]]] = {}
         # Referencias fuertes a las tareas de fondo: el loop solo guarda
         # referencias débiles y una tarea sin dueño puede recolectarse a medias.
         self._tareas: set[asyncio.Task] = set()
@@ -322,7 +352,7 @@ class Music(commands.Cog):
         return 0
 
     @staticmethod
-    def _posicion_viva(vc: wavelink.Player) -> int:
+    def posicion_viva(vc: wavelink.Player) -> int:
         """Ms por donde va el tema ahora, sin adelantarse nunca a lo que Lavalink contó.
 
         Entre reportes suma el tiempo corrido, pero no si está en pausa ni con un reporte viejo:
@@ -364,7 +394,7 @@ class Music(commands.Cog):
         yo = asyncio.current_task()
         try:
             while True:
-                posicion = self._posicion_viva(vc)
+                posicion = self.posicion_viva(vc)
                 if vc.current is not pista or not vc.connected or posicion >= segmento.fin:
                     return
                 falta = (segmento.inicio - posicion) / 1000
@@ -820,9 +850,11 @@ class Music(commands.Cog):
             pista.requester = datos[persistencia.PEDIDO_POR]
         return pista
 
-    @commands.command(name='play', aliases=['p'])
+    @commands.hybrid_command(name='play', aliases=['p'], description="Reproduce o encola un tema, una URL, una playlist o un link de Spotify")
+    @app_commands.describe(query="Título, artista, URL de YouTube o link de Spotify")
     async def play(self, ctx: commands.Context, *, query: str):
         """Reproduce o encola una canción, una URL, una playlist o un link de Spotify."""
+        await ctx.defer()
         vc = await self._connect_voice(ctx)
         if not vc:
             return
@@ -860,12 +892,16 @@ class Music(commands.Cog):
                 await vc.queue.put_wait(track)
                 if self._ocupado(vc):
                     await ctx.send(f"Cola #{len(vc.queue)}: **{track.title}**")
+                elif ctx.interaction:   # con `/` la respuesta diferida tiene que cerrarse con un mensaje
+                    await ctx.send(f"▶️ **{track.title}**")
 
             await self._arrancar_si_hace_falta(vc)
 
-    @commands.command(name='playnext', aliases=['pn', 'next'])
+    @commands.hybrid_command(name='playnext', aliases=['pn', 'next'], description="Mete un tema al principio de la cola: es el próximo en sonar")
+    @app_commands.describe(query="Título, artista, URL de YouTube o link de Spotify (de una lista se toma el primero)")
     async def playnext(self, ctx: commands.Context, *, query: str):
         """Mete la canción al principio de la cola: es la próxima en sonar."""
+        await ctx.defer()
         vc = await self._connect_voice(ctx)
         if not vc:
             return
@@ -897,6 +933,8 @@ class Music(commands.Cog):
 
         if not self._ocupado(vc):
             await vc.queue.put_wait(track)
+            if ctx.interaction:
+                await ctx.send(f"▶️ **{track.title}**")
             return await self._arrancar_si_hace_falta(vc)
 
         # Al frente de todo, incluso de un corte del DJ que ya esté esperando:
@@ -904,6 +942,42 @@ class Music(commands.Cog):
         # segunda.
         vc.queue.put_at(0, track)
         await ctx.send(f"🔝 La próxima: **{track.title}**")
+
+    # --- autocompletado de /play y /playnext -----------------------------------------
+    async def buscar_sugerencias(self, texto: str) -> list[app_commands.Choice[str]]:
+        """Temas de YouTube Music para el autocompletado. No lanza: si Lavalink tarda o falla, no hay opciones."""
+        texto = texto.strip()
+        if len(texto) < SUGERENCIAS_MIN:
+            return []
+        if es_url(texto):   # Discord deja mandar lo escrito aunque no sea una opción; esta solo evita el "sin resultados"
+            return [app_commands.Choice(name=texto, value=texto)] if len(texto) <= LARGO_DISCORD else []
+        clave, ahora = texto.casefold(), time.monotonic()
+        guardada = self._sugerencias.get(clave)
+        if guardada and guardada[0] > ahora:
+            return guardada[1]
+        try:
+            tracks = await asyncio.wait_for(wavelink.Playable.search(texto), SUGERENCIAS_ESPERA)
+        except Exception:  # noqa: BLE001 - sin nodo, Lavalink caído o plazo vencido: sin opciones y ya
+            log.debug("Sin sugerencias para %r", texto, exc_info=True)
+            return []
+        if isinstance(tracks, wavelink.Playlist):
+            return []
+        opciones = [o for o in map(opcion_de, tracks) if o][:SUGERENCIAS_MAX]
+        if opciones:
+            self._sugerencias = {k: v for k, v in self._sugerencias.items() if v[0] > ahora}
+            while len(self._sugerencias) >= SUGERENCIAS_EN_CACHE:
+                del self._sugerencias[next(iter(self._sugerencias))]
+            self._sugerencias[clave] = (ahora + SUGERENCIAS_VIGENCIA, opciones)
+        return opciones
+
+    @play.autocomplete("query")
+    @playnext.autocomplete("query")
+    async def autocompletar_busqueda(self, interaction: discord.Interaction, current: str):
+        """Sugerencias mientras se escribe. Discord no pasa el autocompletado por los checks, así que repite el de servidores."""
+        permitidos = config.SERVIDORES_PERMITIDOS
+        if interaction.guild_id is None or (permitidos and interaction.guild_id not in permitidos):
+            return []
+        return await self.buscar_sugerencias(current)
 
     # --- Spotify --------------------------------------------------------------
     async def _play_spotify(self, ctx: commands.Context, vc: wavelink.Player, url: str):
@@ -980,7 +1054,9 @@ class Music(commands.Cog):
         except discord.HTTPException:
             log.debug("no pude avisar el fin de la carga de Spotify", exc_info=True)
 
-    @commands.command(name='autoplay', aliases=['ap'])
+    @commands.hybrid_command(name='autoplay', aliases=['ap'], description="Sigue solo con temas parecidos cuando se acaba la cola")
+    @app_commands.describe(modo="on o off; vacío muestra cómo está")
+    @app_commands.choices(modo=[app_commands.Choice(name="Encender", value="on"), app_commands.Choice(name="Apagar", value="off")])
     async def autoplay_cmd(self, ctx: commands.Context, modo: str = ""):
         """Cuando se acaba la cola, sigue solo con temas parecidos. `!autoplay on|off`."""
         modo = modo.lower()
@@ -1006,6 +1082,7 @@ class Music(commands.Cog):
             else "Autoplay apagado: al final de la cola me quedo callado."
         )
 
+    # Solo con prefijo: elige con reacciones sobre un mensaje, que no encaja con una respuesta de `/`; `/play` ya autocompleta.
     @commands.command(name='search', aliases=['buscar'])
     async def search_cmd(self, ctx: commands.Context, *, query: str):
         """Busca y muestra 5 opciones para elegir con una reacción."""
@@ -1051,36 +1128,37 @@ class Music(commands.Cog):
             await self._arrancar_si_hace_falta(vc)
 
     @en_el_mismo_canal()
-    @commands.command(name='pause')
+    @commands.hybrid_command(name='pause', description="Pausa lo que está sonando")
     async def pause(self, ctx: commands.Context):
         """Pausa lo que esté sonando."""
         msg = await controller.pause(ctx.voice_client)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='resume', aliases=['r'])
+    @commands.hybrid_command(name='resume', aliases=['r'], description="Reanuda lo que estaba pausado")
     async def resume(self, ctx: commands.Context):
         """Reanuda lo que estaba pausado."""
         msg = await controller.resume(ctx.voice_client)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='skip', aliases=['s'])
+    @commands.hybrid_command(name='skip', aliases=['s'], description="Salta a la canción siguiente")
     async def skip(self, ctx: commands.Context):
         """Salta a la canción siguiente."""
         msg = await controller.skip(ctx.voice_client)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='stop')
+    @commands.hybrid_command(name='stop', description="Para todo, vacía la cola y sale del canal de voz")
     async def stop(self, ctx: commands.Context):
         """Para todo, vacía la cola y me salgo del canal."""
+        await ctx.defer()
         if not ctx.voice_client:
             return await ctx.send("No estoy en ningún canal.")
         await self.teardown(ctx.guild)
         await ctx.send("Parado 🛑")
 
-    @commands.command(name='queue', aliases=['q'])
+    @commands.hybrid_command(name='queue', aliases=['q'], description="Muestra la cola de reproducción")
     async def show_queue(self, ctx: commands.Context):
         """Muestra la cola de reproducción."""
         vc: wavelink.Player = ctx.voice_client
@@ -1106,7 +1184,7 @@ class Music(commands.Cog):
         for chunk in split_message("\n".join(lines)):
             await ctx.send(chunk)
 
-    @commands.command(name='nowplaying', aliases=['np'])
+    @commands.hybrid_command(name='nowplaying', aliases=['np'], description="Dice qué canción está sonando")
     async def nowplaying(self, ctx: commands.Context):
         """Dice qué canción está sonando."""
         vc: wavelink.Player = ctx.voice_client
@@ -1120,37 +1198,42 @@ class Music(commands.Cog):
             f"Duración: `{format_duration(t.length)}` — Pedido por: {req}"
         )
 
-    @commands.command(name='panel')
+    @commands.hybrid_command(name='panel', description="Vuelve a publicar el panel de botones")
     async def panel_cmd(self, ctx: commands.Context):
         """Vuelve a postear el panel de botones."""
+        await ctx.defer(ephemeral=True)
         vc: wavelink.Player = ctx.voice_client
         if not vc or not vc.current:
             return await ctx.send("No hay nada reproduciendo.")
         await self._post_panel(ctx.guild, vc)
+        if ctx.interaction:   # el panel va al canal de texto; aquí solo se cierra la respuesta
+            await ctx.send("Panel publicado.")
 
     @en_el_mismo_canal()
-    @commands.command(name='loop', aliases=['l'])
+    @commands.hybrid_command(name='loop', aliases=['l'], description="Activa o desactiva la repetición de la canción actual")
     async def loop_cmd(self, ctx: commands.Context):
         """Enciende o apaga la repetición de la canción actual."""
         msg = await controller.toggle_loop(ctx.voice_client)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='shuffle')
+    @commands.hybrid_command(name='shuffle', description="Mezcla el orden de la cola")
     async def shuffle(self, ctx: commands.Context):
         """Mezcla el orden de la cola."""
         msg = controller.shuffle(ctx.voice_client)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='volume', aliases=['vol'])
+    @commands.hybrid_command(name='volume', aliases=['vol'], description="Ajusta el volumen del bot")
+    @app_commands.describe(vol="Volumen de 0 a 100")
     async def volume(self, ctx: commands.Context, vol: int):
         """Ajusta el volumen, de 0 a 100."""
         msg = await controller.set_volume(ctx.voice_client, vol)
         await ctx.send(msg)
 
     @en_el_mismo_canal()
-    @commands.command(name='remove', aliases=['rm'])
+    @commands.hybrid_command(name='remove', aliases=['rm'], description="Saca de la cola la canción en esa posición")
+    @app_commands.describe(pos="Posición en la cola, empezando por 1")
     async def remove(self, ctx: commands.Context, pos: int):
         """Saca de la cola la canción en esa posición."""
         vc: wavelink.Player = ctx.voice_client
@@ -1163,16 +1246,18 @@ class Music(commands.Cog):
         except IndexError:
             await ctx.send(f"No hay canción en la posición {pos}.")
 
-    @commands.command(name='dj')
-    async def dj_cmd(self, ctx: commands.Context, *args: str):
+    @commands.hybrid_command(name='dj', description="El DJ de radio: habla en el próximo corte, se enciende o apaga, o ajusta su voz")
+    @app_commands.describe(opcion="on, off o vol; vacío hace que hable en el próximo corte", valor="Con vol: volumen de la voz del DJ, de 0 a 200")
+    @app_commands.choices(opcion=[app_commands.Choice(name="Encender", value="on"), app_commands.Choice(name="Apagar", value="off"), app_commands.Choice(name="Volumen de su voz", value="vol")])
+    async def dj_cmd(self, ctx: commands.Context, opcion: str = "", valor: str = ""):
         """El DJ de radio: `!dj` habla en el próximo corte, `!dj on|off` lo enciende o apaga, `!dj vol 0-200` ajusta su voz."""
-        if not args:
+        if not opcion:
             if not self.dj.available():
                 return await ctx.send("El DJ está apagado o falta espeak-ng.")
             self.dj.force(ctx.guild.id)
             return await ctx.send("🎙️ El DJ habla en el próximo corte.")
 
-        opcion = args[0].lower()
+        opcion = opcion.lower()
         if opcion in ("on", "off"):
             if opcion == "on" and not tts.available():
                 return await ctx.send("No puedo: falta `espeak-ng` en el sistema.")
@@ -1180,10 +1265,10 @@ class Music(commands.Cog):
             return await ctx.send(f"DJ {'activado 🎙️' if self.dj.enabled else 'apagado'}")
 
         if opcion in ("vol", "volumen"):
-            if len(args) < 2:
+            if not valor:
                 return await ctx.send(f"La voz del DJ está al **{self.dj.volume}%**. Usa `!dj vol 0-200`.")
             try:
-                pedido = int(args[1])
+                pedido = int(valor)
             except ValueError:
                 return await ctx.send("El volumen del DJ va entre 0 y 200.")
             aplicado = self.dj.set_volume(pedido)
@@ -1195,9 +1280,11 @@ class Music(commands.Cog):
 
         await ctx.send("Uso: `!dj`, `!dj on|off`, `!dj vol 0-200`")
 
-    @commands.command(name='lyrics', aliases=['ly'])
+    @commands.hybrid_command(name='lyrics', aliases=['ly'], description="Busca la letra de la canción actual o de la que indiques")
+    @app_commands.describe(query="Artista - canción; vacío busca la que está sonando")
     async def lyrics_cmd(self, ctx: commands.Context, *, query: str = ""):
         """Busca la letra de la canción actual (o la que le pidas)."""
+        await ctx.defer()
         vc: wavelink.Player = ctx.voice_client
         if not vc or not vc.current and not query:
             return await ctx.send("No hay nada reproduciendo.")

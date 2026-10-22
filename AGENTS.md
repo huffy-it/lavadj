@@ -87,6 +87,9 @@ cambias esa ruta hay que cambiarla en los dos lados o el DJ se queda mudo.
 4. Los tests son async (`asyncio_mode = auto` en `pytest.ini`); no hace falta
    decorar cada test con `@pytest.mark.asyncio`.
 
+5. **Los comandos de música son híbridos** (`!` y `/`): `description` y
+   `app_commands.describe` en español (100 caracteres como máximo), `await ctx.defer()`
+   al empezar si buscan o resuelven (Discord da 3 s) y toda ruta termina en un mensaje.
 ## De dónde sale el audio de YouTube
 
 **Lo resuelve yt-dlp, no Lavalink** (`core/resolver.py`). El plugin
