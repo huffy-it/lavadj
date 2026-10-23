@@ -3,322 +3,499 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LavaDJ</title>
+<meta name="color-scheme" content="dark light">
+<title>LavaDJ · Cabina de radio</title>
 <style>
-  :root { --bg:#14161a; --card:#1e2127; --fg:#e6e8eb; --mut:#8b929c; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; }
-  @media (prefers-color-scheme: light) { :root { --bg:#f4f5f7; --card:#fff; --fg:#1b1f24; --mut:#6a7280; } }
-  * { box-sizing: border-box; }
-  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,sans-serif; }
-  main { max-width:900px; margin:auto; display:grid; gap:12px; }
-  h1 { margin:0 0 4px; font-size:20px; display:flex; align-items:center; gap:10px; }
-  .card { background:var(--card); border-radius:10px; padding:14px 16px; }
-  .card h2 { margin:0 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
-  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); display:inline-block; }
-  .ok { background:var(--ok); } .warn { background:var(--warn); } .bad { background:var(--bad); }
-  .row { display:flex; justify-content:space-between; gap:12px; padding:3px 0; }
-  .row span:first-child { color:var(--mut); }
-  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:7px 14px; font:inherit; cursor:pointer; }
-  button.bad { background:var(--bad); } button:disabled { opacity:.5; }
-  .acciones { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  input[type=range] { flex:1; min-width:120px; }
-  ul { margin:0; padding-left:18px; } li.leido { color:var(--mut); text-decoration:line-through; }
-  pre { margin:0; max-height:300px; overflow:auto; font:12px/1.4 ui-monospace,Consolas,monospace; white-space:pre-wrap; }
-  .pais { margin:10px 0 2px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--mut); }
-  .voz { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px 12px; padding:3px 0; }
-  .voz small { color:var(--mut); } .voz .uso { color:var(--ok); font-weight:600; }
-  .voz .botones { display:flex; gap:6px; align-items:center; }
-  .voz button { padding:3px 10px; } button.sec { background:transparent; color:var(--fg); border:1px solid var(--mut); }
-  .voz progress { width:90px; } .err { color:var(--bad); font-size:13px; }
-  .guion { display:flex; align-items:center; gap:8px; padding:3px 0; } .guion small { color:var(--mut); }
-  .letra summary { cursor:pointer; list-style:none; display:flex; align-items:baseline; gap:8px; }
+  :root { color-scheme:dark; --bg:#171918; --card:#202320; --raised:#2b2f29; --fg:#ebeee4; --mut:#a9b09f; --line:#3b4035; --acc:#f8ba58; --soft:#3c3120; --ok:#a0c5ab; --warn:#f8ba58; --bad:#e8a49b; --radius:5px; }
+  @media (prefers-color-scheme:light) { :root { color-scheme:light; --bg:#efeee9; --card:#faf9f5; --raised:#e6e5df; --fg:#242820; --mut:#64675d; --line:#cfd1c6; --acc:#a95200; --soft:#fff0cf; --ok:#32614b; --warn:#966016; --bad:#9d3e36; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:0 32px 28px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:1180px; margin:0 auto; min-width:0; }
+  h1,h2,h3,p { margin:0; }
+  button,input,select { font:inherit; }
+  button,select,summary { touch-action:manipulation; }
+  button { display:inline-flex; align-items:center; justify-content:center; gap:8px; max-width:100%; padding:10px 14px; border:1px solid var(--line); border-radius:var(--radius); background:var(--card); color:var(--fg); cursor:pointer; line-height:1.4; overflow-wrap:anywhere; }
+  button:hover:not(:disabled) { background:var(--raised); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid var(--acc); outline-offset:4px; }
+  select { width:100%; min-width:0; max-width:100%; padding:9px 32px 9px 10px; border:1px solid var(--line); border-radius:var(--radius); background:var(--card); color:var(--fg); }
+  svg { width:18px; height:18px; flex-shrink:0; }
+  [hidden] { display:none!important; }
+  small,.small { font-size:13px; color:var(--mut); }
+  .mono { font-family:ui-monospace,"Cascadia Code",Consolas,monospace; font-variant-numeric:tabular-nums; }
+  .top { min-height:104px; display:flex; justify-content:space-between; align-items:center; gap:24px; padding:22px 0; border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:13px; }
+  .brand-mark { width:43px; height:43px; display:grid; place-items:center; background:var(--fg); color:var(--bg); border-radius:var(--radius); }
+  .brand-mark svg { width:27px; height:27px; }
+  .brand-name { font-size:25px; font-weight:700; letter-spacing:-1px; line-height:1.2; }
+  .brand-name span { color:var(--acc); }
+  .brand p { margin-top:3px; font-size:13px; color:var(--mut); }
+  #usuario { color:var(--mut); font-size:13px; text-align:right; overflow-wrap:anywhere; min-width:0; }
+  .station-bar { display:flex; flex-wrap:wrap; align-items:center; gap:12px 24px; padding:18px 0; font-size:13px; }
+  .onair { display:inline-flex; align-items:center; gap:9px; color:var(--acc); letter-spacing:.08em; font-weight:600; }
+  .dot { display:inline-block; width:8px; height:8px; flex-shrink:0; border-radius:50%; background:var(--mut); }
+  .dot.ok { background:var(--ok); } .dot.warn { background:var(--warn); } .dot.bad { background:var(--bad); }
+  #canal { min-width:0; overflow-wrap:anywhere; }
+  .station-status { margin-left:auto; color:var(--mut); font-size:12px; }
+  #elegirServidor { display:flex; align-items:center; gap:9px; margin-left:auto; max-width:100%; }
+  #elegirServidor label { font-size:12px; color:var(--mut); }
+  #selectorServidor { max-width:260px; font-size:13px; padding-top:6px; padding-bottom:6px; }
+  .banner { background:var(--soft); border:1px solid var(--line); border-left:3px solid var(--acc); border-radius:var(--radius); padding:14px 17px; margin-bottom:18px; font-size:14px; overflow-wrap:anywhere; }
+  .banner strong { display:block; font-weight:600; margin-bottom:3px; }
+  .grid { display:grid; grid-template-columns:minmax(0,1.75fr) minmax(280px,1fr); gap:16px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); min-width:0; }
+  .section-head { display:flex; align-items:center; justify-content:space-between; gap:15px; padding:16px 21px; border-bottom:1px solid var(--line); min-width:0; }
+  .section-head h2 { display:flex; align-items:center; gap:9px; font-size:12px; font-weight:650; letter-spacing:.08em; text-transform:uppercase; }
+  .now { padding:26px 27px 21px; }
+  .eyebrow { display:flex; align-items:center; gap:8px; color:var(--mut); font-size:12px; text-transform:uppercase; letter-spacing:.1em; }
+  #cancion { font-size:clamp(32px,4vw,48px); letter-spacing:-1.8px; font-weight:580; line-height:1.14; margin:18px 0 13px; overflow-wrap:anywhere; }
+  .queue { display:flex; align-items:center; gap:7px; color:var(--mut); font-size:13px; }
+  #progreso { height:5px; background:var(--raised); border-radius:2px; overflow:hidden; margin:29px 0 9px; }
+  #progresoBarra { height:100%; width:0; background:var(--acc); }
+  .times { display:flex; align-items:center; justify-content:space-between; gap:12px; color:var(--mut); font-size:13px; }
+  #posicion { color:var(--fg); }
+  .radio-actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px 14px; margin-top:21px; }
+  #radio { font-size:13px; background:transparent; }
+  #radio:hover:not(:disabled) { background:var(--raised); }
+  #radioAviso { font-size:13px; overflow-wrap:anywhere; }
+  .lyrics-panel { grid-column:2; grid-row:1 / span 2; display:flex; flex-direction:column; }
+  .letra { min-width:0; flex:1; }
+  .letra summary { display:flex; align-items:center; gap:10px; cursor:pointer; list-style:none; padding:16px 21px; border-bottom:1px solid var(--line); }
   .letra summary::-webkit-details-marker { display:none; }
-  .letra summary::before { content:'▸'; color:var(--mut); font-size:12px; } .letra[open] summary::before { content:'▾'; }
-  .letra summary h2 { margin:0; } .letra summary small { color:var(--mut); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #letraCaja { position:relative; max-height:260px; overflow:auto; margin-top:8px; }
-  #letraCaja p { margin:0; padding:2px 0; }
-  #letraCaja.sync p { color:var(--mut); transition:color .2s; } #letraCaja.sync p.on { color:var(--fg); font-weight:600; }
-  #letraCaja.sync p:empty::before { content:'♪'; } #letraCaja.plana p:empty { height:.8em; }
+  .letra summary::after { content:'+'; color:var(--mut); margin-left:auto; font:18px/1 ui-monospace,Consolas,monospace; }
+  .letra[open] summary::after { content:'−'; }
+  .letra summary h2 { font-size:12px; font-weight:650; letter-spacing:.08em; text-transform:uppercase; }
+  #letraTit { display:block; padding:16px 23px 0; overflow-wrap:anywhere; font-size:12px; color:var(--mut); }
+  #letraTit:empty { display:none; }
+  #letraCaja { position:relative; padding:24px 24px 36px; margin:0; min-height:350px; max-height:580px; overflow-y:auto; overflow-wrap:anywhere; scrollbar-width:thin; scrollbar-color:var(--line) transparent; font-size:21px; line-height:1.65; letter-spacing:-.3px; }
+  #letraCaja p { margin:0; padding:8px 0; }
+  #letraCaja:not(.sync):not(.plana) { font-size:16px; color:var(--mut); }
+  #letraCaja.sync p { color:var(--mut); transition:color .2s; }
+  #letraCaja.sync p.on { color:var(--acc); font-weight:600; border-left:2px solid var(--acc); padding-left:12px; margin-left:-14px; }
+  #letraCaja.sync p:empty::before { content:'♪'; }
+  #letraCaja.plana p:empty { height:1em; }
+  .lyrics-foot { border-top:1px solid var(--line); color:var(--mut); font-size:11px; letter-spacing:.04em; padding:13px 21px; margin-top:auto; }
+  .dj-panel { grid-column:1; }
+  .badge { font:12px/1.4 ui-monospace,Consolas,monospace; background:var(--soft); color:var(--acc); padding:4px 8px; border-radius:3px; max-width:55%; overflow-wrap:anywhere; text-transform:uppercase; }
+  .dj-body { padding:21px; }
+  .volume-label { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+  .volume-label label { font-size:14px; }
+  #volTxt { font:25px/1 ui-monospace,Consolas,monospace; letter-spacing:-1px; }
+  #vol { display:block; width:100%; margin:0; height:25px; accent-color:var(--acc); cursor:pointer; }
+  .range-ends { display:flex; justify-content:space-between; color:var(--mut); font-size:11px; margin-top:4px; }
+  #djEstado { display:block; margin-top:8px; }
+  .settings { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.35fr); gap:20px; padding-top:18px; margin-top:19px; border-top:1px solid var(--line); }
+  .control-label { display:block; margin-bottom:7px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); }
+  .voice-current { display:flex; align-items:center; gap:8px; min-height:38px; font-weight:500; overflow-wrap:anywhere; }
+  #vozDetalle { display:block; margin-top:3px; }
+  #guionistas { font-size:14px; }
+  .filter { display:flex; align-items:center; justify-content:space-between; gap:12px; border-top:1px solid var(--line); padding-top:16px; margin-top:18px; cursor:pointer; min-height:46px; }
+  .filter span { display:flex; align-items:center; gap:9px; font-size:14px; }
+  #filtro { appearance:none; position:relative; flex-shrink:0; margin:0; width:36px; height:21px; border:1px solid var(--line); border-radius:20px; background:var(--bg); cursor:pointer; }
+  #filtro::before { content:''; position:absolute; top:3px; left:3px; width:13px; height:13px; border-radius:50%; background:var(--mut); }
+  #filtro:checked { background:var(--acc); border-color:var(--acc); }
+  #filtro:checked::before { left:18px; background:#29271e; }
+  .voice-picker { border-top:1px solid var(--line); margin-top:17px; padding-top:5px; }
+  .voice-picker>summary { width:fit-content; padding:10px 0; font-size:13px; color:var(--acc); cursor:pointer; }
+  .pais { margin:17px 0 6px; font:11px/1.5 ui-monospace,Consolas,monospace; color:var(--mut); text-transform:uppercase; letter-spacing:.07em; }
+  .voz { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:9px 14px; padding:12px 0; border-bottom:1px solid var(--line); min-width:0; }
+  .voz>span { min-width:0; overflow-wrap:anywhere; }
+  .voz .uso { color:var(--ok); font-weight:600; }
+  .botones { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
+  .voz button { padding:7px 10px; font-size:12px; }
+  .voz progress { width:90px; accent-color:var(--acc); }
+  .sec { background:transparent; }
+  button.bad { color:var(--bad); background:transparent; border-color:var(--line); }
+  .guion { display:flex; align-items:center; gap:8px; padding:4px 0; }
+  .guion small { color:var(--mut); }
+  .err { color:var(--bad); font-size:13px; overflow-wrap:anywhere; }
+  .err:not(:empty) { margin-top:10px; }
+  .news-panel { grid-column:1 / -1; }
+  .news-panel .section-head { padding-top:12px; padding-bottom:12px; }
+  .news-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; }
+  #refrescar { font-size:13px; padding:7px 9px; border-color:transparent; background:transparent; }
+  #refrescar:hover:not(:disabled) { background:var(--raised); }
+  #edad { color:var(--mut); font-size:12px; }
+  #titulares { display:grid; grid-template-columns:1fr 1fr; gap:18px 30px; counter-reset:titular; list-style:none; padding:23px; margin:0; }
+  #titulares:empty { padding:0; }
+  #titulares li { counter-increment:titular; display:grid; grid-template-columns:25px minmax(0,1fr); gap:10px; font-size:14px; overflow-wrap:anywhere; }
+  #titulares li::before { content:counter(titular,decimal-leading-zero); color:var(--acc); font:12px/1.9 ui-monospace,Consolas,monospace; }
+  #titulares li small { grid-column:2; color:var(--mut); font-size:11px; }
+  #titulares li.leido { color:var(--mut); }
+  #titulares li.leido>span { text-decoration:line-through; }
+  #titularesVacios,#noticiasError { margin:0; padding:18px 23px; }
+  #noticiasError:empty { display:none; }
+  .footer { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-top:18px; }
+  .diagnostics { flex:1; min-width:0; font-size:13px; color:var(--mut); }
+  .diagnostics>summary { width:fit-content; cursor:pointer; padding:11px 0; }
+  .diagnostic-body { margin-top:8px; padding:19px 21px; }
+  .diagnostic-body h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; font-weight:600; margin:20px 0 10px; }
+  .diagnostic-body h2:first-child { margin-top:0; }
+  .row { display:flex; justify-content:space-between; gap:12px 24px; padding:5px 0; min-width:0; }
+  .row span { min-width:0; overflow-wrap:anywhere; }
+  .row span:first-child { color:var(--mut); }
+  .row span:last-child { color:var(--fg); text-align:right; }
+  #voz { overflow-wrap:anywhere; }
+  #log { padding:14px; border:1px solid var(--line); border-radius:var(--radius); background:var(--bg); margin:0; max-height:300px; overflow-y:auto; overflow-wrap:anywhere; white-space:pre-wrap; font:12px/1.8 ui-monospace,Consolas,monospace; scrollbar-width:thin; }
+  .acciones { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+  .power { text-align:right; max-width:310px; flex-shrink:0; }
+  #parar { border-color:transparent; color:var(--bad); background:transparent; font-size:13px; }
+  #parar:hover:not(:disabled) { background:var(--raised); }
+  #apagado { margin-top:18px; }
+  #pararError { max-width:310px; }
+  @media(max-width:760px) { body { padding:0 18px 24px; } .top { min-height:94px; } .grid { grid-template-columns:1fr; } .lyrics-panel { grid-column:1; grid-row:auto; } .dj-panel { grid-row:2; } #letraCaja { min-height:200px; max-height:380px; font-size:20px; } .station-status { margin-left:0; } .now { padding:23px; } #cancion { font-size:38px; } .news-panel .section-head { flex-wrap:wrap; gap:8px; } #titulares { grid-template-columns:1fr; gap:20px; } .footer { gap:16px; } .power { max-width:220px; } }
+  @media(max-width:420px) { body { padding:0 12px 20px; } .top { gap:12px; } .brand-mark { width:36px; height:36px; } .brand-mark svg { width:23px; height:23px; } .brand { gap:9px; } .brand-name { font-size:23px; } .brand p { font-size:11px; } #usuario { max-width:115px; font-size:11px; } .station-bar { gap:10px 16px; font-size:12px; } #elegirServidor { width:100%; margin:0; } #selectorServidor { flex:1; max-width:none; } .section-head,.letra summary { padding:15px 17px; } .now { padding:22px 18px; } #cancion { font-size:34px; letter-spacing:-1.2px; } .dj-body { padding:18px; } .settings { grid-template-columns:1fr; gap:18px; } #titulares { padding:18px; } .footer { flex-wrap:wrap; gap:6px; } .diagnostics { flex-basis:100%; } .power { text-align:left; } #parar { padding-left:0; } .row { flex-wrap:wrap; gap:3px; } .row span:last-child { text-align:left; } .diagnostic-body { padding:16px; } }
+  @media(pointer:coarse) { button,select,summary { min-height:44px; } #vol { height:38px; } .filter { min-height:58px; } select { font-size:16px!important; } }
+  @media(prefers-reduced-motion:reduce) { #letraCaja.sync p { transition:none; } }
 </style>
 </head>
 <body>
 <main>
-  <h1><span id="luz" class="dot"></span> LavaDJ <small id="usuario" style="color:var(--mut);font-weight:400"></small></h1>
-
-  <div class="card">
-    <h2>Estado</h2>
-    <div class="row"><span>Bot</span><span id="bot">…</span></div>
-    <div class="row"><span>Lavalink (audio)</span><span id="lava">…</span></div>
-    <div class="row"><span>Transmisión</span><span id="salud">…</span></div>
-    <div class="row"><span>yt-dlp</span><span id="ytdlp">…</span></div>
-    <div class="row"><span>Servidores</span><span id="servidores">…</span></div>
+  <header class="top">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="13" rx="2"/><path d="m6 8 12-5M7 12h1m3 0h6M7 16h1m3 0h6"/></svg></span><div><div class="brand-name">LavaDJ<span>.</span></div><p>Cabina de radio</p></div></div>
+    <span id="usuario" class="mono">Conectando…</span>
+  </header>
+  <div class="station-bar"><span class="onair mono"><span id="luz" class="dot"></span><span id="conexion">CONECTANDO</span></span><span id="canal">Esperando al bot…</span><div id="elegirServidor" hidden><label for="selectorServidor">Servidor</label><select id="selectorServidor" aria-label="Servidor de la cabina"></select></div><span class="station-status mono">CONTROL LOCAL</span></div>
+  <div id="desconectado" class="banner" role="status" hidden><strong>Sin conexión con el bot.</strong>Abre el acceso directo de LavaDJ para iniciar la radio. El panel se reconectará automáticamente.</div>
+  <div id="apagado" class="banner" role="status" hidden><strong>Todo apagado: el bot y Lavalink.</strong>Para volver a arrancar, abre el acceso directo de LavaDJ.</div>
+  <div class="grid">
+    <section class="panel now" aria-label="Canción en reproducción">
+      <p class="eyebrow mono"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 10v4m4-7v10m4-14v18m4-14v10m4-7v4"/></svg><span id="estadoPista">Esperando</span></p>
+      <h1 id="cancion">Conectando con tu radio…</h1>
+      <p class="queue"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h11M3 11h7M3 16h6m8 0V7l4-1v8"/><circle cx="15" cy="17" r="2"/><circle cx="19" cy="15" r="2"/></svg><span id="cola">Esperando la cola</span></p>
+      <div id="progreso" role="progressbar" aria-label="Posición de la canción" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progresoBarra"></div></div>
+      <div class="times mono"><span id="posicion">—:—</span><span id="duracion">—:—</span></div>
+      <div class="radio-actions"><button id="radio" type="button" disabled>Radio de este tema</button><span id="radioAviso" role="status" aria-live="polite"></span></div>
+    </section>
+    <section class="panel lyrics-panel" aria-label="Letra de la canción">
+      <details id="letraDet" class="letra" open><summary><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 5h16M4 10h12M4 15h16M4 20h10"/></svg><h2>Letra</h2></summary><small id="letraTit"></small><div id="letraCaja"><p>La letra aparecerá cuando empiece una canción.</p></div></details>
+      <p id="sincronizacion" class="lyrics-foot mono">ESPERANDO UNA CANCIÓN</p>
+    </section>
+    <section class="panel dj-panel" aria-label="Controles del DJ">
+      <div class="section-head"><h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="13" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2m-7 9v3m-4 0h8"/></svg>Voz del DJ</h2><span id="vozResumen" class="badge">Cargando…</span></div>
+      <div class="dj-body">
+        <div class="volume-label"><label for="vol">Volumen de la voz</label><output id="volTxt" for="vol">—</output></div>
+        <input id="vol" type="range" min="0" max="200" step="5" value="0" aria-label="Volumen de la voz del DJ">
+        <div class="range-ends mono"><span>0%</span><span>200%</span></div><small id="djEstado">Cargando estado del DJ…</small><div id="volumenError" class="err" role="status"></div>
+        <div class="settings"><div><span class="control-label mono">Voz actual</span><div class="voice-current"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5 6 9H3v6h3l6 4V5zm4 3a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg><span id="vozActual">Cargando…</span></div><small id="vozDetalle"></small></div><div><label for="guionistas" class="control-label mono">Guionista del DJ</label><select id="guionistas" aria-label="Guionista del DJ"><option value="">Cargando…</option></select><div id="guionistaFallo" class="err" role="status"></div><div id="guionistaError" class="err" role="status"></div></div></div>
+        <label class="filter" for="filtro"><span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 7h6m4 0h8M3 17h11m4 0h3"/><circle cx="11" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>Filtro de radio</span><input id="filtro" type="checkbox"></label>
+        <details class="voice-picker"><summary>Cambiar voz</summary><div id="sinPiper" class="err" hidden>Las voces neuronales no están disponibles. Puedes seguir usando la voz del sistema.</div><div id="voces">Cargando catálogo de voces…</div><div id="vocesError" class="err" role="status"></div></details>
+        <audio id="muestra" preload="none"></audio>
+      </div>
+    </section>
+    <section class="panel news-panel" aria-label="Titulares del DJ">
+      <div class="section-head"><h2><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h15v14a3 3 0 0 0 3 3H6a3 3 0 0 1-3-3V8m16 4h3v6a3 3 0 0 1-3 3M7 8h8m-8 4h8m-8 4h5"/></svg>En el guion</h2><div class="news-actions"><span id="edad" class="mono">Cargando…</span><button id="refrescar" type="button"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7v5h-5M4 17v-5h5m-4-4a8 8 0 0 1 13-3l2 2M4 17l2 2a8 8 0 0 0 13-3"/></svg>Actualizar titulares</button></div></div>
+      <ul id="titulares"></ul><p id="titularesVacios" class="small" hidden>No hay titulares pendientes.</p><p id="noticiasError" class="err" role="status"></p>
+    </section>
   </div>
-
-  <div class="card">
-    <h2>En el aire</h2><div id="voz">Nada.</div>
-    <div class="acciones" style="margin-top:8px"><button id="radio" disabled>📻 Radio de este tema</button><span id="radioAviso"></span></div>
-  </div>
-
-  <div class="card">
-    <details id="letraDet" class="letra" open>
-      <summary><h2>Letra</h2><small id="letraTit"></small></summary>
-      <div id="letraCaja"><p>Nada sonando.</p></div>
-    </details>
-  </div>
-
-  <div class="card">
-    <h2>Voz del DJ</h2>
-    <div class="acciones">
-      <input id="vol" type="range" min="0" max="200" step="5">
-      <b id="volTxt">–</b>
-    </div>
-    <label class="row"><span>Filtro de radio</span><input id="filtro" type="checkbox"></label>
-    <div id="sinPiper" class="err" hidden>Falta Piper, el motor de las voces neuronales: instálalo con <code>pip install piper-tts</code> en el venv del bot y reinicia.</div>
-    <div id="voces"></div>
-    <div id="vocesError" class="err"></div>
-    <audio id="muestra"></audio>
-  </div>
-
-  <div class="card">
-    <h2>Guionista del DJ</h2>
-    <div id="guionistas"></div>
-    <div id="guionistaFallo" class="err"></div>
-    <div id="guionistaError" class="err"></div>
-  </div>
-
-  <div class="card">
-    <h2>Titulares del DJ</h2>
-    <div class="acciones" style="margin-bottom:8px">
-      <button id="refrescar">Refrescar noticias</button><span id="edad" style="color:var(--mut)"></span>
-    </div>
-    <ul id="titulares"></ul>
-  </div>
-
-  <div class="card">
-    <h2>Log</h2>
-    <pre id="log">…</pre>
-  </div>
-
-  <div class="card acciones"><button id="parar" class="bad">Apagar todo</button><span id="apagado" hidden>Todo apagado: el bot y Lavalink. Para volver a arrancar, abre el acceso directo de LavaDJ.</span></div>
+  <footer class="footer">
+    <details class="diagnostics"><summary>Diagnóstico y registro</summary><div class="panel diagnostic-body"><h2>Estado de la radio</h2><div class="row"><span>Bot</span><span id="bot">Cargando…</span></div><div class="row"><span>Lavalink · Audio</span><span id="lava">Cargando…</span></div><div class="row"><span>Transmisión</span><span id="salud">Cargando…</span></div><div class="row"><span>yt-dlp</span><span id="ytdlp">Cargando…</span></div><div class="row"><span>Servidores</span><span id="servidores">Cargando…</span></div><h2>Canales de voz</h2><div id="voz">Esperando al bot…</div><h2>Registro reciente</h2><pre id="log">Cargando registro…</pre></div></details>
+    <div class="power"><button id="parar" type="button" class="bad">Apagar todo</button><div id="pararError" class="err" role="status"></div></div>
+  </footer>
 </main>
+
 <script>
 const $ = id => document.getElementById(id);
-const api = (ruta, opts) => fetch('/api/' + ruta, opts).then(r => r.json());
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const dur = s => s < 60 ? s + ' s' : s < 3600 ? Math.floor(s/60) + ' min' : Math.floor(s/3600) + ' h ' + Math.floor(s%3600/60) + ' min';
-let moviendo = false, apagando = false, pidiendoRadio = false, avisoRadio = null;
-
-async function actualizar() {
+const dur = s => s < 60 ? s + ' s' : s < 3600 ? Math.floor(s / 60) + ' min' : Math.floor(s / 3600) + ' h ' + Math.floor(s % 3600 / 60) + ' min';
+const reloj = ms => { const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+async function api(ruta, opts = {}) {
+  const controller = new AbortController(), limite = setTimeout(() => controller.abort(), 12000);
   try {
-    const e = await api('status');
-    $('luz').className = 'dot ' + (e.salud && e.salud.estado === 'bien' && e.lavalink.conectado ? 'ok' : 'warn');
-    $('usuario').textContent = e.usuario || '';
-    $('bot').textContent = (e.listo ? 'listo' : 'arrancando') + ' · ' + dur(Math.floor(e.uptime));
-    $('lava').textContent = e.lavalink.conectado ? 'conectado' : 'DESCONECTADO';
-    $('salud').textContent = e.salud ? e.salud.estado + (e.salud.motivo ? ' – ' + e.salud.motivo : '') : '–';
-    const y = e.ytdlp;
-    let textoYtdlp = y.version ? y.version + (y.viejo ? ' (viejo)' : '') : 'no encontrado';
-    if (y.cliente && y.cliente !== y.cliente_configurado) textoYtdlp += ' · cliente ' + y.cliente + ' (cambiado solo)';
-    $('ytdlp').textContent = textoYtdlp;
-    $('servidores').textContent = e.servidores;
-    $('voz').innerHTML = e.voz.length ? e.voz.map(v =>
-      `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.sonando ? '▶ ' + esc(v.cancion || '') : 'quieto'} · ${v.en_cola} en cola</span></div>`).join('') : 'Nada.';
-    $('radio').disabled = pidiendoRadio || !e.voz.some(v => v.sonando);
-    try { seguirLetra(e.voz); } catch (_) {}    // que la letra falle no es que el bot esté apagado
-  } catch (_) {
-    $('luz').className = 'dot bad'; $('bot').textContent = 'APAGADO';
-    $('radio').disabled = true; $('apagado').hidden = !apagando;    // sin API tras "Apagar todo" no queda nada arriba
-    return;
-  }
-  try {
-    const d = await api('dj_volume');
-    if (!moviendo) { $('vol').value = d.volumen; $('volTxt').textContent = d.volumen + '%' + (d.disponible ? '' : ' (DJ no disponible)'); }
-    if (!sondeoVoces) await cargarVoces();
-    const h = await api('headlines');
-    $('edad').textContent = h.edad == null ? 'sin bajar' : 'hace ' + dur(Math.floor(h.edad));
-    $('titulares').innerHTML = (h.titulares || []).map(t => `<li class="${t.leido ? 'leido' : ''}">${esc(t.texto)}</li>`).join('');
-    const l = await api('log?lineas=60');
-    const caja = $('log'), abajo = caja.scrollTop + caja.clientHeight >= caja.scrollHeight - 20;
-    caja.textContent = l.lineas.join('\n');
-    if (abajo) caja.scrollTop = caja.scrollHeight;
-    await cargarGuionista();    // al final: preguntar si Ollama responde puede tardar y no debe frenar lo demás
-  } catch (_) {}
+    const respuesta = await fetch('/api/' + ruta, {...opts, signal:controller.signal}), datos = await respuesta.json().catch(() => ({}));
+    if (!respuesta.ok) throw new Error(datos.error || datos.aviso || 'No pude completar la solicitud.');
+    return datos;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('La solicitud tardó demasiado. Inténtalo de nuevo.');
+    if (error instanceof TypeError) throw new Error('No hay conexión con el bot.');
+    throw error;
+  } finally { clearTimeout(limite); }
 }
-
-$('vol').oninput = () => { moviendo = true; $('volTxt').textContent = $('vol').value + '%'; };
-$('vol').onchange = async () => { await api('dj_volume?valor=' + $('vol').value, {method:'POST'}); moviendo = false; };
-$('refrescar').onclick = async () => { $('refrescar').disabled = true; await api('refresh_news', {method:'POST'}); $('refrescar').disabled = false; actualizar(); };
-// Sin confirm(): los navegadores embebidos lo bloquean y el botón parecía muerto.
-let armado = null;
-$('parar').onclick = async () => {
-  const b = $('parar');
-  if (!armado) {
-    b.textContent = 'Otra vez: se apaga también el audio';
-    armado = setTimeout(() => { armado = null; b.textContent = 'Apagar todo'; }, 4000);
-    return;
+let conectado = false, actualizando = false, apagando = false, apagadoConfirmado = false, enviandoStop = false;
+let moviendo = false, guardandoVolumen = false, cargandoVolumen = false, volumenListo = false, revisionVolumen = 0;
+let refrescando = false, cargandoNoticias = false, revisionNoticias = 0, cargandoLog = false;
+let pidiendoRadio = false, avisoRadio = null, armado = null, servidorElegido = null, ultimoEstado = null, vistaServidores = '';
+let sala = null, anclaPista = null;
+const CALIDAD = {x_low:'muy baja', low:'baja', medium:'media', high:'alta'};
+let datosVoces = null, vistaVoces = '', escuchando = null, sondeoVoces = null, tiempoMuestra = null;
+let cargandoVoces = false, vozPendiente = false, filtroPendiente = false, revisionVoces = 0;
+const GUIONISTAS = [['frases', 'Frases fijas'], ['claude', 'Claude (API, cobra por uso)'], ['ollama', 'Ollama (local)']];
+const SIN_GUIONISTA = {claude:'no disponible', ollama:'no responde'};
+let datosGuionista = null, vistaGuionistas = '', cargandoGuionista = false, guionistaPendiente = false, revisionGuionista = 0;
+const caja = $('letraCaja'), det = $('letraDet');
+const AVISOS = {sin_letra:'No encontré la letra de esta canción.', error:'No pude buscar la letra.', nada_sonando:'No hay ninguna canción sonando.'};
+let letra = {pista:null, servidor:null, sync:false, lineas:[]}, pedida = null, ancla = null, activa = -1, libre = 0, versionLetra = 0;
+const claveSala = v => v && v.pista ? String(v.id) + ':' + v.pista : null;
+const operativo = () => conectado && !apagando && !enviandoStop;
+function habilitarControles() {
+  const listo = operativo();
+  $('vol').disabled = !listo || !volumenListo || guardandoVolumen;
+  $('filtro').disabled = !listo || !datosVoces || filtroPendiente || vozPendiente;
+  $('guionistas').disabled = !listo || !datosGuionista || guionistaPendiente;
+  $('refrescar').disabled = !listo || refrescando; $('parar').disabled = !listo;
+  $('radio').disabled = !listo || pidiendoRadio || !sala || !sala.sonando || sala.dj;
+  $('selectorServidor').disabled = !conectado; pintarVoces();
+}
+function posicionDe(anclaje) {
+  if (!anclaje) return 0;
+  const pos = anclaje.pos + (anclaje.pausado ? 0 : performance.now() - anclaje.t);
+  return Math.max(0, anclaje.largo ? Math.min(pos, anclaje.largo) : pos);
+}
+function sinConexion() {
+  conectado = false; versionLetra++; pedida = null;
+  if (anclaPista) anclaPista = {...anclaPista, pos:posicionDe(anclaPista), pausado:true};
+  if (ancla) ancla = {...ancla, pos:posicionDe(ancla), pausado:true};
+  if (apagando) apagadoConfirmado = true;
+  $('luz').className = 'dot bad'; $('conexion').textContent = apagando ? 'Apagado' : 'Sin conexión';
+  $('bot').textContent = apagando ? 'Apagado' : 'Sin conexión'; $('estadoPista').textContent = apagando ? 'Fuera del aire' : 'Conexión interrumpida';
+  $('desconectado').hidden = apagando; $('apagado').hidden = !apagando;
+  $('sincronizacion').textContent = apagando ? 'Transmisión finalizada' : 'Sin conexión · posición detenida';
+  if (!ultimoEstado) {
+    $('usuario').textContent = 'LavaDJ'; $('cancion').textContent = 'Tu cabina está desconectada';
+    $('canal').textContent = 'Esperando conexión con el bot'; $('cola').textContent = 'Sin datos de la cola';
+    $('vozResumen').textContent = 'Sin conexión'; $('vozActual').textContent = 'Sin datos';
+    $('djEstado').textContent = 'Los controles estarán disponibles al conectar.'; $('edad').textContent = 'Sin conexión';
   }
-  clearTimeout(armado); armado = null;
-  b.disabled = true; b.textContent = 'Apagando…';
-  try { await api('stop?motivo=panel+web&todo=1', {method:'POST'}); apagando = true; } catch (_) {}
+  if (apagando) $('parar').textContent = 'Todo apagado';
+  if (armado) { clearTimeout(armado); armado = null; if (!apagando) $('parar').textContent = 'Apagar todo'; }
+  clearTimeout(sondeoVoces); sondeoVoces = null; habilitarControles();
+}
+function elegirSala(voz) {
+  const anterior = sala;
+  sala = voz.find(v => String(v.id) === servidorElegido) || voz.find(v => v.sonando) || voz[0] || null;
+  servidorElegido = sala ? String(sala.id) : null;
+  const opciones = voz.map(v => `<option value="${esc(v.id)}">${esc(v.servidor)} · ${esc(v.canal || 'Sin canal')}</option>`).join('');
+  if (opciones !== vistaServidores) { vistaServidores = opciones; $('selectorServidor').innerHTML = opciones; }
+  if (servidorElegido) $('selectorServidor').value = servidorElegido;
+  $('elegirServidor').hidden = voz.length < 2;
+  if (String(anterior?.id) !== String(sala?.id)) {
+    versionLetra++; pedida = null; ancla = null; letra = {pista:null, servidor:null, sync:false, lineas:[]};
+    $('radioAviso').textContent = ''; avisoLetra('Esperando una canción.');
+  } else if (claveSala(anterior) !== claveSala(sala)) $('radioAviso').textContent = '';
+  $('estadoPista').textContent = !sala ? 'En espera' : sala.dj ? 'Habla el DJ' : sala.pausado ? 'En pausa' : sala.sonando ? 'Sonando' : 'En espera';
+  $('cancion').textContent = sala?.cancion || 'La próxima canción te espera';
+  $('canal').textContent = sala ? sala.servidor + ' · ' + (sala.canal || 'Sin canal de voz') : 'Conecta el bot a un canal de voz desde Discord.';
+  $('cola').textContent = sala ? (Number(sala.en_cola) || 0) + ' en cola' : 'Sin canciones en cola';
+  anclaPista = sala ? {pos:Number(sala.posicion_ms) || 0, largo:Number(sala.duracion_ms) || 0, t:performance.now(), pausado:!sala.sonando || sala.pausado} : null;
+  $('voz').innerHTML = voz.length ? voz.map(v => `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.pausado ? 'En pausa' : v.sonando ? 'Sonando' : 'En espera'} · ${Number(v.en_cola) || 0} en cola</span></div>`).join('') : 'Sin canales de voz conectados.';
+  seguirLetra(); pintarProgreso(); habilitarControles();
+}
+async function actualizar() {
+  if (actualizando) return;
+  actualizando = true;
+  try {
+    let e;
+    try { e = await api('status'); } catch (_) { sinConexion(); return; }
+    conectado = true; ultimoEstado = e;
+    if (apagadoConfirmado) { apagando = false; apagadoConfirmado = false; $('parar').textContent = 'Apagar todo'; }
+    $('desconectado').hidden = true; $('apagado').hidden = true;
+    const salud = e.salud, audio = !!e.lavalink?.conectado;
+    $('luz').className = 'dot ' + (!audio || salud?.estado === 'mudo' ? 'bad' : !e.listo || salud?.estado === 'flojo' ? 'warn' : 'ok');
+    $('conexion').textContent = apagando ? 'Apagando…' : !e.listo ? 'Arrancando' : !audio ? 'Audio desconectado' : salud?.estado === 'mudo' ? 'La transmisión necesita atención' : salud?.estado === 'flojo' ? 'Transmisión inestable' : 'Conectado';
+    $('usuario').textContent = e.usuario || 'LavaDJ'; $('bot').textContent = (e.listo ? 'Listo' : 'Arrancando') + ' · ' + dur(Math.floor(e.uptime || 0));
+    $('lava').textContent = audio ? 'Conectado' : 'Desconectado'; $('salud').textContent = salud ? salud.estado + (salud.motivo ? ' · ' + salud.motivo : '') : 'Esperando información';
+    const y = e.ytdlp || {};
+    let textoYtdlp = y.version ? y.version + (y.viejo ? ' · necesita actualizarse' : '') : 'No encontrado';
+    if (y.cliente && y.cliente !== y.cliente_configurado) textoYtdlp += ' · cliente ' + y.cliente + ' (cambio temporal)';
+    $('ytdlp').textContent = textoYtdlp; $('servidores').textContent = e.servidores || 0; elegirSala(e.voz || []);
+    if (apagando) return;
+    cargarVolumen(); if (!sondeoVoces) cargarVoces(); cargarNoticias(); cargarLog(); cargarGuionista();
+  } finally { actualizando = false; }
+}
+$('selectorServidor').onchange = () => { servidorElegido = $('selectorServidor').value; if (ultimoEstado) elegirSala(ultimoEstado.voz || []); };
+async function cargarVolumen() {
+  if (cargandoVolumen || guardandoVolumen) return;
+  cargandoVolumen = true; const version = revisionVolumen;
+  try {
+    const d = await api('dj_volume'); if (version !== revisionVolumen || guardandoVolumen) return;
+    volumenListo = true;
+    if (!moviendo) { $('vol').value = d.volumen; $('volTxt').textContent = d.volumen + '%'; }
+    $('djEstado').textContent = d.disponible ? 'Voz lista para salir al aire' : 'Voz del DJ no disponible'; $('volumenError').textContent = '';
+  } catch (error) { if (version === revisionVolumen) $('volumenError').textContent = error.message; }
+  finally { cargandoVolumen = false; habilitarControles(); }
+}
+$('vol').oninput = () => { moviendo = true; $('volTxt').textContent = $('vol').value + '%'; };
+$('vol').onchange = async () => {
+  if (!operativo()) { moviendo = false; return; }
+  guardandoVolumen = true; revisionVolumen++; habilitarControles(); $('volumenError').textContent = '';
+  try { const d = await api('dj_volume?valor=' + encodeURIComponent($('vol').value), {method:'POST'}); $('vol').value = d.volumen; $('volTxt').textContent = d.volumen + '%'; }
+  catch (error) { $('volumenError').textContent = error.message; }
+  finally { guardandoVolumen = false; moviendo = false; habilitarControles(); }
+};
+function pintarNoticias(h) {
+  const titulares = h.titulares || []; $('edad').textContent = h.edad == null ? 'Sin actualizar' : 'Hace ' + dur(Math.floor(h.edad));
+  $('titulares').innerHTML = titulares.map(t => `<li class="${t.leido ? 'leido' : ''}"><span>${esc(t.texto)}</span><small>${t.leido ? 'Leído' : 'Pendiente'}</small></li>`).join('');
+  $('titularesVacios').hidden = titulares.length > 0;
+}
+async function cargarNoticias() {
+  if (cargandoNoticias || refrescando) return;
+  cargandoNoticias = true; const version = revisionNoticias;
+  try { const h = await api('headlines'); if (version === revisionNoticias) { pintarNoticias(h); $('noticiasError').textContent = ''; } }
+  catch (error) { if (version === revisionNoticias) $('noticiasError').textContent = error.message; }
+  finally { cargandoNoticias = false; }
+}
+$('refrescar').onclick = async () => {
+  if (!operativo() || refrescando) return;
+  refrescando = true; revisionNoticias++; habilitarControles(); $('noticiasError').textContent = '';
+  try { pintarNoticias(await api('refresh_news', {method:'POST'})); } catch (error) { $('noticiasError').textContent = error.message; }
+  finally { refrescando = false; habilitarControles(); }
+};
+async function cargarLog() {
+  if (cargandoLog) return;
+  cargandoLog = true;
+  try { const l = await api('log?lineas=60'), cajaLog = $('log'), abajo = cajaLog.scrollTop + cajaLog.clientHeight >= cajaLog.scrollHeight - 20; cajaLog.textContent = (l.lineas || []).join('\n') || 'El registro todavía está vacío.'; if (abajo) cajaLog.scrollTop = cajaLog.scrollHeight; }
+  catch (_) {} finally { cargandoLog = false; }
+}
+// La confirmación vive en el botón porque los navegadores embebidos bloquean confirm().
+$('parar').onclick = async () => {
+  if (!operativo()) return;
+  const b = $('parar'); $('pararError').textContent = '';
+  if (!armado) { b.textContent = 'Otra vez: se apaga también el audio'; armado = setTimeout(() => { armado = null; b.textContent = 'Apagar todo'; }, 4000); return; }
+  clearTimeout(armado); armado = null; enviandoStop = true; b.textContent = 'Apagando…'; habilitarControles();
+  try { await api('stop?motivo=panel+web&todo=1', {method:'POST'}); apagando = true; }
+  catch (error) { b.textContent = 'Apagar todo'; $('pararError').textContent = error.message; }
+  finally { enviandoStop = false; habilitarControles(); }
   setTimeout(actualizar, 1500);
 };
 $('radio').onclick = async () => {
-  const t = $('radioAviso');
-  pidiendoRadio = true; $('radio').disabled = true;
-  try {
-    const r = await api('radio' + (sala ? '?servidor=' + encodeURIComponent(sala.id) : ''), {method:'POST'});
-    t.className = r.ok ? '' : 'err'; t.textContent = r.aviso || r.error || '';
-  } catch (_) { t.className = 'err'; t.textContent = 'No pude armar la radio.'; }
-  pidiendoRadio = false;
-  clearTimeout(avisoRadio); avisoRadio = setTimeout(() => { t.textContent = ''; }, 8000);
-  actualizar();
+  if (!operativo() || pidiendoRadio || !sala || !sala.sonando || sala.dj) return;
+  const solicitada = claveSala(sala), servidor = String(sala.id), t = $('radioAviso');
+  pidiendoRadio = true; habilitarControles(); t.className = ''; t.textContent = 'Preparando la radio…'; clearTimeout(avisoRadio);
+  try { const r = await api('radio?servidor=' + encodeURIComponent(servidor), {method:'POST'}); if (claveSala(sala) === solicitada && String(sala?.id) === servidor) { t.className = r.ok ? '' : 'err'; t.textContent = r.aviso || r.error || ''; } }
+  catch (error) { if (claveSala(sala) === solicitada && String(sala?.id) === servidor) { t.className = 'err'; t.textContent = error.message; } }
+  finally { pidiendoRadio = false; habilitarControles(); }
+  avisoRadio = setTimeout(() => { t.textContent = ''; }, 8000); actualizar();
 };
-
-const CALIDAD = {x_low:'muy baja', low:'baja', medium:'media', high:'alta'};
-let datosVoces = null, vistaVoces = '', escuchando = null, sondeoVoces = null;
-
 function pintarVoces() {
-  const d = datosVoces;
-  if (!d) return;
-  $('sinPiper').hidden = d.piper;
-  $('filtro').checked = d.filtro_radio;
-  const grupos = {};
-  d.voces.forEach(v => (grupos[v.pais || 'De siempre'] = grupos[v.pais || 'De siempre'] || []).push(v));
-  const boton = (a, v, texto, clase = '') => `<button class="${clase}" data-a="${a}" data-v="${esc(v.id)}">${texto}</button>`;
+  const d = datosVoces; if (!d) return;
+  $('sinPiper').hidden = !!d.piper; if (!filtroPendiente) $('filtro').checked = !!d.filtro_radio;
+  const actual = d.voces.find(v => v.en_uso || v.id === d.en_uso);
+  $('vozActual').textContent = actual?.nombre || actual?.id || 'Sin voz seleccionada'; $('vozResumen').textContent = actual ? 'En uso' : 'Sin seleccionar';
+  $('vozDetalle').textContent = actual ? [actual.pais, actual.calidad ? 'Calidad ' + (CALIDAD[actual.calidad] || actual.calidad) : 'Voz del sistema'].filter(Boolean).join(' · ') : 'Elige una voz del catálogo.';
+  const grupos = Object.create(null); d.voces.forEach(v => (grupos[v.pais || 'De siempre'] = grupos[v.pais || 'De siempre'] || []).push(v));
+  const boton = (a, v, texto, clase = '') => `<button type="button" class="${clase}" data-a="${a}" data-v="${esc(v.id)}"${!operativo() || vozPendiente || filtroPendiente || (a === 'escuchar' && escuchando) ? ' disabled' : ''}>${texto}</button>`;
   const vista = Object.entries(grupos).map(([pais, lista]) => `<div class="pais">${esc(pais)}</div>` + lista.map(v => {
-    const detalle = v.calidad ? ` <small>${esc(CALIDAD[v.calidad] || v.calidad)} · ${Math.round(v.tamano / 1e6)} MB</small>` : '';
-    let acciones = boton('escuchar', v, escuchando === v.id ? '…' : '▶ Escuchar', 'sec');
-    if (v.descargando) acciones += `<progress max="100" value="${v.progreso || 0}"></progress> ${v.progreso || 0}%`;
+    const detalle = v.calidad ? ` <small>${esc(CALIDAD[v.calidad] || v.calidad)} · ${Math.round((Number(v.tamano) || 0) / 1e6)} MB</small>` : '';
+    let acciones = v.instalada ? boton('escuchar', v, escuchando === v.id ? 'Preparando…' : 'Escuchar', 'sec') : '';
+    if (v.descargando) { const progreso = Math.max(0, Math.min(100, Number(v.progreso) || 0)); acciones += `<progress aria-label="Descarga de ${esc(v.nombre || v.id)}" max="100" value="${progreso}"></progress> ${progreso}%`; }
     else if (!v.instalada) acciones += boton('descargar', v, 'Descargar');
-    else {
-      if (!v.en_uso) acciones += boton('usar', v, 'Usar');
-      if (!v.en_uso && v.calidad) acciones += boton('borrar', v, 'Borrar', 'bad');
-    }
-    return `<div class="voz"><span>${esc(v.nombre || 'espeak')}${detalle}${v.en_uso ? ' <span class="uso">· en uso</span>' : ''}` +
-      `${v.error ? `<br><span class="err">${esc(v.error)}</span>` : ''}</span><span class="botones">${acciones}</span></div>`;
+    else { if (!v.en_uso) acciones += boton('usar', v, 'Usar'); if (!v.en_uso && v.calidad) acciones += boton('borrar', v, 'Borrar', 'bad'); }
+    return `<div class="voz"><span>${esc(v.nombre || 'espeak')}${detalle}${v.en_uso ? ' <span class="uso">En uso</span>' : ''}${v.error ? `<br><span class="err">${esc(v.error)}</span>` : ''}</span><span class="botones">${acciones}</span></div>`;
   }).join('')).join('');
-  if (vista !== vistaVoces) { vistaVoces = vista; $('voces').innerHTML = vista; }   // sin rehacerla igual: un click a medias se perdería
+  if (vista !== vistaVoces) { vistaVoces = vista; $('voces').innerHTML = vista; }
 }
-
+function programarVoces() {
+  clearTimeout(sondeoVoces); sondeoVoces = null;
+  if (operativo() && datosVoces?.voces.some(v => v.descargando)) sondeoVoces = setTimeout(() => { sondeoVoces = null; cargarVoces(); }, 1000);
+}
 async function cargarVoces(datos) {
-  datosVoces = datos || await api('voces');
-  pintarVoces();
-  clearTimeout(sondeoVoces);
-  // Mientras algo se baja, el progreso se mira cada segundo y no cada 3.
-  sondeoVoces = datosVoces.voces.some(v => v.descargando) ? setTimeout(() => cargarVoces().catch(() => { sondeoVoces = null; }), 1000) : null;
+  if (datos) { datosVoces = datos; pintarVoces(); programarVoces(); habilitarControles(); return; }
+  if (cargandoVoces || vozPendiente || filtroPendiente) return;
+  cargandoVoces = true; const version = revisionVoces;
+  try { const d = await api('voces'); if (version === revisionVoces) { datosVoces = d; pintarVoces(); } }
+  catch (error) { if (version === revisionVoces) $('vocesError').textContent = error.message; }
+  finally { cargandoVoces = false; programarVoces(); habilitarControles(); }
 }
-
 async function accionDeVoz(accion, id) {
-  const ruta = {usar: 'voz', descargar: 'voces/descargar', borrar: 'voces/borrar'}[accion];
-  const r = await api(ruta + '?voz=' + encodeURIComponent(id), {method:'POST'});
-  $('vocesError').textContent = r.error || '';
-  if (!r.error) cargarVoces(r);
+  if (!operativo() || vozPendiente || filtroPendiente) return;
+  const ruta = {usar:'voz', descargar:'voces/descargar', borrar:'voces/borrar'}[accion]; if (!ruta) return;
+  vozPendiente = true; revisionVoces++; $('vocesError').textContent = ''; habilitarControles();
+  try { await cargarVoces(await api(ruta + '?voz=' + encodeURIComponent(id), {method:'POST'})); }
+  catch (error) { $('vocesError').textContent = error.message; }
+  finally { vozPendiente = false; habilitarControles(); }
 }
-
+function terminarMuestra(error) {
+  clearTimeout(tiempoMuestra); tiempoMuestra = null; if (error && escuchando) $('vocesError').textContent = error; escuchando = null; pintarVoces();
+}
 $('voces').onclick = e => {
-  const b = e.target.closest('button');
-  if (!b) return;
-  if (b.dataset.a !== 'escuchar') return accionDeVoz(b.dataset.a, b.dataset.v).catch(err => { $('vocesError').textContent = err.message; });
-  if (escuchando) return;    // una muestra a la vez: cada una lanza Piper
+  const b = e.target.closest('button'); if (!b || b.disabled || !operativo()) return;
+  if (b.dataset.a !== 'escuchar') return accionDeVoz(b.dataset.a, b.dataset.v);
+  if (escuchando || !datosVoces?.voces.some(v => v.id === b.dataset.v && v.instalada)) return;
   escuchando = b.dataset.v; $('vocesError').textContent = ''; pintarVoces();
   $('muestra').src = '/api/voces/muestra?voz=' + encodeURIComponent(escuchando) + '&t=' + Date.now();
-  $('muestra').play().catch(() => {});    // si falla, lo cuenta onerror
+  tiempoMuestra = setTimeout(() => terminarMuestra('La muestra tardó demasiado. Inténtalo de nuevo.'), 20000);
+  $('muestra').play().catch(() => terminarMuestra('No pude reproducir la muestra de esa voz.'));
 };
-$('muestra').onplaying = () => { escuchando = null; pintarVoces(); };
-$('muestra').onerror = () => { if (escuchando) $('vocesError').textContent = 'No pude reproducir la muestra de esa voz.'; escuchando = null; pintarVoces(); };
+$('muestra').onplaying = () => terminarMuestra(); $('muestra').onerror = () => terminarMuestra('No pude reproducir la muestra de esa voz.');
 $('filtro').onchange = async () => {
-  const r = await api('voz/filtro?activo=' + ($('filtro').checked ? 1 : 0), {method:'POST'});
-  $('vocesError').textContent = r.error || '';
-  cargarVoces(r.error ? null : r);
+  if (!operativo() || filtroPendiente || vozPendiente) return;
+  filtroPendiente = true; revisionVoces++; $('vocesError').textContent = ''; habilitarControles();
+  try { await cargarVoces(await api('voz/filtro?activo=' + ($('filtro').checked ? 1 : 0), {method:'POST'})); }
+  catch (error) { $('vocesError').textContent = error.message; }
+  finally { filtroPendiente = false; habilitarControles(); }
 };
-
-const GUIONISTAS = [['frases', 'Frases fijas'], ['claude', 'Claude (API, cobra por uso)'], ['ollama', 'Ollama (local)']];
-const SIN_GUIONISTA = {claude: 'falta el SDK de anthropic', ollama: 'no responde'};
-let vistaGuionistas = '';
-
-async function cargarGuionista(datos) {
-  const d = datos || await api('guionista');
-  if (d.error) { $('guionistaFallo').textContent = d.error; return; }
+function pintarGuionista() {
+  const d = datosGuionista; if (!d) return;
   $('guionistaFallo').textContent = d.ultimo_error || '';
-  const vista = GUIONISTAS.map(([id, nombre]) => {
-    const ok = d.disponibles[id], nota = [(d.modelos || {})[id], ok ? '' : SIN_GUIONISTA[id]].filter(Boolean).join(' · ');
-    return `<label class="guion"><input type="radio" name="guionista" value="${id}"${d.activo === id ? ' checked' : ''}${ok ? '' : ' disabled'}>` +
-      `<span>${nombre}${nota ? ` <small>${esc(nota)}</small>` : ''}</span></label>`;
-  }).join('');
+  const vista = GUIONISTAS.map(([id, nombre]) => { const ok = id === 'frases' || d.disponibles?.[id], nota = [d.modelos?.[id], ok ? '' : SIN_GUIONISTA[id]].filter(Boolean).join(' · '); return `<option value="${id}"${ok ? '' : ' disabled'}>${esc(nombre)}${nota ? ' · ' + esc(nota) : ''}</option>`; }).join('');
   if (vista !== vistaGuionistas) { vistaGuionistas = vista; $('guionistas').innerHTML = vista; }
+  if (!guionistaPendiente) $('guionistas').value = d.activo;
 }
-
+async function cargarGuionista(datos) {
+  if (datos) { datosGuionista = datos; pintarGuionista(); return; }
+  if (cargandoGuionista || guionistaPendiente) return;
+  cargandoGuionista = true; const version = revisionGuionista;
+  try { const d = await api('guionista'); if (version === revisionGuionista) { datosGuionista = d; pintarGuionista(); } }
+  catch (error) { if (version === revisionGuionista) $('guionistaFallo').textContent = error.message; }
+  finally { cargandoGuionista = false; habilitarControles(); }
+}
 $('guionistas').onchange = async e => {
-  try {
-    const r = await api('guionista?nombre=' + encodeURIComponent(e.target.value), {method:'POST'});
-    $('guionistaError').textContent = r.error || '';
-    vistaGuionistas = '';    // tras un error el radio quedó marcado de más: se repinta con lo que hay de verdad
-    await cargarGuionista(r.error ? null : r);
-  } catch (err) { $('guionistaError').textContent = err.message; }
+  if (!operativo() || guionistaPendiente) return;
+  const elegido = e.target.value; guionistaPendiente = true; revisionGuionista++; $('guionistaError').textContent = ''; habilitarControles();
+  try { await cargarGuionista(await api('guionista?nombre=' + encodeURIComponent(elegido), {method:'POST'})); }
+  catch (error) { $('guionistaError').textContent = error.message; }
+  finally { guionistaPendiente = false; pintarGuionista(); habilitarControles(); }
 };
-
-const caja = $('letraCaja'), det = $('letraDet');
-const AVISOS = {sin_letra: 'No encontré la letra de esta canción.', error: 'No pude buscar la letra.'};
-let letra = {pista: null, sync: false, lineas: []}, pedida = null, ancla = null, activa = -1, sala = null, libre = 0;
-
 function avisoLetra(texto) { caja.className = ''; caja.innerHTML = `<p>${esc(texto)}</p>`; }
-
-function pintarLetra(r) {
-  letra = {pista: r.pista, sync: r.sincronizada, lineas: r.lineas};
-  activa = -1;
-  if (!r.lineas.length) return avisoLetra(AVISOS[r.motivo] || 'Sin letra.');
-  caja.className = r.sincronizada ? 'sync' : 'plana';
-  caja.innerHTML = r.lineas.map(l => `<p>${esc(l.texto)}</p>`).join('');
-  caja.scrollTop = 0;
+function pintarLetra(r, servidor) {
+  letra = {pista:r.pista, servidor, sync:r.sincronizada, lineas:r.lineas || []}; activa = -1;
+  $('sincronizacion').textContent = r.sincronizada ? 'Letra sincronizada' : r.lineas?.length ? 'Letra sin tiempos' : 'Letra no disponible';
+  if (!letra.lineas.length) return avisoLetra(AVISOS[r.motivo] || 'Sin letra para esta canción.');
+  caja.className = r.sincronizada ? 'sync' : 'plana'; caja.innerHTML = letra.lineas.map(l => `<p>${esc(l.texto)}</p>`).join(''); caja.scrollTop = 0;
 }
-
-// La letra se pide solo cuando cambia la pista; la posición entre sondeos se interpola en `resaltar`.
 async function pedirLetra(v) {
-  if (!det.open || pedida === v.pista) return;
-  pedida = v.pista; ancla = null; letra = {pista: null, sync: false, lineas: []};
-  $('letraTit').textContent = v.cancion || '';
-  avisoLetra('Buscando la letra…');
+  const clave = claveSala(v); if (!conectado || !det.open || !clave || pedida === clave) return;
+  pedida = clave; ancla = null; const version = ++versionLetra, servidor = String(v.id); letra = {pista:null, servidor, sync:false, lineas:[]};
+  $('letraTit').textContent = v.cancion || ''; $('sincronizacion').textContent = 'Buscando letra'; avisoLetra('Buscando la letra…');
   try {
     const r = await api('letra?servidor=' + encodeURIComponent(v.id));
-    if (r.pista !== pedida) { pedida = null; return; }    // cambió mientras se buscaba: el próximo sondeo la pide otra vez
-    ancla = {pos: r.posicion_ms, t: performance.now(), pausado: r.pausado};
-    pintarLetra(r);
-  } catch (_) { pedida = null; }
+    if (version !== versionLetra) return;
+    if (claveSala(sala) !== clave || String(sala?.id) !== servidor) { pedida = null; return; }
+    if (r.pista !== v.pista || String(r.servidor) !== servidor) { pedida = null; avisoLetra('Esperando la letra de la canción actual.'); return; }
+    ancla = {pos:r.posicion_ms, largo:r.duracion_ms, t:performance.now(), pausado:r.pausado || !conectado}; pintarLetra(r, servidor);
+  } catch (error) { if (version !== versionLetra || claveSala(sala) !== clave) return; pedida = null; $('sincronizacion').textContent = 'Letra no disponible'; avisoLetra(error.message); }
 }
-
-function seguirLetra(voz) {
-  sala = voz.find(v => v.sonando) || null;
-  if (!sala) { pedida = null; ancla = null; letra.pista = null; $('letraTit').textContent = ''; return avisoLetra('Nada sonando.'); }
-  if (sala.dj) { ancla = null; return; }    // habla el locutor: la letra se queda donde estaba
-  if (sala.pista === letra.pista) ancla = {pos: sala.posicion_ms, t: performance.now(), pausado: sala.pausado};
-  else pedirLetra(sala);
+function seguirLetra() {
+  if (!sala || (!sala.sonando && !sala.pausado)) { versionLetra++; pedida = null; ancla = null; letra.pista = null; $('letraTit').textContent = ''; $('sincronizacion').textContent = 'Esperando música'; avisoLetra('La letra aparecerá cuando suene una canción.'); return; }
+  if (sala.dj) { ancla = null; $('sincronizacion').textContent = 'Habla el DJ · la letra espera'; return; }
+  if (sala.pista === letra.pista && String(sala.id) === letra.servidor) {
+    ancla = {pos:sala.posicion_ms, largo:sala.duracion_ms, t:performance.now(), pausado:sala.pausado};
+    $('sincronizacion').textContent = sala.pausado ? 'En pausa' : letra.sync ? 'Letra sincronizada' : letra.lineas.length ? 'Letra sin tiempos' : 'Letra no disponible';
+  } else pedirLetra(sala);
 }
-
 function resaltar(forzar) {
   if (!ancla || !letra.sync || !det.open || !caja.children.length) return;
-  const pos = ancla.pausado ? ancla.pos : ancla.pos + performance.now() - ancla.t, ls = letra.lineas;
-  let lo = 0, hi = ls.length - 1, i = -1;    // la última línea con ms <= pos
+  const pos = posicionDe(ancla), ls = letra.lineas; let lo = 0, hi = ls.length - 1, i = -1;
   while (lo <= hi) { const m = (lo + hi) >> 1; if (ls[m].ms <= pos) { i = m; lo = m + 1; } else hi = m - 1; }
   if (i === activa && !forzar) return;
-  const ps = caja.children;
-  if (ps[activa]) ps[activa].classList.remove('on');
-  activa = i;
-  if (!ps[i]) return;
-  ps[i].classList.add('on');
-  // Dentro de la tarjeta (scrollIntoView movería toda la página); quien rueda a mano no es arrastrado de vuelta.
-  if (performance.now() > libre) caja.scrollTo({top: ps[i].offsetTop - (caja.clientHeight - ps[i].offsetHeight) / 2, behavior: 'smooth'});
+  const ps = caja.children; if (ps[activa]) ps[activa].classList.remove('on'); activa = i; if (!ps[i]) return; ps[i].classList.add('on');
+  if (performance.now() > libre) caja.scrollTo({top:ps[i].offsetTop - (caja.clientHeight - ps[i].offsetHeight) / 2, behavior:matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
 }
-
-const bucle = () => { resaltar(); requestAnimationFrame(bucle); };
+let ultimaPosicion = '', ultimaDuracion = '';
+function pintarProgreso() {
+  const pos = posicionDe(anclaPista), largo = anclaPista?.largo || 0, texto = reloj(pos), total = largo ? reloj(largo) : '—';
+  if (texto !== ultimaPosicion || total !== ultimaDuracion) { ultimaPosicion = texto; ultimaDuracion = total; $('posicion').textContent = texto; $('duracion').textContent = total; $('progreso').setAttribute('aria-valuenow', String(Math.floor(pos / 1000))); $('progreso').setAttribute('aria-valuemax', String(Math.max(1, Math.floor(largo / 1000)))); $('progreso').setAttribute('aria-valuetext', texto + ' de ' + total); }
+  $('progresoBarra').style.width = (largo ? Math.min(100, pos / largo * 100) : 0) + '%';
+}
+const bucle = () => { if (!document.hidden) { resaltar(); pintarProgreso(); } requestAnimationFrame(bucle); };
 const soltar = () => { libre = performance.now() + 4000; };
-caja.addEventListener('wheel', soltar, {passive: true}); caja.addEventListener('touchmove', soltar, {passive: true});
+caja.addEventListener('wheel', soltar, {passive:true}); caja.addEventListener('touchmove', soltar, {passive:true});
 try { det.open = localStorage.getItem('lavadj.letra') !== '0'; } catch (_) {}
-det.ontoggle = () => {
-  try { localStorage.setItem('lavadj.letra', det.open ? '1' : '0'); } catch (_) {}
-  if (det.open && sala) { pedirLetra(sala); resaltar(true); }
-};
-requestAnimationFrame(bucle);
-
+det.ontoggle = () => { try { localStorage.setItem('lavadj.letra', det.open ? '1' : '0'); } catch (_) {} if (det.open && sala) { pedirLetra(sala); resaltar(true); } };
+document.addEventListener('visibilitychange', () => { if (!document.hidden) actualizar(); });
+habilitarControles(); requestAnimationFrame(bucle);
 actualizar(); setInterval(() => { if (!document.hidden) actualizar(); }, 3000);
+
 </script>
 </body>
 </html>
