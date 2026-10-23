@@ -2263,3 +2263,8 @@ async def test_guardar_y_cerrar_borra_los_mensajes_aunque_no_se_haya_retomado_na
     mensaje = est.panel[0]
     await cog.guardar_y_cerrar()
     assert cog._persistencia == "cerrada" and mensaje.borrado
+
+
+@pytest.mark.parametrize("segundos, texto", [(300, "5 min"), (60, "1 min"), (90, "90 s"), (30, "30 s")])
+def test_rato_de(segundos, texto):
+    assert music_mod.rato_de(segundos) == texto

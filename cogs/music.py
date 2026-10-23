@@ -89,6 +89,11 @@ def format_duration(milliseconds: int) -> str:
     return f"{mins}:{secs:02d}"
 
 
+def rato_de(segundos: int) -> str:
+    """Un plazo en palabras: "5 min" si son minutos justos, si no "90 s"."""
+    return f"{segundos // 60} min" if segundos >= 60 and not segundos % 60 else f"{segundos} s"
+
+
 def es_url(texto: str) -> bool:
     return texto.lower().startswith(("http://", "https://"))
 
@@ -161,7 +166,7 @@ class Music(commands.Cog):
             self.dj.feeds = FeedCache(feed_urls)
         if not tts.available():
             self.dj.enabled = False
-            log.warning("espeak-ng no está instalado: el DJ queda desactivado")
+            log.warning("No hay espeak-ng ni una voz de Piper instalada: el DJ queda desactivado")
         else:
             log.info("DJ activo (%s feeds)", len(feed_urls))
         self._vigilante = self._segundo_plano(self._vigilar())
@@ -238,7 +243,7 @@ class Music(commands.Cog):
                 await self._delete_panel(guild_id)
                 text_channel = getattr(vc, "text_channel", None)
                 if text_channel:
-                    await text_channel.send("Sin música por 5 min, me fui 👋")
+                    await text_channel.send(f"Sin música por {rato_de(IDLE_TIMEOUT)}, me fui 👋")
             est.idle = None
 
         est.idle = asyncio.create_task(_task())
