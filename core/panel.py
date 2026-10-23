@@ -181,3 +181,16 @@ class PlayerPanel(discord.ui.View):
         await self._cambiar(
             interaction, lambda vc: self.cog.poner_autoplay(guild_id, vc, not self.cog.autoplay_activo(guild_id))
         )
+
+    @discord.ui.button(emoji="📻", label="Radio", style=GRIS, row=2, custom_id="lavadj:radio")
+    async def radio(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc, guild = self._vc(interaction), interaction.guild
+        antes = self._huella(self.pintar(vc, guild))
+        await interaction.response.defer(ephemeral=True, thinking=True)     # buscar el mix tarda más que los 3 s de Discord
+        await interaction.followup.send(await self.cog.poner_radio(guild), ephemeral=True)
+        embed = self.pintar(vc, guild)      # el aviso va en privado, pero si se encendió el autoplay o cambió el "Después" el panel se repinta
+        if self._huella(embed) != antes:
+            try:
+                await interaction.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                log.debug("no pude editar el panel", exc_info=True)

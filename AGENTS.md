@@ -47,8 +47,8 @@ en Linux, `LAVALINK_MEMORY` y `LAVALINK_CPUS`.
 
 | Ruta | Responsabilidad |
 |---|---|
-| `bot.py` | Arranque y carga de cogs; lista blanca de servidores (check global, `on_guild_join`); registro de los comandos de barra (una vez por proceso: por servidor con lista blanca, global sin ella); `/refresh`; apagado ordenado |
-| `cogs/music.py` | Comandos de Discord de música (wavelink), eventos de pista, el vigilante que destraba la cola y el guardado/retoma de colas |
+| `bot.py` | Arranque y carga de cogs; lista blanca de servidores (check global, `on_guild_join`); registro de los comandos de barra (una vez por proceso: por servidor con lista blanca, global sin ella); `/refresh`; apagado ordenado (con `todo`, `bajar_lavalink` baja también el nodo, ver "API HTTP de los paneles") |
+| `cogs/music.py` | Comandos de Discord de música (wavelink), eventos de pista, el vigilante que destraba la cola y el guardado/retoma de colas; la radio sigue a lo último pedido: `rearmar_radio` cambia la `auto_queue` por el mix de YouTube Music (`list=RD<id>`, la consulta del AutoPlay de wavelink) del tema, sin él ni lo ya sonado, bajo el `_auto_lock` de wavelink y sin tocar `queue`; se dispara en segundo plano al pedir un tema suelto con `play`, `playnext` o `search` (no con playlists, Spotify ni con el autoplay apagado) y a mano con `poner_radio` (`/radio` y el botón 📻) |
 | `core/config.py` | Toda la configuración (`.env` y constantes); `.env.example` es su plantilla |
 | `core/estacion.py` | El estado de un servidor en un solo objeto (`Estacion`); `teardown` lo tira entero |
 | `core/reintentos.py` | Política de reintentos de una pista caída: función pura, el cog aplica la decisión (2 reintentos por pista; 3 caídas seguidas paran la cola y `!play` la retoma) |
@@ -294,15 +294,20 @@ sea `127.0.0.1`, `localhost` o `[::1]` con su puerto (DNS rebinding) y los POST 
 | `/api/voces/borrar` | POST | Borra una voz instalada que no esté en uso (`?voz=<id>`) |
 | `/api/guionista` | GET/POST | Guionista en uso, cuáles están disponibles y su modelo; con POST lo cambia y guarda la elección (`?nombre=frases\|claude\|ollama`) |
 | `/api/refresh_news` | POST | Rebaja los titulares ahora mismo |
-| `/api/stop` | POST | Cierre limpio del bot |
+| `/api/radio` | POST | Rearma el autoplay desde lo que suena (`?servidor=<id>`; sin él, el primero que suene): `cog.poner_radio` y `{"ok", "aviso"}`; 503 sin cog, 409 si no suena nada |
+| `/api/stop` | POST | Cierre limpio del bot (`?motivo=`). Con `?todo=1`, después de cerrar baja también Lavalink con el script de cada sistema (`lavalink.ps1 stop` / `start-lavalink.sh stop`, plazo de 30 s; un fallo solo deja un aviso en el log). Sin `todo` Lavalink sigue arriba: es lo que usan `probar-que-suena.py --cortar-bot` y los scripts |
 
 ## Arranque diario
 
 - **Linux:** `scripts/instalar-acceso-directo.sh` crea el lanzador del panel GTK4;
-  desde ahí, botón **Salir al aire** (levanta Lavalink si está abajo y después el bot).
+  desde ahí, botón **Salir al aire** (levanta Lavalink si está abajo y después el bot);
+  **Cortar** baja todo: el bot, que se despide de los canales de voz y baja Lavalink
+  (`todo=1`), y el panel lo verifica y lo baja él si el nodo sigue arriba.
 - **Windows:** `scripts\windows\crear-acceso-directo.ps1` crea un acceso directo que
   corre `start.ps1` (Lavalink, bot y panel web).
-- El panel web queda en `http://127.0.0.1:9876/` mientras el bot esté arriba.
+- El panel web queda en `http://127.0.0.1:9876/` mientras el bot esté arriba. **Apagar
+  todo** (pide confirmar con un segundo click) baja el bot y Lavalink; cuando la API deja
+  de contestar, el panel avisa de que todo está apagado. Para volver, el acceso directo.
 
 ## Convenciones
 

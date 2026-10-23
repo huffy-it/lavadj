@@ -262,6 +262,24 @@ async def handle_letra(request: web.Request) -> web.Response:
     return _letra_json(None, **datos, sincronizada=letra.sincronizada, lineas=lineas)
 
 
+async def handle_radio(request: web.Request) -> web.Response:
+    """Rearma el autoplay desde lo que suena. `?servidor=<id>`; sin él, el primero que tenga algo sonando."""
+    bot = request.app["bot"]
+    cog = bot.get_cog(COG)
+    if not cog:
+        return _sin_cog()
+    guild = _sala_sonando(bot, request.query.get("servidor"))
+    if guild is None:
+        return web.json_response({"ok": False, "aviso": "No hay nada sonando."}, status=409)
+    try:
+        aviso = await cog.poner_radio(guild)
+    except Exception:
+        log.exception("API: error armando la radio de %s", guild.id)
+        return web.json_response({"ok": False, "aviso": "No pude armar la radio de este tema."}, status=500)
+    log.info("API: radio de lo que suena en %s", guild.id)
+    return web.json_response({"ok": True, "aviso": aviso})
+
+
 async def handle_dj_volume(request: web.Request) -> web.Response:
     """Lee o mueve el volumen de la voz del DJ (0-200%)."""
     dj = _dj(request)
@@ -403,12 +421,15 @@ async def handle_stop(request: web.Request) -> web.Response:
     # Quién lo pidió queda en el log: si la transmisión se corta sola, esto es
     # lo primero que hay que poder mirar.
     motivo = request.query.get("motivo") or "sin motivo declarado"
-    log.info("API: me pidieron cortar la transmisión (%s)", motivo)
+    todo = request.query.get("todo") == "1"
+    log.info("API: me pidieron cortar la transmisión (%s)%s", motivo, " y bajar Lavalink" if todo else "")
     # Avisamos y devolvemos la respuesta; el cierre ocurre en bot.py, que espera
     # este evento y llama a bot.close(). Matar el proceso aquí dejaría al bot
     # colgado en el canal de voz hasta que Discord se diera cuenta.
+    if todo:
+        request.app["bot"].apagar_todo = True    # antes del evento: bot.py lo lee al terminar de cerrar
     request.app["apagar"].set()
-    return web.json_response({"status": "stopping"})
+    return web.json_response({"status": "stopping", "todo": todo})
 
 
 def _anfitriones_locales(puerto: int) -> frozenset[str]:
@@ -460,6 +481,7 @@ def crear_app(bot, apagar: asyncio.Event, puerto: int) -> web.Application:
         web.get("/api/status", handle_status),
         web.get("/api/headlines", handle_headlines),
         web.get("/api/letra", handle_letra),
+        web.post("/api/radio", handle_radio),
         web.get("/api/dj_volume", handle_dj_volume),
         web.post("/api/dj_volume", handle_dj_volume),
         web.get("/api/voces", handle_voces),

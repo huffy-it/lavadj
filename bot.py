@@ -3,6 +3,7 @@ import contextlib
 import logging
 import os
 import signal
+import subprocess
 
 import discord
 import wavelink
@@ -11,7 +12,10 @@ from discord.ext import commands
 from core import config
 from core.logging_setup import setup_logging
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+RAIZ = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(RAIZ, "logs")
+ES_WINDOWS = os.name == "nt"
+PLAZO_BAJAR_LAVALINK = 30   # segundos que se le da al script que baja el nodo
 setup_logging(LOG_DIR)
 log = logging.getLogger("bot")
 
@@ -28,6 +32,8 @@ bot = commands.Bot(command_prefix=config.PREFIX, intents=intents)
 # Una sola para todo el bot: el cog y los players de cada servidor la comparten,
 # así lo que uno aprende de yt-dlp (videos bloqueados, versión) lo ven todos.
 bot.resolver = Resolver()
+# La API lo enciende con `POST /api/stop?todo=1`: tras el cierre ordenado también se baja Lavalink.
+bot.apagar_todo = False
 # Lo guardado en disco se retoma solo cuando el nodo queda listo por primera vez.
 guardadas_retomadas = False
 # El árbol de comandos de barra se sincroniza una sola vez por proceso.
@@ -228,8 +234,36 @@ async def conectar_lavalink() -> None:
     )
 
 
+def comando_para_bajar_lavalink() -> list[str]:
+    """El script de cada sistema (el mismo de los accesos directos), sin shell."""
+    if ES_WINDOWS:
+        script = os.path.join(RAIZ, "scripts", "windows", "lavalink.ps1")
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "stop"]
+    return [os.path.join(RAIZ, "scripts", "lavalink", "start-lavalink.sh"), "stop"]
+
+
+async def bajar_lavalink() -> None:
+    """Baja el nodo de audio con tiempo límite. Un fallo se anota y no frena el cierre."""
+    try:
+        resultado = await asyncio.to_thread(
+            subprocess.run, comando_para_bajar_lavalink(), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, errors="replace", timeout=PLAZO_BAJAR_LAVALINK,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Lavalink no bajó en %s s: puede seguir arriba", PLAZO_BAJAR_LAVALINK)
+        return
+    except Exception:  # noqa: BLE001 - cerrar tiene que seguir pase lo que pase
+        log.exception("No pude ejecutar el script que baja Lavalink")
+        return
+    lineas = (resultado.stdout + resultado.stderr).strip().splitlines()
+    if resultado.returncode:
+        log.warning("El script que baja Lavalink falló (código %s): %s", resultado.returncode, lineas[-1] if lineas else "sin salida")
+    else:
+        log.info("Lavalink: %s", lineas[-1] if lineas else "bajado")
+
+
 async def esperar_orden_de_apagado(apagar: asyncio.Event) -> None:
-    """Cierra el bot cuando lo pide la API (o un SIGTERM), sin cortar de golpe."""
+    """Cierra el bot cuando lo pide la API (o un SIGTERM), sin cortar de golpe; con `apagar_todo`, baja también Lavalink."""
     await apagar.wait()
     log.info("Cerrando: me despido de los canales de voz")
     # Antes de desconectar: sin players, la foto que se escribiera quedaría vacía.
@@ -244,6 +278,9 @@ async def esperar_orden_de_apagado(apagar: asyncio.Event) -> None:
         except Exception:  # noqa: BLE001 - cerrar tiene que seguir pase lo que pase
             log.exception("No pude desconectar el player de %s", getattr(vc, "guild", "?"))
     await bot.close()
+    if bot.apagar_todo:
+        log.info("Bajando también Lavalink")
+        await bajar_lavalink()
 
 
 async def main():
@@ -260,16 +297,20 @@ async def main():
     # Después de bindear el puerto, no antes: si ya hay otro bot corriendo, esto
     # muere aquí con "address in use" sin haberle borrado los clips en uso.
     log.info("Caché limpiada: %s del DJ", purge_dj_cache())
-    mantenimiento = None
+    mantenimiento = apagado = None
     try:
         async with bot:
             await bot.load_extension('cogs.music')
             bot.loop.create_task(conectar_lavalink())
             # yt-dlp se queda viejo con el bot arriba: se revisa al arrancar y cada día.
             mantenimiento = bot.loop.create_task(bot.resolver.mantener_al_dia())
-            bot.loop.create_task(esperar_orden_de_apagado(apagar))
+            apagado = bot.loop.create_task(esperar_orden_de_apagado(apagar))
             await bot.start(config.DISCORD_TOKEN)
     finally:
+        if apagado is not None and apagar.is_set():
+            # Bajar Lavalink va después de bot.close(): sin esperar la tarea, asyncio.run la cancela a medias.
+            # La API se cierra después, así que cuando deja de contestar ya no queda nada arriba.
+            await asyncio.wait([apagado], timeout=PLAZO_BAJAR_LAVALINK + 10)
         if mantenimiento is not None:
             # Cancelar corta una actualización a medias. Con plazo: wait_for puede tragarse una cancelación.
             mantenimiento.cancel()

@@ -1,6 +1,6 @@
 # Levanta Lavalink (si hace falta), abre el panel web y corre el bot en esta
-# ventana (se ve el log). Ctrl+C o cerrar la ventana apaga el bot; Lavalink
-# queda abajo con:  scripts\windows\lavalink.ps1 stop
+# ventana (se ve el log). "Apagar todo" en el panel web baja el bot y Lavalink;
+# con Ctrl+C o cerrando la ventana Lavalink queda arriba (scripts\windows\lavalink.ps1 stop).
 $ErrorActionPreference = "Stop"
 $Raiz = (Resolve-Path "$PSScriptRoot\..\..").Path
 Set-Location $Raiz

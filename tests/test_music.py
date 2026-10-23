@@ -40,6 +40,9 @@ class FakeQueue(list):
         self.insert(index, track)
     def get(self):
         return self.pop(0)
+    def put(self, temas):
+        self.extend(temas)
+        return len(temas)
 
 class FakeGuild:
     def __init__(self, guild_id=1):
@@ -59,6 +62,8 @@ class FakePlayer:
     def __init__(self, playing=False, temas=(), auto=(), guild=None):
         self.playing, self.paused, self.connected = playing, False, True
         self.queue, self.auto_queue = FakeQueue(temas), FakeQueue(auto)
+        self.queue.history, self.auto_queue.history = FakeQueue(), FakeQueue()
+        self.node, self._auto_lock = "nodo-de-audio", asyncio.Lock()
         self.guild = guild or FakeGuild()
         self.channel = "canal-de-voz"
         self.autoplay = wavelink.AutoPlayMode.disabled
@@ -358,6 +363,260 @@ async def test_dj_vol(cog, args, volumen, aviso):
     ctx = FakeCtx()
     await cog.dj_cmd(cog, ctx, *args)
     assert cog.dj.volume == volumen and aviso in ctx.ultimo
+# --- la radio: el autoplay que sigue a lo último que se pidió ------------------------------------
+
+def _playlist(*ids):
+    lista = wavelink.Playlist.__new__(wavelink.Playlist)
+    lista.name, lista.tracks = "YouTube mix", [_tema(i) for i in ids]
+    return lista
+
+def _ids(cola):
+    return [t.identifier for t in cola]
+
+def _tocando(id_="sonando", **kwargs):
+    vc = FakePlayer(playing=True, **kwargs)
+    vc.current = _tema(id_)
+    vc.guild.voice_client = vc
+    return vc
+
+@pytest.fixture
+def radios(monkeypatch):
+    """Anota a partir de qué pista se rearma la radio, sin ir a buscar el mix."""
+    rearmadas = []
+    async def _rearmar(self, vc, pista):
+        rearmadas.append(pista)
+        return 1
+
+    monkeypatch.setattr(Music, "rearmar_radio", _rearmar)
+    return rearmadas
+
+async def _tareas(cog):
+    await asyncio.gather(*cog._tareas)
+
+async def test_rearmar_radio_cambia_la_auto_queue_por_el_mix_sin_la_pista_ni_lo_ya_sonado(cog, monkeypatch):
+    cog._autoplay[1] = True
+    vc = FakePlayer(playing=True, temas=[_tema("pedido")], auto=[_tema("vieja")])
+    vc.current = _tema("actual")
+    vc.queue.history.append(_tema("sono1"))
+    vc.auto_queue.history.append(_tema("sono2"))
+    pedidas = []
+    async def _search(query, *a, **kw):
+        pedidas.append((query, kw))
+        return _playlist("semilla", "a", "sono1", "b", "pedido", "sono2", "actual", "c", "a")
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _search)
+    cola = list(vc.queue)
+    assert await cog.rearmar_radio(vc, _tema("semilla")) == 3
+    assert _ids(vc.auto_queue) == ["a", "b", "c"] and all(t._recommended for t in vc.auto_queue)
+    assert list(vc.queue) == cola       # lo que pidió la gente no se toca
+    assert pedidas == [("https://music.youtube.com/watch?v=semilla&list=RDsemilla", {"node": "nodo-de-audio"})]
+
+@pytest.mark.parametrize("mix", [
+    RuntimeError("Lavalink no responde"), wavelink.InvalidNodeException("sin nodo"), [], _playlist("semilla", "sono"),
+], ids=["falla", "sin-nodo", "vacio", "todo-ya-sono"])
+async def test_si_el_mix_falla_viene_vacio_o_ya_sono_todo_la_auto_queue_queda_vacia(cog, monkeypatch, mix):
+    cog._autoplay[1] = True
+    vc = FakePlayer(playing=True, temas=[_tema("pedido")], auto=[_tema("vieja")])
+    vc.queue.history.append(_tema("sono"))
+    _busca(monkeypatch, mix)
+    assert await cog.rearmar_radio(vc, _tema("semilla")) == 0
+    assert not vc.auto_queue and _ids(vc.queue) == ["pedido"]
+
+async def test_si_lavalink_tarda_mas_del_plazo_el_mix_se_da_por_fallido(cog, monkeypatch):
+    cog._autoplay[1] = True
+    async def _colgada(query, *a, **kw):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _colgada)
+    monkeypatch.setattr(music_mod, "RADIO_ESPERA", 0.01)
+    vc = FakePlayer(auto=[_tema("vieja")])
+    assert await asyncio.wait_for(cog.rearmar_radio(vc, _tema("semilla")), 1) == 0 and not vc.auto_queue
+
+@pytest.mark.parametrize("pista", [FakeTrack("de otra fuente"), _clip_del_dj()], ids=["sin-id-de-youtube", "clip-del-dj"])
+async def test_sin_un_id_de_youtube_de_donde_partir_no_busca_y_deja_la_auto_queue_vacia(cog, monkeypatch, pista):
+    cog._autoplay[1] = True
+    consultas = _busca(monkeypatch, _playlist("a"))
+    vc = FakePlayer(auto=[_tema("vieja")])
+    assert await cog.rearmar_radio(vc, pista) == 0 and consultas == [] and not vc.auto_queue
+
+async def test_rearmar_radio_espera_a_que_wavelink_termine_su_recomendacion(cog, monkeypatch):
+    cog._autoplay[1] = True
+    _busca(monkeypatch, _playlist("a"))
+    vc = FakePlayer(auto=[_tema("vieja")])
+    async with vc._auto_lock:       # wavelink está armando la suya
+        tarea = asyncio.create_task(cog.rearmar_radio(vc, _tema("semilla")))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not tarea.done() and _ids(vc.auto_queue) == ["vieja"]
+        vc.auto_queue.append(_tema("rancia"))       # lo que acabe agregando wavelink
+    assert await tarea == 1 and _ids(vc.auto_queue) == ["a"]
+
+@pytest.mark.parametrize("motivo", ["desconectado", "autoplay-apagado"])
+async def test_si_mientras_buscaba_se_fue_el_player_o_se_apago_el_autoplay_no_toca_la_auto_queue(cog, monkeypatch, motivo):
+    cog._autoplay[1] = True
+    vc = FakePlayer(auto=[_tema("vieja")])
+    async def _search(query, *a, **kw):
+        if motivo == "desconectado":
+            vc.connected = False
+        else:
+            cog._autoplay[1] = False
+        return _playlist("a")
+
+    monkeypatch.setattr(music_mod.wavelink.Playable, "search", _search)
+    assert await cog.rearmar_radio(vc, _tema("semilla")) == 0 and _ids(vc.auto_queue) == ["vieja"]
+
+@pytest.mark.parametrize("ocupado", [True, False], ids=["sonando", "libre"])
+@pytest.mark.parametrize("comando", ["play", "playnext"])
+async def test_pedir_un_tema_suelto_rearma_la_radio_a_partir_de_el(cog, monkeypatch, radios, comando, ocupado):
+    cog._autoplay[1] = True
+    vc = FakePlayer(playing=ocupado)
+    ctx = _conectar(monkeypatch, vc)
+    tema = _tema("pedido")
+    _busca(monkeypatch, [tema])
+    await getattr(cog, comando)(cog, ctx, query="pedido")
+    await _tareas(cog)
+    assert radios == [tema]
+
+@pytest.mark.parametrize("elige", [True, False], ids=["elige", "se-acaba-el-tiempo"])
+async def test_elegir_con_search_rearma_la_radio_a_partir_del_elegido(cog, monkeypatch, radios, elige):
+    cog._autoplay[1] = True
+    vc = FakePlayer(playing=True)
+    ctx = FakeCtx(vc)
+    async def _connect(self, ctx):
+        return vc
+    async def _nada(emoji):
+        return None
+    async def _send(contenido=None, **kwargs):
+        return SimpleNamespace(id=7, add_reaction=_nada)
+    async def _wait_for(evento, *, timeout, check):
+        if not elige:
+            raise asyncio.TimeoutError
+        return SimpleNamespace(emoji="2️⃣"), ctx.author
+
+    monkeypatch.setattr(Music, "_connect_voice", _connect)
+    ctx.send = _send
+    cog.bot = SimpleNamespace(wait_for=_wait_for)
+    temas = [_tema("a"), _tema("b")]
+    _busca(monkeypatch, temas)
+    await cog.search_cmd(cog, ctx, query="algo")
+    await _tareas(cog)
+    assert radios == ([temas[1]] if elige else [])
+
+@pytest.mark.parametrize("comando", ["play", "playnext"])
+async def test_una_playlist_no_rearma_la_radio(cog, monkeypatch, radios, comando):
+    cog._autoplay[1] = True
+    vc = FakePlayer(playing=True)
+    ctx = _conectar(monkeypatch, vc)
+    _busca(monkeypatch, _playlist("a", "b"))
+    await getattr(cog, comando)(cog, ctx, query="https://www.youtube.com/playlist?list=x")
+    await _tareas(cog)
+    assert radios == []
+
+@pytest.mark.parametrize("comando", ["play", "playnext"])
+async def test_un_link_de_spotify_no_rearma_la_radio(cog, monkeypatch, radios, comando):
+    cog._autoplay[1] = True
+    cog._session = object()
+    vc = FakePlayer(playing=True)
+    ctx = _conectar(monkeypatch, vc)
+    _busca(monkeypatch, [_tema("de-youtube")])
+    _con_lista_de_spotify(monkeypatch, "Artista - Tema")
+    await getattr(cog, comando)(cog, ctx, query="https://open.spotify.com/track/x")
+    await _tareas(cog)
+    assert radios == [] and vc.queue
+
+async def test_con_el_autoplay_apagado_pedir_un_tema_no_busca_ningun_mix(cog, monkeypatch):
+    cog._autoplay[1] = False
+    vc = FakePlayer(playing=True)
+    ctx = _conectar(monkeypatch, vc)
+    consultas = _busca(monkeypatch, [_tema("pedido")])
+    await cog.play(cog, ctx, query="pedido")
+    await _tareas(cog)
+    assert consultas == ["pedido"] and not vc.auto_queue
+
+async def test_los_clips_del_dj_y_lo_que_no_es_de_youtube_no_rearman_nada(cog, radios):
+    cog._autoplay[1] = True
+    for pista in (_clip_del_dj(), FakeTrack("de otra fuente")):
+        await cog._radio_tras_pedir(FakePlayer(), pista)
+    assert radios == []
+
+async def test_el_rearmado_no_demora_la_respuesta_del_comando(cog, monkeypatch):
+    cog._autoplay[1] = True
+    soltar = asyncio.Event()
+    async def _lenta(self, vc, pista):
+        await soltar.wait()
+        return 1
+
+    monkeypatch.setattr(Music, "rearmar_radio", _lenta)
+    vc = FakePlayer(playing=True)
+    ctx = _conectar(monkeypatch, vc)
+    _busca(monkeypatch, [_tema("pedido")])
+    await asyncio.wait_for(cog.play(cog, ctx, query="pedido"), 1)
+    assert len(cog._tareas) == 1 and "Cola #1" in ctx.ultimo
+    soltar.set()
+    await _tareas(cog)
+
+async def test_si_rearmar_la_radio_revienta_en_segundo_plano_no_escapa(cog, monkeypatch, caplog):
+    cog._autoplay[1] = True
+    async def _revienta(self, vc, pista):
+        raise RuntimeError("se cayó")
+
+    monkeypatch.setattr(Music, "rearmar_radio", _revienta)
+    await cog._radio_tras_pedir(FakePlayer(), _tema("pedido"))
+    assert "No pude rearmar la radio" in caplog.text
+
+async def test_poner_radio_rearma_desde_lo_que_suena_aunque_sea_del_autoplay_y_avisa(cog, monkeypatch):
+    cog._autoplay[1] = True
+    vc = _tocando(auto=[_tema("vieja")])
+    vc.auto_queue.history.append(vc.current)    # lo puso el autoplay: no está en el historial de pedidos
+    consultas = _busca(monkeypatch, _playlist("sonando", "a", "b"))
+    assert await cog.poner_radio(vc.guild) == "📻 Radio armada a partir de **sonando** (2 temas)"
+    assert _ids(vc.auto_queue) == ["a", "b"] and consultas == ["https://music.youtube.com/watch?v=sonando&list=RDsonando"]
+
+async def test_poner_radio_con_un_solo_tema_lo_dice_en_singular(cog, monkeypatch):
+    cog._autoplay[1] = True
+    vc = _tocando()
+    _busca(monkeypatch, _playlist("a"))
+    assert await cog.poner_radio(vc.guild) == "📻 Radio armada a partir de **sonando** (1 tema)"
+
+async def test_poner_radio_enciende_el_autoplay_si_estaba_apagado(cog, monkeypatch):
+    cog._autoplay[1] = False
+    vc = _tocando()
+    vc.autoplay = wavelink.AutoPlayMode.partial
+    _busca(monkeypatch, _playlist("a"))
+    assert "Radio armada" in await cog.poner_radio(vc.guild)
+    assert cog.autoplay_activo(1) and vc.autoplay is wavelink.AutoPlayMode.enabled and _ids(vc.auto_queue) == ["a"]
+
+async def test_poner_radio_avisa_si_no_pudo_y_deja_que_wavelink_recomiende_de_nuevo(cog, monkeypatch):
+    cog._autoplay[1] = True
+    vc = _tocando(auto=[_tema("vieja")])
+    _busca(monkeypatch, RuntimeError("Lavalink no responde"))
+    aviso = await cog.poner_radio(vc.guild)
+    assert aviso.startswith("📻 No pude armar una radio a partir de **sonando**") and not vc.auto_queue
+
+@pytest.mark.parametrize("falta, aviso", [
+    ("voz", "No hay nada reproduciendo."), ("tema", "No hay nada reproduciendo."), ("dj", "habla el DJ"),
+])
+async def test_poner_radio_sin_un_tema_que_suene_avisa_y_no_cambia_nada(cog, monkeypatch, falta, aviso):
+    cog._autoplay[1] = False
+    vc = _tocando(auto=[_tema("vieja")])
+    consultas = _busca(monkeypatch, _playlist("a"))
+    if falta == "voz":
+        vc.guild.voice_client = None
+    elif falta == "tema":
+        vc.current = None
+    else:
+        vc.current = _clip_del_dj(f"{music_mod.tts.CACHE_DIR}/dj_abc.wav")
+    assert aviso in await cog.poner_radio(vc.guild)
+    assert consultas == [] and _ids(vc.auto_queue) == ["vieja"] and not cog.autoplay_activo(1)
+
+async def test_el_comando_radio_hace_lo_mismo_que_el_boton(cog, monkeypatch):
+    cog._autoplay[1] = True
+    vc = _tocando()
+    ctx = FakeCtx(vc)
+    _busca(monkeypatch, _playlist("a", "b"))
+    await cog.radio_cmd(cog, ctx)
+    assert ctx.eventos == ["defer"] and ctx.enviados == ["📻 Radio armada a partir de **sonando** (2 temas)"]
+    assert _ids(vc.auto_queue) == ["a", "b"]
 # --- reintentos cuando Lavalink no puede sacar el audio ---------------------------------
 
 async def test_una_pista_que_falla_vuelve_al_frente_de_la_cola(cog, sin_espera):
@@ -1692,9 +1951,9 @@ async def test_un_error_dentro_de_la_tarea_se_anota_y_no_escapa(cog, sin_panel, 
 
 HIBRIDOS = {
     "play", "playnext", "autoplay", "pause", "resume", "skip", "stop", "queue", "nowplaying",
-    "panel", "loop", "shuffle", "volume", "remove", "dj", "lyrics", "letra",
+    "panel", "loop", "shuffle", "volume", "remove", "dj", "lyrics", "letra", "radio",
 }
-CON_CONTROL = ("pause", "resume", "skip", "stop", "loop", "shuffle", "volume", "remove", "letra")
+CON_CONTROL = ("pause", "resume", "skip", "stop", "loop", "shuffle", "volume", "remove", "letra", "radio")
 ALIAS = {
     "p": "play", "pn": "playnext", "next": "playnext", "ap": "autoplay", "r": "resume", "s": "skip",
     "q": "queue", "np": "nowplaying", "l": "loop", "vol": "volume", "rm": "remove", "ly": "lyrics",
@@ -1746,6 +2005,7 @@ def test_solo_query_de_play_y_playnext_se_autocompleta():
 
 @pytest.mark.parametrize("comando, args", [
     ("play", {"query": "algo"}), ("playnext", {"query": "algo"}), ("lyrics_cmd", {}), ("stop", {}), ("panel_cmd", {}),
+    ("radio_cmd", {}),
 ])
 async def test_los_comandos_lentos_difieren_la_respuesta_antes_de_hacer_nada(cog, monkeypatch, comando, args):
     ctx = FakeCtx()

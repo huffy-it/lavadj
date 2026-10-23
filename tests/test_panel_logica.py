@@ -358,6 +358,91 @@ def test_levantar_lavalink_fallido_devuelve_la_ultima_linea_corta_o_el_motivo(lo
     assert logica.levantar_lavalink() == "Lavalink tardó demasiado en levantar"
 
 
+def test_bajar_lavalink_corre_stop_con_plazo(logica, monkeypatch):
+    llamadas = _doble_run(monkeypatch, logica, resultado=_completado(0, "Lavalink detenido."))
+    assert logica.bajar_lavalink() == ""
+    comando, kwargs = llamadas[0]
+    assert comando == [str(logica.LAVALINK_SCRIPT), "stop"]
+    assert kwargs["timeout"] == 60 and kwargs["capture_output"] and kwargs["text"]
+
+
+def test_bajar_lavalink_fallido_devuelve_el_motivo_igual_que_al_levantar(logica, monkeypatch):
+    _doble_run(monkeypatch, logica, resultado=_completado(1, "uno\n", "podman roto\n"))
+    assert logica.bajar_lavalink() == "podman roto"
+    _doble_run(monkeypatch, logica, resultado=_completado(1, "  \n", ""))
+    assert logica.bajar_lavalink() == "no pude bajar Lavalink"
+    _doble_run(monkeypatch, logica, lanza=FileNotFoundError())
+    assert logica.bajar_lavalink() == "falta start-lavalink.sh"
+    _doble_run(monkeypatch, logica, lanza=subprocess.TimeoutExpired("cmd", 60))
+    assert logica.bajar_lavalink() == "Lavalink tardó demasiado en bajar"
+
+
+@pytest.fixture
+def corte(logica, monkeypatch):
+    """`cortar_todo` sin red ni sueño: el bot contesta `vivo` veces más antes de soltar la API; el reloj avanza lo que se duerme."""
+    e = SimpleNamespace(posts=[], consultas=0, vivo=2, nodo_arriba=True, error_post="", error_bajar="",
+                        bajadas=[], ahora=0.0)
+
+    def postear(ruta, timeout=2.0, **params):
+        e.posts.append((ruta, params))
+        return e.error_post
+
+    def estado_bot():
+        e.consultas += 1
+        return {"usuario": "LavaDJ"} if e.consultas <= e.vivo else None
+
+    def bajar():
+        e.bajadas.append(e.consultas)
+        return e.error_bajar
+
+    def dormir(segundos):
+        e.ahora += segundos
+
+    monkeypatch.setattr(logica, "postear", postear)
+    monkeypatch.setattr(logica, "estado_bot", estado_bot)
+    monkeypatch.setattr(logica, "lavalink_arriba", lambda: e.nodo_arriba)
+    monkeypatch.setattr(logica, "bajar_lavalink", bajar)
+    monkeypatch.setattr(logica, "time", SimpleNamespace(monotonic=lambda: e.ahora, sleep=dormir))
+    return e
+
+
+def test_cortar_todo_pide_el_cierre_con_todo_y_baja_lavalink_cuando_el_bot_ya_soltó_la_api(logica, corte):
+    assert logica.cortar_todo("boton Cortar del panel") == ""
+    assert corte.posts == [("stop", {"motivo": "boton Cortar del panel", "todo": 1})]
+    assert corte.bajadas == [3]     # tras dos respuestas vivas y la que ya no contestó: los players se despidieron con el nodo arriba
+
+
+def test_cortar_todo_no_toca_el_nodo_si_el_bot_ya_lo_bajo(logica, corte):
+    corte.nodo_arriba = False
+    assert logica.cortar_todo("x") == ""
+    assert corte.bajadas == []
+
+
+def test_cortar_todo_devuelve_el_motivo_si_no_se_pudo_bajar_el_nodo(logica, corte):
+    corte.error_bajar = "podman roto"
+    assert logica.cortar_todo("x") == "podman roto"
+
+
+def test_cortar_todo_con_el_bot_sin_contestar_no_espera_ni_baja_nada(logica, corte):
+    corte.error_post = "Connection refused"
+    assert logica.cortar_todo("x") == "Connection refused"
+    assert corte.consultas == 0 and corte.bajadas == [] and corte.ahora == 0
+
+
+def test_cortar_todo_si_el_bot_no_cierra_a_tiempo_no_baja_el_nodo(logica, corte):
+    """Con el bot todavía en los canales, bajar Lavalink los dejaría colgados."""
+    corte.vivo = 10_000
+    assert logica.cortar_todo("x", espera=3) == "el bot no cerró a tiempo"
+    assert corte.bajadas == [] and 3 <= corte.ahora < 4
+
+
+def test_el_boton_cortar_del_panel_pasa_por_cortar_todo():
+    arbol = ast.parse((SCRIPTS / "lavadj-panel.py").read_text(encoding="utf-8"))
+    metodo = next(n for n in ast.walk(arbol) if isinstance(n, ast.FunctionDef) and n.name == "cortar_transmision")
+    nombres = {n.id for n in ast.walk(metodo) if isinstance(n, ast.Name)}
+    assert "cortar_todo" in nombres and "postear" not in nombres
+
+
 @pytest.fixture
 def arranque(logica, monkeypatch, tmp_path):
     """Un proyecto de juguete con venv y `subprocess.Popen` doblado."""

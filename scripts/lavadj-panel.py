@@ -23,10 +23,10 @@ from pathlib import Path
 
 from lavadj_panel_logica import (
     API_BASE, LINEAS_MONITOR, LOG_FILE, REFRESCO, START_LOG, aviso_de_salud,
-    aviso_sin_titulares, botones_activos, consultar, estado_bot, guardar_ajuste,
-    lavalink_arriba, leer_ajustes, levantar_bot, levantar_lavalink, lineas_de_log,
-    motivo_de_la_caida, postear, resumen_de_titulares, texto_de_estado,
-    veredicto_de_arranque,
+    aviso_sin_titulares, botones_activos, consultar, cortar_todo, estado_bot,
+    guardar_ajuste, lavalink_arriba, leer_ajustes, levantar_bot, levantar_lavalink,
+    lineas_de_log, motivo_de_la_caida, postear, resumen_de_titulares,
+    texto_de_estado, veredicto_de_arranque,
 )
 
 import gi
@@ -111,7 +111,8 @@ class Panel(Adw.ApplicationWindow):
         self.boton_aire.set_child(Adw.ButtonContent(
             icon_name="media-record-symbolic", label="Salir al aire"))
         self.boton_aire.connect("clicked", self.al_aire)
-        self.boton_cortar = Gtk.Button(css_classes=["destructive-action"])
+        self.boton_cortar = Gtk.Button(css_classes=["destructive-action"],
+                                       tooltip_text="Corta la transmisión y baja también el nodo de audio")
         self.boton_cortar.set_child(Adw.ButtonContent(
             icon_name="media-playback-stop-symbolic", label="Cortar"))
         self.boton_cortar.connect("clicked", self.cortar_transmision)
@@ -390,11 +391,14 @@ class Panel(Adw.ApplicationWindow):
         if not self.esta_al_aire:
             return
         self.vigilando = None
-        error = postear("stop", motivo="boton Cortar del panel")
+        # Esperar el cierre y bajar Lavalink tarda: va en un hilo, como al levantar.
+        self.en_hilo(lambda: cortar_todo("boton Cortar del panel"), self.tras_cortar, que="apagando todo…")
+
+    def tras_cortar(self, error: str):
         if error:
-            self.avisar(f"No pude cortar: {error}", falla=True)
+            self.avisar(f"No pude apagar todo: {error}", falla=True)
         else:
-            self.avisar("Transmisión cortada")
+            self.avisar("Transmisión cortada y Lavalink abajo")
 
     def refrescar_noticias(self, _boton):
         if not self.esta_al_aire:

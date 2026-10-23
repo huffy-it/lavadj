@@ -53,6 +53,9 @@ REVISAR_PRECARGA = 5.0
 # Lavalink reporta la posición cada 5 s; con un reporte más viejo (tras una pausa larga) no se extrapola.
 REPORTE_VIGENTE_MS = 6000
 
+# Lo que se espera al mix de la radio; vencido el plazo, wavelink recomienda por su cuenta.
+RADIO_ESPERA = 10
+
 # Autocompletado de /play y /playnext. Discord da 3 s para contestar y recorta a 100 caracteres y 25 opciones.
 SUGERENCIAS_MIN = 3
 SUGERENCIAS_MAX = 25
@@ -360,6 +363,63 @@ class Music(commands.Cog):
             if activo
             else "Autoplay apagado: al final de la cola me quedo callado."
         )
+
+    async def rearmar_radio(self, vc: wavelink.Player, pista: wavelink.Playable) -> int:
+        """Cambia la `auto_queue` por el mix de YouTube Music de `pista`, sin ella ni lo que ya sonó; devuelve cuántos temas quedaron.
+
+        Es la consulta del AutoPlay de wavelink. Si la carga falla o no trae nada la deja vacía y wavelink
+        recomienda de nuevo desde el historial. `queue`, lo que pidió la gente, no se toca.
+        """
+        semilla, mix = resolver.video_de(pista), []
+        if semilla:
+            try:
+                res = await asyncio.wait_for(
+                    wavelink.Playable.search(f"https://music.youtube.com/watch?v={semilla}&list=RD{semilla}", node=vc.node),
+                    RADIO_ESPERA,
+                )
+                mix = list(res.tracks if isinstance(res, wavelink.Playlist) else res)[:config.PLAYLIST_LIMIT]
+            except Exception:  # noqa: BLE001 - sin nodo, Lavalink caído o plazo vencido: sin radio nueva y ya
+                log.warning("No pude cargar el mix de %r", resolver.titulo_de(pista), exc_info=True)
+        # El mismo candado con que wavelink arma sus recomendaciones: la `auto_queue` no la tocan los dos a la vez.
+        async with vc._auto_lock:
+            if not vc.connected or not self.autoplay_activo(vc.guild.id):
+                return 0
+            vistos = {
+                resolver.id_de_cancion(t)
+                for t in (pista, vc.current, *vc.queue[:40], *vc.queue.history[:-41:-1], *vc.auto_queue.history[:-61:-1]) if t
+            }
+            temas = []
+            for tema in mix:
+                if (id_ := resolver.id_de_cancion(tema)) not in vistos:
+                    vistos.add(id_)
+                    tema._recommended = True
+                    temas.append(tema)
+            vc.auto_queue.clear()
+            vc.auto_queue.put(temas)
+            return len(temas)
+
+    async def _radio_tras_pedir(self, vc: wavelink.Player, pista: wavelink.Playable) -> None:
+        """Tras pedir un tema suelto, la radio sigue desde él. Va en segundo plano: no demora la respuesta ni rompe nada."""
+        if not (self.autoplay_activo(vc.guild.id) and resolver.video_de(pista)):
+            return
+        try:
+            await self.rearmar_radio(vc, pista)
+        except Exception:  # noqa: BLE001 - tarea suelta: nada de lo que pase puede escapar
+            log.warning("No pude rearmar la radio a partir de %r", resolver.titulo_de(pista), exc_info=True)
+
+    async def poner_radio(self, guild: discord.Guild) -> str:
+        """Rearma la radio a partir de lo que suena (enciende el autoplay si estaba apagado) y devuelve el aviso para quien lo pidió."""
+        vc: wavelink.Player = guild.voice_client
+        if not vc or not vc.current:
+            return "No hay nada reproduciendo."
+        if self.locutor.es_clip(vc.current):
+            return "Ahora habla el DJ: prueba otra vez cuando suene el tema."
+        if not self.autoplay_activo(guild.id):
+            self.poner_autoplay(guild.id, vc, True)
+        titulo, temas = resolver.titulo_de(vc.current), await self.rearmar_radio(vc, vc.current)
+        if not temas:
+            return f"📻 No pude armar una radio a partir de **{titulo}**: sigo con las recomendaciones del historial."
+        return f"📻 Radio armada a partir de **{titulo}** ({temas} tema{'' if temas == 1 else 's'})"
 
     def _espacio_en_cola(self, vc: wavelink.Player) -> int:
         return max(0, config.QUEUE_LIMIT - len(vc.queue))
@@ -1011,6 +1071,7 @@ class Music(commands.Cog):
                 track = tracks[0]
                 track.requester = ctx.author.display_name
                 await vc.queue.put_wait(track)
+                self._segundo_plano(self._radio_tras_pedir(vc, track))
                 if self._ocupado(vc):
                     await ctx.send(f"Cola #{len(vc.queue)}: **{track.title}**")
                 elif ctx.interaction:   # con `/` la respuesta diferida tiene que cerrarse con un mensaje
@@ -1036,7 +1097,8 @@ class Music(commands.Cog):
 
         # De un link de Spotify se toma el primer tema: meter una lista entera
         # adelante de todo no es lo que nadie espera de "la próxima".
-        if spotify.es_spotify(query):
+        de_spotify = spotify.es_spotify(query)
+        if de_spotify:
             lista = await spotify.fetch(self._session, query, limit=1) if self._session else None
             if not lista:
                 return await ctx.send("No pude leer ese link de Spotify.")
@@ -1051,6 +1113,8 @@ class Music(commands.Cog):
 
         track = tracks[0]
         track.requester = ctx.author.display_name
+        if not de_spotify:
+            self._segundo_plano(self._radio_tras_pedir(vc, track))
 
         if not self._ocupado(vc):
             await vc.queue.put_wait(track)
@@ -1191,6 +1255,13 @@ class Music(commands.Cog):
 
         await ctx.send(self.poner_autoplay(ctx.guild.id, ctx.voice_client, modo == "on"))
 
+    @en_el_mismo_canal()
+    @commands.hybrid_command(name='radio', description="Arma una radio nueva a partir de lo que suena y sigue con temas parecidos")
+    async def radio_cmd(self, ctx: commands.Context):
+        """Rehace las recomendaciones del autoplay a partir de lo que suena ahora."""
+        await ctx.defer()
+        await ctx.send(await self.poner_radio(ctx.guild))
+
     # Solo con prefijo: elige con reacciones sobre un mensaje, que no encaja con una respuesta de `/`; `/play` ya autocompleta.
     @commands.command(name='search', aliases=['buscar'])
     async def search_cmd(self, ctx: commands.Context, *, query: str):
@@ -1231,6 +1302,7 @@ class Music(commands.Cog):
         chosen.requester = ctx.author.display_name
 
         await vc.queue.put_wait(chosen)
+        self._segundo_plano(self._radio_tras_pedir(vc, chosen))
         if self._ocupado(vc):
             await ctx.send(f"Cola #{len(vc.queue)}: **{chosen.title}**")
         else:

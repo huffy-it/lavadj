@@ -30,7 +30,7 @@ class FakeDJ:
 
 class FakeCog:
     def __init__(self):
-        self.letra_pedida, self.autoplay_pedido, self.autoplay = [], [], False
+        self.letra_pedida, self.autoplay_pedido, self.radio_pedida, self.autoplay = [], [], [], False
         self.est = SimpleNamespace(letra=SimpleNamespace(activa=False))
         self.dj = FakeDJ()
 
@@ -45,6 +45,12 @@ class FakeCog:
         self.autoplay = activo
         vc.autoplay = wavelink.AutoPlayMode.enabled if activo else wavelink.AutoPlayMode.partial
         return "autoplay encendido" if activo else "autoplay apagado"
+
+    async def poner_radio(self, guild):
+        self.radio_pedida.append(guild)
+        if not self.autoplay:
+            self.poner_autoplay(guild.id, guild.voice_client, True)
+        return "📻 Radio armada a partir de **Tema** (3 temas)"
 
     async def alternar_letra(self, guild, modo=None):
         self.letra_pedida.append((guild, modo))
@@ -83,12 +89,35 @@ class FakePlayer:
 
 class FakeRespuesta:
     def __init__(self):
-        self.enviados, self.editados = [], []
+        self.enviados, self.editados, self.diferidas = [], [], []
+
+    async def defer(self, **kwargs):
+        self.diferidas.append(kwargs)
 
     async def send_message(self, contenido, **kwargs):
         self.enviados.append((contenido, kwargs))
 
     async def edit_message(self, **kwargs):
+        self.editados.append(kwargs)
+
+
+class FakeSeguimiento:
+    """`interaction.followup`: lo que se manda después de diferir la respuesta."""
+
+    def __init__(self):
+        self.enviados = []
+
+    async def send(self, contenido, **kwargs):
+        self.enviados.append((contenido, kwargs))
+
+
+class FakeMensaje:
+    """El mensaje del panel: `interaction.message`."""
+
+    def __init__(self):
+        self.editados = []
+
+    async def edit(self, **kwargs):
         self.editados.append(kwargs)
 
 
@@ -100,7 +129,7 @@ class FakeInteraccion:
         self.guild = SimpleNamespace(id=guild_id, voice_client=self.vc)
         self.user = SimpleNamespace(voice=SimpleNamespace(channel=voz_del_usuario) if voz_del_usuario else None)
         self.data = {"custom_id": boton.custom_id} if boton else {}
-        self.response = FakeRespuesta()
+        self.response, self.followup, self.message = FakeRespuesta(), FakeSeguimiento(), FakeMensaje()
 
 
 @pytest.fixture
@@ -142,20 +171,20 @@ def test_nada_de_la_clase_pisa_la_api_de_view():
     assert not pisados, f"pisan la API de View: {pisados}"
 
 
-def test_estan_los_once_botones_en_tres_filas_y_la_letra_no_se_confunde_con_el_dj(view):
+def test_estan_los_doce_botones_en_tres_filas_y_la_letra_no_se_confunde_con_el_dj(view):
     assert [(b.emoji.name, b.row) for b in view.children] == [
         ("⏸️", 0), ("⏭️", 0), ("⏹️", 0), ("🔁", 0), ("🔀", 0),
         ("🔉", 1), ("🔊", 1), ("📋", 1),
-        ("🎙️", 2), ("🎤", 2), ("🔮", 2),
+        ("🎙️", 2), ("🎤", 2), ("🔮", 2), ("📻", 2),
     ]
     por_emoji = {b.emoji.name: b for b in view.children}
-    assert por_emoji["🎤"].label == "Letra" and por_emoji["🎙️"].label is None
+    assert por_emoji["🎤"].label == "Letra" and por_emoji["🎙️"].label is None and por_emoji["📻"].label == "Radio"
 
 
 def test_todos_los_botones_tienen_custom_id_fijo_y_unico(view):
     ids = [b.custom_id for b in view.children]
 
-    assert len(ids) == 11 and all(ids) and len(set(ids)) == len(ids)
+    assert len(ids) == 12 and all(ids) and len(set(ids)) == len(ids) and "lavadj:radio" in ids
     assert [b.custom_id for b in PlayerPanel(FakeCog()).children] == ids    # fijo: no cambia de una vista a otra
     assert ID_COLA in ids
     assert view.is_persistent()
@@ -255,6 +284,35 @@ async def test_el_boton_de_la_letra_alterna_y_repinta_sin_aviso_aparte(view):
     assert not view.cog.est.letra.activa and view.letra_en_vivo.style is GRIS
 
 
+async def test_el_boton_de_radio_rearma_y_responde_en_privado_con_el_aviso_del_cog(view):
+    yo = await _pulsa(view.radio)
+
+    assert view.cog.radio_pedida == [yo.guild]
+    assert yo.response.diferidas == [{"ephemeral": True, "thinking": True}]     # buscar el mix tarda más que los 3 s de Discord
+    assert yo.followup.enviados == [("📻 Radio armada a partir de **Tema** (3 temas)", {"ephemeral": True})]
+    assert yo.response.enviados == [] and yo.response.editados == []
+
+
+async def test_el_boton_de_radio_enciende_el_autoplay_y_repinta_el_panel(view):
+    vc = FakePlayer()
+    _estado(view, vc, autoplay=False)
+
+    yo = await _pulsa(view.radio, vc=vc)
+
+    assert view.cog.autoplay_pedido == [(1, vc, True)] and view.autoplay.style is VERDE
+    assert len(yo.message.editados) == 1 and yo.message.editados[0]["view"] is view
+    assert "🔮 autoplay" in yo.message.editados[0]["embed"].description
+
+
+async def test_el_boton_de_radio_no_toca_el_panel_si_no_cambia_nada(view):
+    vc = FakePlayer()
+    _estado(view, vc, autoplay=True)
+
+    yo = await _pulsa(view.radio, vc=vc)
+
+    assert view.cog.autoplay_pedido == [] and yo.message.editados == [] and len(yo.followup.enviados) == 1
+
+
 async def test_mezclar_edita_el_panel_si_cambia_el_despues(view):
     yo = await _pulsa(view.shuffle, vc=FakePlayer(["a", "b", "c"]))      # queda "c" primero
     assert _campo(yo, "Después") == "c" and yo.response.enviados == []
@@ -310,4 +368,4 @@ async def test_solo_quien_esta_en_el_canal_del_bot_toca_los_botones_y_la_cola_la
         assert permitido is (voz == "voz" or boton is view.show_queue), boton.custom_id
         if not permitido:
             assert "mismo canal de voz" in yo.response.enviados[0][0]
-    assert view.cog.letra_pedida == []
+    assert view.cog.letra_pedida == [] and view.cog.radio_pedida == []

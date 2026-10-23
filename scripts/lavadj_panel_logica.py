@@ -7,6 +7,7 @@ prueba con el del venv (tests/test_panel_logica.py). Nada de `gi` aquí.
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +59,8 @@ REFRESCO = 2          # segundos entre lecturas de estado
 LINEAS_MONITOR = 200  # cuántas líneas de log guarda el cajón
 # Lo mismo que rota bot.log; arranque.log había llegado a 11 MB sin que nadie lo mirara.
 ARRANQUE_MAXIMO = 2_000_000
+# El bot se despide de los canales y baja Lavalink (hasta 30 s) antes de soltar la API.
+ESPERA_DEL_CIERRE = 45
 
 
 # --- Estado del bot --------------------------------------------------------
@@ -111,21 +114,50 @@ def lavalink_arriba() -> bool:
         return False
 
 
-def levantar_lavalink() -> str:
-    """Arranca el contenedor de Lavalink. Bloquea: va en un hilo aparte."""
+def _script_de_lavalink(accion: str, verbo: str, plazo: int) -> str:
+    """Corre `start-lavalink.sh <accion>`. Devuelve "" si salió bien, o el motivo."""
     try:
         resultado = subprocess.run(
-            [str(LAVALINK_SCRIPT), "start"],
-            capture_output=True, text=True, timeout=180,
+            [str(LAVALINK_SCRIPT), accion],
+            capture_output=True, text=True, timeout=plazo,
         )
     except FileNotFoundError:
         return "falta start-lavalink.sh"
     except subprocess.TimeoutExpired:
-        return "Lavalink tardó demasiado en levantar"
+        return f"Lavalink tardó demasiado en {verbo}"
     if resultado.returncode != 0:
         ultima = (resultado.stdout + resultado.stderr).strip().splitlines()
-        return ultima[-1][:120] if ultima else "no pude levantar Lavalink"
+        return ultima[-1][:120] if ultima else f"no pude {verbo} Lavalink"
     return ""
+
+
+def levantar_lavalink() -> str:
+    """Arranca el contenedor de Lavalink. Bloquea: va en un hilo aparte."""
+    return _script_de_lavalink("start", "levantar", 180)
+
+
+def bajar_lavalink() -> str:
+    """Baja el contenedor de Lavalink, lo simétrico de `levantar_lavalink`. Bloquea: va en un hilo aparte."""
+    return _script_de_lavalink("stop", "bajar", 60)
+
+
+def cortar_todo(motivo: str, espera: float = ESPERA_DEL_CIERRE) -> str:
+    """Corta el bot y baja Lavalink. Devuelve "" si salió bien, o el motivo. Bloquea: va en un hilo aparte.
+
+    El bot baja Lavalink él mismo (`todo=1`), después de despedirse de los canales
+    de voz: con el nodo caído antes, los players no alcanzarían a salir. Aquí se
+    espera a que suelte la API (lo último que cierra) y, si el nodo sigue arriba
+    —un bot anterior a `todo`, o su script falló—, se baja desde el panel.
+    """
+    error = postear("stop", motivo=motivo, todo=1)
+    if error:
+        return error
+    limite = time.monotonic() + espera
+    while estado_bot() is not None:
+        if time.monotonic() >= limite:
+            return "el bot no cerró a tiempo"
+        time.sleep(0.5)
+    return bajar_lavalink() if lavalink_arriba() else ""
 
 
 def rotar_arranque() -> None:

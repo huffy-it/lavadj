@@ -53,7 +53,10 @@
     <div class="row"><span>Servidores</span><span id="servidores">…</span></div>
   </div>
 
-  <div class="card"><h2>En el aire</h2><div id="voz">Nada.</div></div>
+  <div class="card">
+    <h2>En el aire</h2><div id="voz">Nada.</div>
+    <div class="acciones" style="margin-top:8px"><button id="radio" disabled>📻 Radio de este tema</button><span id="radioAviso"></span></div>
+  </div>
 
   <div class="card">
     <details id="letraDet" class="letra" open>
@@ -95,14 +98,14 @@
     <pre id="log">…</pre>
   </div>
 
-  <div class="card acciones"><button id="parar" class="bad">Apagar el bot</button></div>
+  <div class="card acciones"><button id="parar" class="bad">Apagar todo</button><span id="apagado" hidden>Todo apagado: el bot y Lavalink. Para volver a arrancar, abre el acceso directo de LavaDJ.</span></div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const api = (ruta, opts) => fetch('/api/' + ruta, opts).then(r => r.json());
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const dur = s => s < 60 ? s + ' s' : s < 3600 ? Math.floor(s/60) + ' min' : Math.floor(s/3600) + ' h ' + Math.floor(s%3600/60) + ' min';
-let moviendo = false;
+let moviendo = false, apagando = false, pidiendoRadio = false, avisoRadio = null;
 
 async function actualizar() {
   try {
@@ -119,9 +122,11 @@ async function actualizar() {
     $('servidores').textContent = e.servidores;
     $('voz').innerHTML = e.voz.length ? e.voz.map(v =>
       `<div class="row"><span>${esc(v.servidor)} · ${esc(v.canal || '')}</span><span>${v.sonando ? '▶ ' + esc(v.cancion || '') : 'quieto'} · ${v.en_cola} en cola</span></div>`).join('') : 'Nada.';
+    $('radio').disabled = pidiendoRadio || !e.voz.some(v => v.sonando);
     try { seguirLetra(e.voz); } catch (_) {}    // que la letra falle no es que el bot esté apagado
   } catch (_) {
     $('luz').className = 'dot bad'; $('bot').textContent = 'APAGADO';
+    $('radio').disabled = true; $('apagado').hidden = !apagando;    // sin API tras "Apagar todo" no queda nada arriba
     return;
   }
   try {
@@ -147,14 +152,25 @@ let armado = null;
 $('parar').onclick = async () => {
   const b = $('parar');
   if (!armado) {
-    b.textContent = 'Click otra vez para confirmar';
-    armado = setTimeout(() => { armado = null; b.textContent = 'Apagar el bot'; }, 4000);
+    b.textContent = 'Otra vez: se apaga también el audio';
+    armado = setTimeout(() => { armado = null; b.textContent = 'Apagar todo'; }, 4000);
     return;
   }
   clearTimeout(armado); armado = null;
   b.disabled = true; b.textContent = 'Apagando…';
-  try { await api('stop?motivo=panel+web', {method:'POST'}); } catch (_) {}
+  try { await api('stop?motivo=panel+web&todo=1', {method:'POST'}); apagando = true; } catch (_) {}
   setTimeout(actualizar, 1500);
+};
+$('radio').onclick = async () => {
+  const t = $('radioAviso');
+  pidiendoRadio = true; $('radio').disabled = true;
+  try {
+    const r = await api('radio' + (sala ? '?servidor=' + encodeURIComponent(sala.id) : ''), {method:'POST'});
+    t.className = r.ok ? '' : 'err'; t.textContent = r.aviso || r.error || '';
+  } catch (_) { t.className = 'err'; t.textContent = 'No pude armar la radio.'; }
+  pidiendoRadio = false;
+  clearTimeout(avisoRadio); avisoRadio = setTimeout(() => { t.textContent = ''; }, 8000);
+  actualizar();
 };
 
 const CALIDAD = {x_low:'muy baja', low:'baja', medium:'media', high:'alta'};

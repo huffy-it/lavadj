@@ -39,6 +39,7 @@ class FakeBot:
         self.cog = cog
         self.guilds = []
         self.user = "LavaDJ#7584"
+        self.apagar_todo = False
 
     def get_cog(self, nombre):
         return self.cog
@@ -283,6 +284,57 @@ async def test_la_ruta_de_la_letra_existe_y_pasa_por_la_proteccion():
         r = await cliente.get("/api/letra")
         assert r.status == 200 and (await r.json())["motivo"] == "nada_sonando"
         await _bloqueadas(cliente, gets=["/api/letra"])
+
+    await _con_servidor(prueba)
+
+# --- radio de lo que suena --------------------------------------------------
+
+class CogConRadio(FakeCog):
+    """`poner_radio` anota a qué servidor se lo pidieron y contesta `aviso`, o lanza `error`."""
+
+    def __init__(self, aviso="Radio armada desde lo que suena.", error=None):
+        super().__init__()
+        self.aviso, self.error, self.pedidos = aviso, error, []
+
+    async def poner_radio(self, guild):
+        self.pedidos.append(guild.id)
+        if self.error:
+            raise self.error
+        return self.aviso
+
+async def radio(bot, ruta="/api/radio"):
+    return await llamar("handle_radio", "POST", ruta, bot)
+
+async def test_radio_se_arma_en_el_servidor_pedido_o_en_el_primero_que_suena():
+    cog = CogConRadio()
+    bot = bot_con(sala(), sala(pista(), id=2), sala(pista(id="b"), id=SNOWFLAKE), cog=cog)
+    sin, con = await radio(bot), await radio(bot, f"/api/radio?servidor={SNOWFLAKE}")
+    assert (sin.status, cuerpo(sin)) == (200, {"ok": True, "aviso": "Radio armada desde lo que suena."})
+    assert con.status == 200 and cog.pedidos == [2, SNOWFLAKE]
+
+@pytest.mark.parametrize("salas, query", [
+    ([], ""), ([sala()], ""), ([sala(pista(), id=2), sala(id=3)], "?servidor=3"), ([sala(pista(), id=2)], "?servidor=999"),
+], ids=["sin servidores", "servidor en silencio", "el pedido no suena", "el pedido no existe"])
+async def test_radio_sin_nada_sonando_da_409_y_no_toca_el_cog(salas, query):
+    cog = CogConRadio()
+    respuesta = await radio(bot_con(*salas, cog=cog), "/api/radio" + query)
+    assert respuesta.status == 409 and cuerpo(respuesta)["ok"] is False and cuerpo(respuesta)["aviso"]
+    assert cog.pedidos == []
+
+async def test_radio_sin_el_cog_da_503():
+    respuesta = await radio(bot_con(sala(pista()), cog=None))
+    assert respuesta.status == 503 and "cog" in cuerpo(respuesta)["error"]
+
+async def test_radio_que_revienta_da_500_con_un_aviso_legible():
+    respuesta = await radio(bot_con(sala(pista()), cog=CogConRadio(error=RuntimeError("bug"))))
+    datos = cuerpo(respuesta)
+    assert respuesta.status == 500 and datos["ok"] is False and "bug" not in datos["aviso"]
+
+async def test_la_ruta_de_la_radio_existe_y_pasa_por_la_proteccion():
+    async def prueba(cliente, puerto, app):
+        assert (await cliente.post("/api/radio")).status == 409       # llega al handler: no suena nada
+        assert (await cliente.get("/api/radio")).status == 405        # cambia el estado: solo POST
+        await _bloqueadas(cliente, posts=["/api/radio"])
 
     await _con_servidor(prueba)
 
@@ -655,6 +707,32 @@ async def test_post_con_origin_propio_o_sin_origin_funciona(con_origin):
     async def prueba(cliente, puerto, app):
         r = await cliente.post("/api/stop", headers={"Origin": f"http://127.0.0.1:{puerto}"} if con_origin else {})
         assert r.status == 200 and app["apagar"].is_set()
+
+    await _con_servidor(prueba)
+
+@pytest.mark.parametrize("query, todo", [
+    ("", False), ("?motivo=panel+web", False), ("?todo=0", False), ("?todo=si", False),
+    ("?todo=1", True), ("?motivo=panel+web&todo=1", True),
+])
+async def test_stop_siempre_pide_el_cierre_y_solo_con_todo_deja_anotado_bajar_lavalink(query, todo):
+    bot = FakeBot(FakeCog())
+    peticion = pedido("POST", "/api/stop" + query, bot)
+    respuesta = await api.handle_stop(peticion)
+    assert respuesta.status == 200 and cuerpo(respuesta) == {"status": "stopping", "todo": todo}
+    assert peticion.app["apagar"].is_set() and bot.apagar_todo is todo
+
+async def test_un_stop_sin_todo_posterior_no_borra_lo_anotado():
+    bot = FakeBot(FakeCog())
+    for query in ("?todo=1", ""):
+        await api.handle_stop(pedido("POST", "/api/stop" + query, bot))
+    assert bot.apagar_todo is True
+
+async def test_stop_con_todo_no_hace_nada_si_el_origen_es_ajeno():
+    async def prueba(cliente, puerto, app):
+        r = await cliente.post("/api/stop?todo=1", headers=EVIL_ORIGIN)
+        assert r.status == 403 and not app["apagar"].is_set() and app["bot"].apagar_todo is False
+        r = await cliente.post("/api/stop?todo=1")
+        assert r.status == 200 and app["apagar"].is_set() and app["bot"].apagar_todo is True
 
     await _con_servidor(prueba)
 

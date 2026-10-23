@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import logging
+import os
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -106,8 +108,8 @@ class Voz:
     async def disconnect(self):
         self.orden.append("desconectar")
 
-def _bot_con(bot_mod, monkeypatch, cog, voice_clients=(), close=None):
-    falso = SimpleNamespace(get_cog=lambda nombre: cog, voice_clients=list(voice_clients), close=close)
+def _bot_con(bot_mod, monkeypatch, cog, voice_clients=(), close=None, todo=False):
+    falso = SimpleNamespace(get_cog=lambda nombre: cog, voice_clients=list(voice_clients), close=close, apagar_todo=todo)
     monkeypatch.setattr(bot_mod, "bot", falso)
 
 class ArbolFalso:
@@ -140,6 +142,7 @@ def test_el_import_no_borra_la_cache_del_dj_y_deja_listo_el_resolver(bot_mod):
     """Otra instancia en marcha tiene sus clips en uso; el cog y los players toman el resolver de aquí."""
     assert bot_mod.orden == []
     assert isinstance(bot_mod.bot.resolver, Resolver)
+    assert bot_mod.bot.apagar_todo is False
 
 async def test_la_cache_se_purga_solo_despues_de_tomar_el_puerto(bot_mod, monkeypatch):
     async def _fin():
@@ -204,6 +207,99 @@ async def test_al_apagar_se_guarda_antes_de_desconectar_los_players(bot_mod, mon
     apagar.set()
     await bot_mod.esperar_orden_de_apagado(apagar)
     assert orden == esperado
+
+def _script_doblado(monkeypatch, *, resultado=None, lanza=None):
+    """`subprocess.run` doblado: nada de lanzar PowerShell ni podman de verdad."""
+    llamadas = []
+
+    def run(comando, **kwargs):
+        llamadas.append((comando, kwargs))
+        if lanza:
+            raise lanza
+        return resultado
+    monkeypatch.setattr(subprocess, "run", run)
+    return llamadas
+
+def _terminado(codigo, salida="", errores=""):
+    return subprocess.CompletedProcess([], codigo, stdout=salida, stderr=errores)
+
+@pytest.mark.parametrize("todo, esperado", [
+    (True, ["guardar", "desconectar", "desconectar", "cerrar", "bajar lavalink"]),
+    (False, ["guardar", "desconectar", "desconectar", "cerrar"]),
+], ids=["con todo", "sin todo"])
+async def test_con_todo_se_baja_lavalink_al_final_y_sin_todo_no_se_toca(bot_mod, monkeypatch, todo, esperado):
+    """Lavalink tiene que seguir vivo mientras los players se despiden: baja después de desconectar y de cerrar."""
+    orden = []
+
+    async def _cerrar():
+        orden.append("cerrar")
+
+    async def _bajar():
+        orden.append("bajar lavalink")
+
+    monkeypatch.setattr(bot_mod, "bajar_lavalink", _bajar)
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden), [Voz(orden), Voz(orden)], _cerrar, todo)
+    apagar = asyncio.Event()
+    apagar.set()
+    await bot_mod.esperar_orden_de_apagado(apagar)
+    assert orden == esperado
+
+@pytest.mark.parametrize("windows", [True, False], ids=["Windows", "Linux"])
+async def test_bajar_lavalink_corre_el_script_de_cada_sistema_sin_shell_y_con_plazo(bot_mod, monkeypatch, caplog, windows):
+    llamadas = _script_doblado(monkeypatch, resultado=_terminado(0, "Lavalink detenido.\n"))
+    monkeypatch.setattr(bot_mod, "ES_WINDOWS", windows)
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.bajar_lavalink()
+    raiz = os.path.dirname(os.path.abspath(bot_mod.__file__))
+    esperado = (
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", os.path.join(raiz, "scripts", "windows", "lavalink.ps1"), "stop"]
+        if windows else [os.path.join(raiz, "scripts", "lavalink", "start-lavalink.sh"), "stop"]
+    )
+    (comando, kwargs), = llamadas
+    assert comando == esperado
+    assert not kwargs.get("shell") and kwargs["timeout"] == bot_mod.PLAZO_BAJAR_LAVALINK and kwargs["stdin"] == subprocess.DEVNULL
+    assert "Lavalink detenido." in caplog.text
+
+@pytest.mark.parametrize("resultado, lanza, en_log", [
+    (_terminado(1, "uno\n", "dos\nfalló podman\n"), None, ("código 1", "falló podman")),
+    (_terminado(2), None, ("código 2", "sin salida")),
+    (None, subprocess.TimeoutExpired("cmd", 30), ("no bajó en 30 s",)),
+    (None, FileNotFoundError("powershell"), ("No pude ejecutar",)),
+    (None, PermissionError("start-lavalink.sh"), ("No pude ejecutar",)),
+], ids=["script con error", "script mudo", "plazo vencido", "sin powershell", "sin permiso de ejecución"])
+async def test_si_bajar_lavalink_falla_queda_un_aviso_y_no_se_propaga(bot_mod, monkeypatch, caplog, resultado, lanza, en_log):
+    _script_doblado(monkeypatch, resultado=resultado, lanza=lanza)
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        await bot_mod.bajar_lavalink()
+    assert [r.levelno for r in caplog.records] == [logging.WARNING if lanza is None or isinstance(lanza, subprocess.TimeoutExpired) else logging.ERROR]
+    assert all(fragmento in caplog.text for fragmento in en_log)
+
+async def test_un_script_que_se_cuelga_no_impide_que_el_bot_termine_de_cerrar(bot_mod, monkeypatch):
+    orden = []
+
+    async def _cerrar():
+        orden.append("cerrar")
+
+    _script_doblado(monkeypatch, lanza=subprocess.TimeoutExpired("cmd", 30))
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden), [Voz(orden)], _cerrar, todo=True)
+    apagar = asyncio.Event()
+    apagar.set()
+    await bot_mod.esperar_orden_de_apagado(apagar)
+    assert orden == ["guardar", "desconectar", "cerrar"]
+
+async def test_main_espera_el_apagado_antes_de_soltar_la_api(bot_mod, monkeypatch):
+    """Bajar Lavalink va después de `bot.close()`: si `main()` acabara antes, `asyncio.run` cancelaría la tarea a medias."""
+    async def _apagar_lento(apagar):
+        apagar.set()
+        await asyncio.sleep(0.05)       # lo que tarda el script que baja Lavalink
+        bot_mod.orden.append("lavalink abajo")
+
+    _sin_red(bot_mod, monkeypatch)
+    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _nada)      # que no lance yt-dlp de verdad en el rato de espera
+    monkeypatch.setattr(bot_mod, "esperar_orden_de_apagado", _apagar_lento)
+    with pytest.raises(Fin):
+        await bot_mod.main()
+    assert bot_mod.orden == ["puerto", "purge", "lavalink abajo", "limpiar"]
 
 # --- configuración de la lista blanca y de yt-dlp -----------------------------
 
