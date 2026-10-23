@@ -11,3 +11,4 @@ bot_out.log
 bot_err.log
 estado/
 /voces/
+.coverage*

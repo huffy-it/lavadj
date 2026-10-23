@@ -66,125 +66,104 @@ def cog():
 
 
 async def _terminadas(*tareas):
-    """Espera a que terminen; con tope, para que una que no se canceló falle en vez de colgar."""
+    """Con tope, para que una tarea que no se canceló falle en vez de colgar."""
     await asyncio.wait_for(asyncio.gather(*tareas, return_exceptions=True), timeout=1)
 
 
-async def _tarea_eterna():
-    await asyncio.sleep(3600)
-
-
 async def _tarea_en_marcha():
-    tarea = asyncio.create_task(_tarea_eterna())
+    tarea = asyncio.create_task(asyncio.sleep(3600))
     await asyncio.sleep(0)
     return tarea
 
 
 async def _estacion_cargada(cog, guild_id=1):
-    """Una estación con de todo: tareas en vuelo, panel, reintentos y caídas."""
+    """Una estación con de todo: tareas en vuelo, vigías, precarga, letra, panel, reintentos y caídas."""
     est = cog.estacion(guild_id)
-    est.idle = await _tarea_en_marcha()
-    est.spotify = await _tarea_en_marcha()
+    est.idle, est.spotify, est.precarga, est.letra.tarea = [await _tarea_en_marcha() for _ in range(4)]
+    est.segmentos = [await _tarea_en_marcha()]
     est.panel = (FakeMensaje(), FakeVista())
+    est.letra.activa, est.letra.mensaje = True, FakeMensaje()
     est.reintentos["una-cancion"] = 1
     est.caidas = 2
     est.atascado = True
     return est
 
 
-# --- la estación -----------------------------------------------------------------------
-
-def test_una_estacion_nueva_arranca_vacia():
-    est = Estacion()
-    assert est.idle is None and est.spotify is None and est.panel is None
-    assert est.reintentos == {} and est.caidas == 0 and est.atascado is False
-    assert not est.arranque.locked()
+def _tareas(est):
+    return [est.idle, est.spotify, est.precarga, est.letra.tarea, *est.segmentos]
 
 
-def test_dos_estaciones_no_comparten_colecciones_ni_lock():
+def test_una_estacion_nueva_arranca_vacia_y_no_comparte_nada_con_otra():
     a, b = Estacion(), Estacion()
+    assert a.idle is a.spotify is a.panel is a.precarga is None
+    assert a.reintentos == {} and a.caidas == 0 and a.atascado is False and a.segmentos == []
+    assert not a.arranque.locked()
+    assert a.letra.activa is False and a.letra.tarea is None and a.letra.mensaje is None
     a.reintentos["x"] = 1
-    assert b.reintentos == {}
-    assert a.arranque is not b.arranque
+    a.segmentos.append(object())
+    a.letra.activa = True
+    assert b.reintentos == {} and b.segmentos == [] and b.letra.activa is False
+    assert a.arranque is not b.arranque and a.letra is not b.letra
 
 
-async def test_cancelar_idle_corta_la_tarea_y_la_suelta():
+@pytest.mark.parametrize("metodo, cortadas", [
+    ("cancelar_idle", {"idle"}),
+    ("cancelar_spotify", {"spotify"}),
+    ("cancelar_segmentos", {"segmentos"}),
+    ("cancelar_precarga", {"precarga"}),
+    ("cancelar_tareas", {"idle", "spotify", "segmentos", "precarga", "letra"}),
+])
+async def test_cada_cancelacion_corta_lo_suyo_sin_tocar_lo_demas(metodo, cortadas):
     est = Estacion()
-    est.idle = tarea = await _tarea_en_marcha()
-    est.cancelar_idle()
-    assert est.idle is None
-    await _terminadas(tarea)
-    assert tarea.cancelled()
-
-
-async def test_cancelar_spotify_no_toca_la_desconexion_por_ocio():
-    est = Estacion()
-    est.idle = ocio = await _tarea_en_marcha()
-    est.spotify = carga = await _tarea_en_marcha()
-    est.cancelar_spotify()
-    assert est.spotify is None and est.idle is ocio
-    await _terminadas(carga)
-    assert carga.cancelled() and not ocio.cancelled()
-    ocio.cancel()
-
-
-async def test_cancelar_tareas_corta_las_dos():
-    est = Estacion()
-    est.idle = ocio = await _tarea_en_marcha()
-    est.spotify = carga = await _tarea_en_marcha()
+    est.idle, est.spotify, est.precarga, est.letra.tarea = [await _tarea_en_marcha() for _ in range(4)]
+    est.segmentos = [await _tarea_en_marcha(), await _tarea_en_marcha()]
+    tareas = {"idle": [est.idle], "spotify": [est.spotify], "precarga": [est.precarga],
+              "letra": [est.letra.tarea], "segmentos": list(est.segmentos)}
+    getattr(est, metodo)()
+    await _terminadas(*[t for nombre in cortadas for t in tareas[nombre]])
+    suelto = {"idle": est.idle, "spotify": est.spotify, "precarga": est.precarga,
+              "letra": est.letra.tarea, "segmentos": est.segmentos or None}
+    for nombre, lista in tareas.items():
+        assert all(t.cancelled() == (nombre in cortadas) for t in lista), nombre
+        assert (suelto[nombre] is None) == (nombre in cortadas), nombre
     est.cancelar_tareas()
-    await _terminadas(ocio, carga)
-    assert ocio.cancelled() and carga.cancelled()
-    assert est.idle is None and est.spotify is None
 
 
 def test_cancelar_sin_tareas_no_hace_nada():
     est = Estacion()
-    est.cancelar_tareas()
-    assert est.idle is None and est.spotify is None
+    for metodo in ("cancelar_idle", "cancelar_spotify", "cancelar_segmentos", "cancelar_precarga", "cancelar_tareas"):
+        getattr(est, metodo)()
+    assert est.idle is est.spotify is est.precarga is est.letra.tarea is None and est.segmentos == []
 
-
-# --- el cog guarda una por servidor -------------------------------------------------
 
 def test_el_cog_crea_la_estacion_la_primera_vez_y_despues_devuelve_la_misma(cog):
     assert cog._estaciones == {}
     est = cog.estacion(7)
     assert cog.estacion(7) is est
     assert cog._estaciones == {7: est}
-
-
-def test_cada_servidor_tiene_la_suya(cog):
     assert cog.estacion(1) is not cog.estacion(2)
 
-
-# --- teardown deja todo limpio ---------------------------------------------------------
 
 async def test_teardown_deja_todo_limpio(cog):
     vc = FakePlayer(temas=[object()])
     est = await _estacion_cargada(cog)
-    idle, spotify = est.idle, est.spotify
-    mensaje, vista = est.panel
-
+    tareas, (mensaje, vista), mensaje_letra = _tareas(est), est.panel, est.letra.mensaje
     await cog.teardown(vc.guild)
-
     assert 1 not in cog._estaciones
-    await _terminadas(idle, spotify)
-    assert idle.cancelled() and spotify.cancelled()
-    assert mensaje.borrado and vista.detenida
+    await _terminadas(*tareas)
+    assert all(t.cancelled() for t in tareas)
+    assert mensaje.borrado and vista.detenida and mensaje_letra.borrado
+    assert est.letra.activa is False and est.letra.mensaje is None
     assert not vc.connected and not vc.queue
-    # Lo que se pidiera después arranca de cero.
     nueva = cog.estacion(1)
     assert nueva is not est
-    assert nueva.reintentos == {} and nueva.caidas == 0 and nueva.panel is None
+    assert nueva.reintentos == {} and nueva.caidas == 0 and nueva.panel is None and nueva.letra.activa is False
 
 
 async def test_teardown_con_nota_avisa_donde_estaba_el_panel(cog):
     vc = FakePlayer()
-    est = await _estacion_cargada(cog)
-    mensaje = est.panel[0]
-
+    mensaje = (await _estacion_cargada(cog)).panel[0]
     await cog.teardown(vc.guild, note="Parado 🛑")
-
     assert mensaje.channel.enviados == ["Parado 🛑"]
     assert 1 not in cog._estaciones
 
@@ -193,43 +172,34 @@ async def test_teardown_con_nota_pero_sin_panel_no_avisa_a_nadie(cog):
     vc = FakePlayer()
     vc.text_channel = FakeCanal()
     cog.estacion(1)
-
     await cog.teardown(vc.guild, note="Parado 🛑")
-
     assert vc.text_channel.enviados == []
     assert 1 not in cog._estaciones
 
 
 async def test_teardown_de_un_servidor_sin_estacion_no_deja_ninguna(cog):
     vc = FakePlayer()
-
     await cog.teardown(vc.guild)
-
-    assert cog._estaciones == {}
-    assert not vc.connected
+    assert cog._estaciones == {} and not vc.connected
 
 
 async def test_teardown_sin_player_tambien_limpia(cog):
     guild = FakeGuild()
-    est = await _estacion_cargada(cog)
-    mensaje = est.panel[0]
-
+    mensaje = (await _estacion_cargada(cog)).panel[0]
     await cog.teardown(guild)
-
-    assert cog._estaciones == {}
-    assert mensaje.borrado
+    assert cog._estaciones == {} and mensaje.borrado
 
 
 async def test_teardown_no_toca_a_los_otros_servidores(cog):
     vc = FakePlayer(guild=FakeGuild(1))
     await _estacion_cargada(cog, 1)
     otra = await _estacion_cargada(cog, 2)
-
+    mensaje_letra = otra.letra.mensaje
     await cog.teardown(vc.guild)
-
     assert cog._estaciones == {2: otra}
-    assert not otra.idle.cancelled() and not otra.spotify.cancelled()
+    assert not any(t.cancelled() for t in _tareas(otra))
     assert otra.panel is not None and otra.reintentos == {"una-cancion": 1} and otra.caidas == 2
+    assert otra.letra.activa and not mensaje_letra.borrado
     otra.cancelar_tareas()
 
 
@@ -238,9 +208,7 @@ async def test_teardown_le_avisa_a_la_salud_y_al_dj(cog, monkeypatch):
     vc = FakePlayer()
     monkeypatch.setattr(cog.dj, "drop", soltados.append)
     monkeypatch.setattr(cog.salud, "sin_siguiente", descartados.append)
-
     await cog.teardown(vc.guild)
-
     assert soltados == [1] and descartados == [1]
 
 
@@ -248,68 +216,47 @@ async def test_el_autoplay_es_una_preferencia_y_sobrevive_al_teardown(cog):
     """Un `!autoplay off` no se pierde al parar el bot ni al irse del canal."""
     vc = FakePlayer()
     cog._autoplay[1] = False
-
     await cog.teardown(vc.guild)
-
     assert cog.autoplay_activo(1) is False
 
 
 async def test_cog_unload_corta_las_tareas_y_las_vistas_de_todos_los_servidores(cog):
-    uno = await _estacion_cargada(cog, 1)
-    otro = await _estacion_cargada(cog, 2)
-    tareas = [uno.idle, uno.spotify, otro.idle, otro.spotify]
+    uno, otro = await _estacion_cargada(cog, 1), await _estacion_cargada(cog, 2)
+    tareas = _tareas(uno) + _tareas(otro)
     vistas = [uno.panel[1], otro.panel[1]]
-
     await cog.cog_unload()
-
     await _terminadas(*tareas)
     assert all(t.cancelled() for t in tareas)
     assert all(v.detenida for v in vistas)
 
 
-# --- el panel de la estación ------------------------------------------------------------
-
 async def test_borrar_el_panel_lo_saca_de_la_estacion(cog):
     est = await _estacion_cargada(cog)
     mensaje, vista = est.panel
-
     await cog._delete_panel(1)
-
-    assert est.panel is None
-    assert mensaje.borrado and vista.detenida
+    assert est.panel is None and mensaje.borrado and vista.detenida
     est.cancelar_tareas()
 
 
 async def test_borrar_un_panel_que_no_existe_no_falla(cog):
     await cog._delete_panel(99)
-
     assert cog.estacion(99).panel is None
 
-
-# --- la marca del vigilante ---------------------------------------------------------------
 
 async def test_la_pasada_deja_en_falso_las_estaciones_que_no_vio(cog):
     visto, ausente = cog.estacion(1), cog.estacion(2)
     visto.atascado = ausente.atascado = True
-    vc = FakePlayer(guild=FakeGuild(1), temas=[object()])
-
-    await cog._vigilar_una_vez([vc])
-
+    await cog._vigilar_una_vez([FakePlayer(guild=FakeGuild(1), temas=[object()])])
     assert ausente.atascado is False
 
 
 async def test_la_marca_se_pone_a_la_primera_y_se_suelta_al_actuar(cog):
-    primero, segundo = object(), object()
-
     class Mudo(FakePlayer):
         async def play(self, track):
             pass
-
-    vc = Mudo(temas=[primero, segundo])
-
+    vc = Mudo(temas=[object(), object()])
     await cog._vigilar_una_vez([vc])
     assert cog.estacion(1).atascado is True
-
     await cog._vigilar_una_vez([vc])
     assert cog.estacion(1).atascado is False
 
@@ -318,213 +265,6 @@ async def test_si_el_servidor_deja_de_estar_atascado_pierde_la_marca(cog):
     vc = FakePlayer(temas=[object()])
     await cog._vigilar_una_vez([vc])
     assert cog.estacion(1).atascado is True
-
     vc.playing = True
     await cog._vigilar_una_vez([vc])
-
     assert cog.estacion(1).atascado is False
-
-
-# --- los vigías de las partes que no son música ---------------------------------------------
-
-def test_una_estacion_nueva_no_tiene_vigias_ni_los_comparte():
-    a, b = Estacion(), Estacion()
-    assert a.segmentos == []
-    a.segmentos.append(object())
-    assert b.segmentos == []
-
-
-async def test_cancelar_segmentos_corta_todos_y_vacia_la_lista():
-    est = Estacion()
-    est.segmentos = [await _tarea_en_marcha(), await _tarea_en_marcha()]
-    tareas = list(est.segmentos)
-
-    est.cancelar_segmentos()
-
-    await _terminadas(*tareas)
-    assert all(t.cancelled() for t in tareas)
-    assert est.segmentos == []
-
-
-async def test_cancelar_idle_y_spotify_no_tocan_los_vigias():
-    est = Estacion()
-    est.idle = await _tarea_en_marcha()
-    vigia = await _tarea_en_marcha()
-    est.segmentos = [vigia]
-
-    est.cancelar_idle()
-    est.cancelar_spotify()
-
-    assert not vigia.cancelled() and est.segmentos == [vigia]
-    est.cancelar_segmentos()
-
-
-async def test_cancelar_tareas_corta_tambien_los_vigias():
-    est = Estacion()
-    est.segmentos = [await _tarea_en_marcha()]
-    vigia = est.segmentos[0]
-
-    est.cancelar_tareas()
-
-    await _terminadas(vigia)
-    assert vigia.cancelled() and est.segmentos == []
-
-
-async def test_teardown_corta_los_vigias(cog):
-    vc = FakePlayer()
-    est = await _estacion_cargada(cog)
-    est.segmentos.append(await _tarea_en_marcha())
-    vigia = est.segmentos[0]
-
-    await cog.teardown(vc.guild)
-
-    await _terminadas(vigia)
-    assert vigia.cancelled()
-
-
-async def test_cog_unload_corta_los_vigias(cog):
-    est = cog.estacion(1)
-    est.segmentos.append(await _tarea_en_marcha())
-    vigia = est.segmentos[0]
-
-    await cog.cog_unload()
-
-    await _terminadas(vigia)
-    assert vigia.cancelled()
-
-
-# --- la precarga del tema que viene --------------------------------------------------------
-
-def test_una_estacion_nueva_no_tiene_precarga():
-    assert Estacion().precarga is None
-
-
-async def test_cancelar_precarga_corta_la_tarea_y_la_suelta():
-    est = Estacion()
-    est.precarga = tarea = await _tarea_en_marcha()
-
-    est.cancelar_precarga()
-
-    await _terminadas(tarea)
-    assert tarea.cancelled() and est.precarga is None
-
-
-def test_cancelar_la_precarga_sin_tarea_no_hace_nada():
-    est = Estacion()
-    est.cancelar_precarga()
-    assert est.precarga is None
-
-
-async def test_las_demas_cancelaciones_no_tocan_la_precarga():
-    est = Estacion()
-    est.idle = await _tarea_en_marcha()
-    est.precarga = precarga = await _tarea_en_marcha()
-    est.segmentos = [await _tarea_en_marcha()]
-
-    est.cancelar_idle()
-    est.cancelar_spotify()
-    est.cancelar_segmentos()
-
-    assert not precarga.cancelled() and est.precarga is precarga
-    est.cancelar_precarga()
-
-
-async def test_cancelar_tareas_corta_tambien_la_precarga():
-    est = Estacion()
-    est.precarga = tarea = await _tarea_en_marcha()
-
-    est.cancelar_tareas()
-
-    await _terminadas(tarea)
-    assert tarea.cancelled() and est.precarga is None
-
-
-async def test_teardown_corta_la_precarga(cog):
-    vc = FakePlayer()
-    est = await _estacion_cargada(cog)
-    est.precarga = tarea = await _tarea_en_marcha()
-
-    await cog.teardown(vc.guild)
-
-    await _terminadas(tarea)
-    assert tarea.cancelled() and est.precarga is None
-
-
-async def test_teardown_no_toca_la_precarga_de_los_otros_servidores(cog):
-    vc = FakePlayer(guild=FakeGuild(1))
-    cog.estacion(1)
-    otra = cog.estacion(2)
-    otra.precarga = await _tarea_en_marcha()
-
-    await cog.teardown(vc.guild)
-
-    assert not otra.precarga.cancelled()
-    otra.cancelar_tareas()
-
-
-async def test_cog_unload_corta_la_precarga(cog):
-    est = cog.estacion(1)
-    est.precarga = tarea = await _tarea_en_marcha()
-
-    await cog.cog_unload()
-
-    await _terminadas(tarea)
-    assert tarea.cancelled()
-
-
-# --- la letra en vivo ----------------------------------------------------------------------
-
-def test_una_estacion_nueva_tiene_la_letra_apagada_y_cada_una_la_suya():
-    a, b = Estacion(), Estacion()
-    assert a.letra.activa is False and a.letra.tarea is None and a.letra.mensaje is None
-    a.letra.activa = True
-    assert b.letra.activa is False and a.letra is not b.letra
-
-
-async def test_cancelar_tareas_corta_tambien_la_letra_en_vivo():
-    est = Estacion()
-    est.letra.tarea = tarea = await _tarea_en_marcha()
-
-    est.cancelar_tareas()
-
-    await _terminadas(tarea)
-    assert tarea.cancelled() and est.letra.tarea is None
-
-
-async def test_teardown_apaga_la_letra_y_borra_su_mensaje(cog):
-    vc = FakePlayer()
-    est = await _estacion_cargada(cog)
-    est.letra.activa = True
-    est.letra.mensaje = mensaje = FakeMensaje()
-    est.letra.tarea = tarea = await _tarea_en_marcha()
-
-    await cog.teardown(vc.guild)
-
-    await _terminadas(tarea)
-    assert tarea.cancelled() and mensaje.borrado
-    assert est.letra.activa is False and est.letra.mensaje is None
-    # Lo que se pida después arranca de cero: apagada.
-    assert cog.estacion(1).letra.activa is False
-
-
-async def test_teardown_no_toca_la_letra_de_los_otros_servidores(cog):
-    vc = FakePlayer(guild=FakeGuild(1))
-    otra = await _estacion_cargada(cog, 2)
-    otra.letra.activa = True
-    otra.letra.mensaje = mensaje = FakeMensaje()
-    otra.letra.tarea = await _tarea_en_marcha()
-
-    await cog.teardown(vc.guild)
-
-    assert otra.letra.activa and not mensaje.borrado and not otra.letra.tarea.cancelled()
-    otra.cancelar_tareas()
-
-
-async def test_cog_unload_corta_la_tarea_de_la_letra(cog):
-    est = cog.estacion(1)
-    est.letra.tarea = tarea = await _tarea_en_marcha()
-
-    await cog.cog_unload()
-
-    await _terminadas(tarea)
-    assert tarea.cancelled()

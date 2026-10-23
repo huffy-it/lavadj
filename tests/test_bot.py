@@ -13,6 +13,8 @@ from discord.ext import commands
 from core import config, tts
 from core.resolver import Resolver
 
+class Fin(Exception):
+    pass
 
 @pytest.fixture
 def bot_mod(monkeypatch):
@@ -26,123 +28,56 @@ def bot_mod(monkeypatch):
     yield modulo
     sys.modules.pop("bot", None)
 
-
 async def _nada():
     return None
 
+def _env(monkeypatch, nombre, valor):
+    if valor is None:
+        monkeypatch.delenv(nombre, raising=False)
+    else:
+        monkeypatch.setenv(nombre, valor)
 
-def test_importar_bot_no_borra_la_cache_del_dj(bot_mod):
-    """Otra instancia en marcha tiene sus clips en uso: el import no puede tocarlos."""
-    assert bot_mod.orden == []
-
-
-async def test_la_cache_se_purga_solo_despues_de_tomar_el_puerto(bot_mod, monkeypatch):
-    class Fin(Exception):
-        pass
-
+def _sin_red(bot_mod, monkeypatch, cargar=_nada):
+    """`main()` sin red: anota puerto y cierre, y `bot.start` da un turno al loop y corta con `Fin`."""
     async def _start_server(bot, apagar):
         bot_mod.orden.append("puerto")
-        return type("Runner", (), {"cleanup": staticmethod(_nada)})()
 
-    async def _load_extension(nombre):
-        raise Fin()
-
-    monkeypatch.setattr(bot_mod, "start_server", _start_server)
-    monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
-
-    with pytest.raises(Fin):
-        await bot_mod.main()
-
-    assert bot_mod.orden == ["puerto", "purge"]
-
-
-async def test_si_el_puerto_esta_ocupado_no_se_purga_nada(bot_mod, monkeypatch):
-    async def _start_server(bot, apagar):
-        raise OSError("address in use")
-
-    monkeypatch.setattr(bot_mod, "start_server", _start_server)
-
-    with pytest.raises(OSError):
-        await bot_mod.main()
-
-    assert bot_mod.orden == []
-
-
-def test_el_bot_trae_su_resolver_desde_el_import(bot_mod):
-    """El cog y los players lo toman de aquí: tiene que existir antes de cargar nada."""
-    assert isinstance(bot_mod.bot.resolver, Resolver)
-
-
-def _arrancar_sin_red(bot_mod, monkeypatch, durante_el_arranque):
-    """`main()` sin red: `bot.start` da un turno al loop, llama a `durante_el_arranque` y corta con `Fin`."""
-    async def _start_server(bot, apagar):
-        return type("Runner", (), {"cleanup": staticmethod(_nada)})()
-
-    async def _load_extension(nombre):
-        return None
+        async def cleanup():
+            bot_mod.orden.append("limpiar")
+        return SimpleNamespace(cleanup=cleanup)
 
     async def _start(token):
         await asyncio.sleep(0)      # deja correr las tareas que `main()` dejó creadas
-        await durante_el_arranque()
         raise Fin()
 
     monkeypatch.setattr(bot_mod, "start_server", _start_server)
     monkeypatch.setattr(bot_mod, "conectar_lavalink", _nada)
     monkeypatch.setattr(bot_mod, "esperar_orden_de_apagado", lambda apagar: _nada())
-    monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
+    monkeypatch.setattr(bot_mod.bot, "load_extension", lambda nombre: cargar())
     monkeypatch.setattr(bot_mod.bot, "start", _start)
 
+def _ctx(guild_id, cliente=None):
+    """Contexto de mentira: `guild_id=None` es un mensaje directo; con `cliente` corre por el camino de `/`."""
+    enviados, opciones = [], []
 
-class Fin(Exception):
-    pass
+    async def send(texto, **kwargs):
+        enviados.append(texto)
+        opciones.append(kwargs)
 
+    guild = None if guild_id is None else SimpleNamespace(id=guild_id)
+    ctx = SimpleNamespace(guild=guild, send=send, enviados=enviados, opciones=opciones, interaction=None)
+    if cliente is not None:
+        ctx.interaction = SimpleNamespace(client=cliente, _baton=ctx)
+    return ctx
 
-async def test_al_arrancar_se_mantiene_yt_dlp_con_el_resolver_del_bot(bot_mod, monkeypatch):
-    mantenidas = []
+def _servidor(id_, nombre="Servidor"):
+    """Servidor de mentira cuyo `leave` anota que lo llamaron."""
+    salidas = []
 
-    async def _mantener():
-        mantenidas.append("yt-dlp")
-        await asyncio.sleep(3600)
+    async def leave():
+        salidas.append(id_)
 
-    _arrancar_sin_red(bot_mod, monkeypatch, _nada)
-    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _mantener)
-    with pytest.raises(Fin):
-        await bot_mod.main()
-    assert mantenidas == ["yt-dlp"]
-
-
-async def test_al_cerrar_el_bot_se_cancela_el_mantenimiento_de_yt_dlp(bot_mod, monkeypatch):
-    estado = []
-
-    async def _mantener():
-        estado.append("corriendo")
-        try:
-            await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            estado.append("cancelada")
-            raise
-
-    _arrancar_sin_red(bot_mod, monkeypatch, _nada)
-    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _mantener)
-    with pytest.raises(Fin):
-        await bot_mod.main()
-    assert estado == ["corriendo", "cancelada"]
-
-
-async def test_cerrar_sin_haber_llegado_a_lanzar_el_mantenimiento_no_estorba(bot_mod, monkeypatch):
-    async def _start_server(bot, apagar):
-        return type("Runner", (), {"cleanup": staticmethod(_nada)})()
-
-    async def _load_extension(nombre):
-        raise Fin()
-
-    monkeypatch.setattr(bot_mod, "start_server", _start_server)
-    monkeypatch.setattr(bot_mod.bot, "load_extension", _load_extension)
-    with pytest.raises(Fin):
-        await bot_mod.main()
-
-
-# --- la cola en disco: retomarla al arrancar y guardarla al cerrar ------------
+    return SimpleNamespace(id=id_, name=nombre, leave=leave, salidas=salidas)
 
 class CogQueAnota:
     """De cada llamada que bot.py le hace al cog, solo importa el orden."""
@@ -159,304 +94,21 @@ class CogQueAnota:
     async def guardar_y_cerrar(self):
         self.orden.append("guardar")
 
-
-def _nodo_listo(resumed):
+def _nodo(resumed):
     return SimpleNamespace(resumed=resumed, node=SimpleNamespace(uri="http://127.0.0.1:2333", players={}))
 
+class Voz:
+    guild = "servidor"
+
+    def __init__(self, orden):
+        self.orden = orden
+
+    async def disconnect(self):
+        self.orden.append("desconectar")
 
 def _bot_con(bot_mod, monkeypatch, cog, voice_clients=(), close=None):
     falso = SimpleNamespace(get_cog=lambda nombre: cog, voice_clients=list(voice_clients), close=close)
     monkeypatch.setattr(bot_mod, "bot", falso)
-
-
-async def test_lo_guardado_se_retoma_una_sola_vez_aunque_el_nodo_reconecte(bot_mod, monkeypatch):
-    orden = []
-    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden))
-
-    for _ in range(3):
-        await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
-
-    assert orden == ["recuperar", "retomar", "recuperar", "recuperar"]
-
-
-async def test_una_sesion_reanudada_no_retoma_nada_pero_la_primera_nueva_si(bot_mod, monkeypatch):
-    orden = []
-    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden))
-
-    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=True))
-    assert orden == []
-
-    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
-    assert orden == ["recuperar", "retomar"]
-
-
-async def test_sin_el_cog_cargado_el_nodo_listo_no_falla(bot_mod, monkeypatch):
-    _bot_con(bot_mod, monkeypatch, None)
-
-    await bot_mod.on_wavelink_node_ready(_nodo_listo(resumed=False))
-
-
-async def test_al_apagar_se_guarda_antes_de_desconectar_los_players(bot_mod, monkeypatch):
-    orden = []
-
-    class Voz:
-        guild = "servidor"
-
-        async def disconnect(self):
-            orden.append("desconectar")
-
-    async def _cerrar():
-        orden.append("cerrar")
-
-    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden), [Voz(), Voz()], _cerrar)
-    apagar = asyncio.Event()
-    apagar.set()
-
-    await bot_mod.esperar_orden_de_apagado(apagar)
-
-    assert orden == ["guardar", "desconectar", "desconectar", "cerrar"]
-
-
-async def test_al_apagar_sin_el_cog_cargado_igual_se_desconecta_y_se_cierra(bot_mod, monkeypatch):
-    orden = []
-
-    class Voz:
-        guild = "servidor"
-
-        async def disconnect(self):
-            orden.append("desconectar")
-
-    async def _cerrar():
-        orden.append("cerrar")
-
-    _bot_con(bot_mod, monkeypatch, None, [Voz()], _cerrar)
-    apagar = asyncio.Event()
-    apagar.set()
-
-    await bot_mod.esperar_orden_de_apagado(apagar)
-
-    assert orden == ["desconectar", "cerrar"]
-
-
-# --- Lista blanca de servidores ----------------------------------------------
-
-def _servidor(id_, nombre="Servidor"):
-    """Un servidor de mentira cuyo `leave` anota que lo llamaron."""
-    salidas = []
-
-    async def leave():
-        salidas.append(id_)
-
-    return SimpleNamespace(id=id_, name=nombre, leave=leave, salidas=salidas)
-
-
-def _ctx(guild_id):
-    """Un contexto de mentira: `guild_id=None` es un mensaje directo."""
-    enviados, opciones = [], []
-
-    async def send(texto, **kwargs):
-        enviados.append(texto)
-        opciones.append(kwargs)
-
-    guild = None if guild_id is None else SimpleNamespace(id=guild_id)
-    return SimpleNamespace(guild=guild, send=send, enviados=enviados, opciones=opciones, interaction=None)
-
-
-def _ctx_de_barra(bot_mod, guild_id):
-    """Como `_ctx`, pero con el `interaction` que hace que discord.py corra los checks por el camino de `/`."""
-    ctx = _ctx(guild_id)
-    ctx.interaction = SimpleNamespace(client=bot_mod.bot)
-    ctx.interaction._baton = ctx
-    return ctx
-
-
-@pytest.mark.parametrize("crudo, validos, invalidos", [
-    ("", set(), ()),
-    ("   ", set(), ()),
-    ("123", {123}, ()),
-    ("123,456,789", {123, 456, 789}, ()),
-    ("123 456  789", {123, 456, 789}, ()),
-    ("123, 456 ,789,, ", {123, 456, 789}, ()),
-    ("123\t456", {123, 456}, ()),
-    ("123,123 123", {123}, ()),
-    # Lo que no es número se descarta, pero queda a la vista para el aviso.
-    ("123, abc 456 12x -5 +7 4.5 ²", {123, 456}, ("abc", "12x", "-5", "+7", "4.5", "²")),
-    ("solo,basura", set(), ("solo", "basura")),
-])
-def test_la_lista_de_servidores_se_parsea(monkeypatch, crudo, validos, invalidos):
-    monkeypatch.setenv("SERVIDORES_PERMITIDOS", crudo)
-
-    resultado, descartados = config._lista_de_ids("SERVIDORES_PERMITIDOS")
-
-    assert resultado == frozenset(validos)
-    assert isinstance(resultado, frozenset)
-    assert descartados == invalidos
-
-
-def test_sin_la_variable_no_hay_restriccion(monkeypatch):
-    """Quien no la tiene en su `.env` sigue como antes: lista vacía y nada que avisar."""
-    monkeypatch.delenv("SERVIDORES_PERMITIDOS", raising=False)
-
-    assert config._lista_de_ids("SERVIDORES_PERMITIDOS") == (frozenset(), ())
-
-
-POR_DEFECTO = ("android", "ios")
-
-
-@pytest.mark.parametrize("crudo, esperado", [
-    ("mweb,web", ("mweb", "web")),
-    (" mweb , web ,, ", ("mweb", "web")),
-    ("web,mweb,web", ("web", "mweb")),
-    ("", POR_DEFECTO),
-    (" , ,", POR_DEFECTO),
-])
-def test_la_lista_de_clientes_se_parsea(monkeypatch, crudo, esperado):
-    monkeypatch.setenv("YTDLP_CLIENTES", crudo)
-    assert config._lista_de_texto("YTDLP_CLIENTES", POR_DEFECTO) == esperado
-
-
-def test_sin_la_variable_de_clientes_se_usan_los_de_siempre(monkeypatch):
-    monkeypatch.delenv("YTDLP_CLIENTES", raising=False)
-    assert config._lista_de_texto("YTDLP_CLIENTES", POR_DEFECTO) == POR_DEFECTO
-
-
-@pytest.mark.parametrize("valor, esperado", [
-    (None, True),
-    ("true", True),
-    ("false", False),
-    ("0", False),
-    ("no", False),
-])
-def test_la_actualizacion_automatica_se_apaga_con_false(monkeypatch, valor, esperado):
-    if valor is None:
-        monkeypatch.delenv("YTDLP_AUTOACTUALIZAR", raising=False)
-    else:
-        monkeypatch.setenv("YTDLP_AUTOACTUALIZAR", valor)
-    assert config._booleano("YTDLP_AUTOACTUALIZAR", True) is esperado
-
-
-def test_servidor_permitido(bot_mod):
-    permitidos = frozenset({1, 2})
-
-    assert bot_mod.servidor_permitido(1, permitidos)
-    assert bot_mod.servidor_permitido(2, permitidos)
-    assert not bot_mod.servidor_permitido(3, permitidos)
-
-
-def test_lista_vacia_permite_cualquier_servidor(bot_mod):
-    assert bot_mod.servidor_permitido(3, frozenset())
-
-
-def test_los_mensajes_directos_no_se_restringen(bot_mod):
-    """Sin servidor no hay a quién restringir, con lista o sin ella."""
-    assert bot_mod.servidor_permitido(None, frozenset({1}))
-    assert bot_mod.servidor_permitido(None, frozenset())
-
-
-async def test_sale_de_un_servidor_nuevo_que_no_esta_en_la_lista(bot_mod, monkeypatch, caplog):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-    guild = _servidor(2, "Ajeno")
-
-    with caplog.at_level(logging.WARNING, logger="bot"):
-        await bot_mod.on_guild_join(guild)
-
-    assert guild.salidas == [2]
-    assert "Ajeno" in caplog.text and "2" in caplog.text
-
-
-async def test_no_sale_de_un_servidor_de_la_lista(bot_mod, monkeypatch):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-    guild = _servidor(1)
-
-    await bot_mod.on_guild_join(guild)
-
-    assert guild.salidas == []
-
-
-async def test_con_la_lista_vacia_no_sale_de_ningun_servidor(bot_mod, monkeypatch):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
-    guild = _servidor(2)
-
-    await bot_mod.on_guild_join(guild)
-
-    assert guild.salidas == []
-
-
-async def test_el_check_rechaza_los_comandos_de_un_servidor_ajeno(bot_mod, monkeypatch):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-
-    with pytest.raises(bot_mod.ServidorNoPermitido):
-        await bot_mod.bot.can_run(_ctx(2))
-
-
-async def test_el_check_deja_pasar_servidores_de_la_lista_y_mensajes_directos(bot_mod, monkeypatch):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-
-    assert await bot_mod.bot.can_run(_ctx(1))
-    assert await bot_mod.bot.can_run(_ctx(None))
-
-
-async def test_el_check_no_restringe_con_la_lista_vacia(bot_mod, monkeypatch):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
-
-    assert await bot_mod.bot.can_run(_ctx(2))
-
-
-async def test_un_servidor_no_permitido_no_recibe_respuesta(bot_mod):
-    ctx = _ctx(2)
-
-    await bot_mod.on_command_error(ctx, bot_mod.ServidorNoPermitido())
-
-    assert ctx.enviados == []
-
-
-async def test_otros_check_failure_siguen_contestando(bot_mod):
-    """La excepción nueva es una `CheckFailure`: las demás no pueden quedar mudas."""
-    ctx = _ctx(1)
-
-    await bot_mod.on_command_error(ctx, commands.CheckFailure("Entra a un canal de voz."))
-
-    assert ctx.enviados == ["Entra a un canal de voz."]
-
-
-def test_on_ready_avisa_si_la_lista_esta_vacia(bot_mod, monkeypatch, caplog):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
-    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
-
-    with caplog.at_level(logging.WARNING, logger="bot"):
-        bot_mod.avisar_lista_blanca([_servidor(1)])
-
-    assert "cualquier servidor" in caplog.text
-    assert "SERVIDORES_PERMITIDOS" in caplog.text
-
-
-def test_on_ready_avisa_de_las_entradas_invalidas(bot_mod, monkeypatch, caplog):
-    """Un ID mal escrito no puede perderse en silencio, aunque la lista tenga otros."""
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ("12x", "abc"))
-
-    with caplog.at_level(logging.WARNING, logger="bot"):
-        bot_mod.avisar_lista_blanca([_servidor(1)])
-
-    assert "12x, abc" in caplog.text
-    assert "cualquier servidor" not in caplog.text
-
-
-def test_on_ready_avisa_de_los_servidores_ajenos_sin_salirse(bot_mod, monkeypatch, caplog):
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
-    propio, ajeno = _servidor(1, "Propio"), _servidor(2, "Ajeno")
-
-    with caplog.at_level(logging.WARNING, logger="bot"):
-        bot_mod.avisar_lista_blanca([propio, ajeno])
-
-    assert "Ajeno" in caplog.text and "(ID: 2)" in caplog.text
-    assert "Propio" not in caplog.text
-    # Un ID mal escrito no puede hacer que el bot abandone el servidor del dueño.
-    assert propio.salidas == [] and ajeno.salidas == []
-
-
-# --- comandos de barra ---------------------------------------------------------
 
 class ArbolFalso:
     """Lo único que bot.py le pide al árbol de comandos: copiar lo global a un servidor y sincronizar."""
@@ -477,142 +129,251 @@ class ArbolFalso:
         self.sincronizados.append(destino)
         return [object()] * 17
 
-
 def _con_arbol(bot_mod, monkeypatch, arbol, permitidos=()):
     monkeypatch.setattr(bot_mod, "bot", SimpleNamespace(tree=arbol, user=SimpleNamespace(id=1), guilds=[]))
     monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset(permitidos))
     monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
 
+# --- arranque y apagado -------------------------------------------------------
 
-async def test_con_lista_blanca_se_copia_y_se_sincroniza_en_cada_servidor(bot_mod, monkeypatch, caplog):
-    arbol = ArbolFalso()
-    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={2, 1})
+def test_el_import_no_borra_la_cache_del_dj_y_deja_listo_el_resolver(bot_mod):
+    """Otra instancia en marcha tiene sus clips en uso; el cog y los players toman el resolver de aquí."""
+    assert bot_mod.orden == []
+    assert isinstance(bot_mod.bot.resolver, Resolver)
 
-    with caplog.at_level(logging.INFO, logger="bot"):
-        await bot_mod.sincronizar_comandos()
+async def test_la_cache_se_purga_solo_despues_de_tomar_el_puerto(bot_mod, monkeypatch):
+    async def _fin():
+        raise Fin()
 
-    assert arbol.copiados == [1, 2]
-    assert arbol.sincronizados == [1, 2, None]      # el último vacía los globales
-    assert arbol.limpiados == [None]
-    assert "17 registrados en el servidor 1" in caplog.text and "17 registrados en el servidor 2" in caplog.text
+    _sin_red(bot_mod, monkeypatch, _fin)
+    with pytest.raises(Fin):
+        await bot_mod.main()
+    assert bot_mod.orden == ["puerto", "purge", "limpiar"]
 
+async def test_si_el_puerto_esta_ocupado_no_se_purga_nada(bot_mod, monkeypatch):
+    async def _start_server(bot, apagar):
+        raise OSError("address in use")
 
-async def test_sin_lista_blanca_la_sincronizacion_es_global(bot_mod, monkeypatch, caplog):
-    arbol = ArbolFalso()
-    _con_arbol(bot_mod, monkeypatch, arbol)
+    monkeypatch.setattr(bot_mod, "start_server", _start_server)
+    with pytest.raises(OSError):
+        await bot_mod.main()
+    assert bot_mod.orden == []
 
-    with caplog.at_level(logging.INFO, logger="bot"):
-        await bot_mod.sincronizar_comandos()
+async def test_yt_dlp_se_mantiene_con_el_resolver_del_bot_y_se_cancela_al_cerrar(bot_mod, monkeypatch):
+    estado = []
 
-    assert arbol.copiados == []
-    assert arbol.sincronizados == [None]
-    assert arbol.limpiados == []
-    assert "17 registrados de forma global" in caplog.text and "tardar" in caplog.text
+    async def _mantener():
+        estado.append("corriendo")
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            estado.append("cancelada")
+            raise
 
+    _sin_red(bot_mod, monkeypatch)
+    monkeypatch.setattr(bot_mod.bot.resolver, "mantener_al_dia", _mantener)
+    with pytest.raises(Fin):
+        await bot_mod.main()
+    assert estado == ["corriendo", "cancelada"]
 
-async def test_los_comandos_de_barra_se_sincronizan_una_sola_vez_aunque_on_ready_se_repita(bot_mod, monkeypatch):
-    arbol = ArbolFalso()
-    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={1})
-
+async def test_lo_guardado_se_retoma_una_sola_vez_y_una_sesion_reanudada_no_retoma(bot_mod, monkeypatch):
+    orden = []
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden))
+    await bot_mod.on_wavelink_node_ready(_nodo(True))
+    assert orden == []
     for _ in range(3):
-        await bot_mod.on_ready()
+        await bot_mod.on_wavelink_node_ready(_nodo(False))
+    assert orden == ["recuperar", "retomar", "recuperar", "recuperar"]
 
-    assert arbol.sincronizados == [1, None]
+async def test_sin_el_cog_cargado_el_nodo_listo_no_falla(bot_mod, monkeypatch):
+    _bot_con(bot_mod, monkeypatch, None)
+    await bot_mod.on_wavelink_node_ready(_nodo(False))
 
-
-async def test_un_error_al_sincronizar_no_tumba_al_bot_ni_a_los_demas_servidores(bot_mod, monkeypatch, caplog):
-    arbol = ArbolFalso(fallan={1})
-    _con_arbol(bot_mod, monkeypatch, arbol, permitidos={1, 2})
-
-    with caplog.at_level(logging.INFO, logger="bot"):
-        await bot_mod.sincronizar_comandos()
-
-    assert arbol.sincronizados == [2, None]
-    assert "No pude registrar los comandos de barra en el servidor 1" in caplog.text
-    assert "17 registrados en el servidor 2" in caplog.text
-
-
-async def test_un_error_en_la_sincronizacion_global_tampoco_tumba_al_bot(bot_mod, monkeypatch, caplog):
-    _con_arbol(bot_mod, monkeypatch, ArbolFalso(fallan={None}))
-
-    with caplog.at_level(logging.INFO, logger="bot"):
-        await bot_mod.on_ready()
-
-    assert "No pude registrar los comandos de barra de forma global" in caplog.text
-
-
-def test_refresh_tambien_es_un_comando_de_barra(bot_mod):
-    comando = bot_mod.bot.get_command("refresh")
-
-    assert isinstance(comando, commands.HybridCommand)
-    assert bot_mod.bot.tree.get_command("refresh") is comando.app_command
-    assert 1 <= len(comando.app_command.description) <= 100
-
-
-async def test_el_check_global_tambien_corta_un_comando_de_barra_de_un_servidor_ajeno(bot_mod, monkeypatch):
-    """Con `/`, discord.py corre los checks del bot por otro camino (`HybridAppCommand._check_can_run`)."""
-    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
-    refresh = bot_mod.bot.get_command("refresh")
-
-    with pytest.raises(bot_mod.ServidorNoPermitido):
-        await refresh.can_run(_ctx_de_barra(bot_mod, 2))
-
-    assert await refresh.can_run(_ctx_de_barra(bot_mod, 1))
-    assert await refresh.can_run(_ctx_de_barra(bot_mod, None))
-
-
-@pytest.mark.parametrize("error", [
-    commands.MissingRequiredArgument(SimpleNamespace(name="query", displayed_name=None)),
-    commands.BadArgument("no es un número"),
-    commands.CheckFailure("Tienes que estar en el mismo canal de voz que yo."),
-    commands.NoPrivateMessage("Los comandos de música funcionan en un servidor."),
+@pytest.mark.parametrize("con_cog, esperado", [
+    (True, ["guardar", "desconectar", "desconectar", "cerrar"]),
+    (False, ["desconectar", "desconectar", "cerrar"]),
 ])
-async def test_los_avisos_de_error_son_efimeros_con_barra_y_normales_con_prefijo(bot_mod, error):
-    de_barra = _ctx_de_barra(bot_mod, 1)
-    con_prefijo = _ctx(1)
+async def test_al_apagar_se_guarda_antes_de_desconectar_los_players(bot_mod, monkeypatch, con_cog, esperado):
+    orden = []
 
-    await bot_mod.on_command_error(de_barra, error)
-    await bot_mod.on_command_error(con_prefijo, error)
+    async def _cerrar():
+        orden.append("cerrar")
 
-    assert de_barra.enviados == con_prefijo.enviados and len(de_barra.enviados) == 1
-    assert de_barra.opciones == [{"ephemeral": True}]
+    _bot_con(bot_mod, monkeypatch, CogQueAnota(orden) if con_cog else None, [Voz(orden), Voz(orden)], _cerrar)
+    apagar = asyncio.Event()
+    apagar.set()
+    await bot_mod.esperar_orden_de_apagado(apagar)
+    assert orden == esperado
 
+# --- configuración de la lista blanca y de yt-dlp -----------------------------
 
-async def test_un_servidor_no_permitido_sigue_mudo_tambien_con_barra(bot_mod):
-    ctx = _ctx_de_barra(bot_mod, 2)
+@pytest.mark.parametrize("crudo, validos, invalidos", [
+    (None, set(), ()),
+    ("", set(), ()),
+    ("123,456,789", {123, 456, 789}, ()),
+    ("123 456\t 789", {123, 456, 789}, ()),
+    ("123, 456 ,789,, ", {123, 456, 789}, ()),
+    ("123,123 123", {123}, ()),
+    # Lo que no es número se descarta, pero queda a la vista para el aviso.
+    ("123, abc 456 12x -5 +7 4.5 ²", {123, 456}, ("abc", "12x", "-5", "+7", "4.5", "²")),
+    ("solo,basura", set(), ("solo", "basura")),
+])
+def test_la_lista_de_servidores_se_parsea(monkeypatch, crudo, validos, invalidos):
+    _env(monkeypatch, "SERVIDORES_PERMITIDOS", crudo)
+    resultado, descartados = config._lista_de_ids("SERVIDORES_PERMITIDOS")
+    assert isinstance(resultado, frozenset) and resultado == frozenset(validos)
+    assert descartados == invalidos
 
+POR_DEFECTO = ("android", "ios")
+
+@pytest.mark.parametrize("crudo, esperado", [
+    (None, POR_DEFECTO),
+    ("", POR_DEFECTO),
+    (" , ,", POR_DEFECTO),
+    (" mweb , web ,, ", ("mweb", "web")),
+    ("web,mweb,web", ("web", "mweb")),
+])
+def test_la_lista_de_clientes_se_parsea(monkeypatch, crudo, esperado):
+    _env(monkeypatch, "YTDLP_CLIENTES", crudo)
+    assert config._lista_de_texto("YTDLP_CLIENTES", POR_DEFECTO) == esperado
+
+@pytest.mark.parametrize("valor, esperado", [(None, True), ("true", True), ("false", False), ("0", False), ("no", False)])
+def test_la_actualizacion_automatica_se_apaga_con_false(monkeypatch, valor, esperado):
+    _env(monkeypatch, "YTDLP_AUTOACTUALIZAR", valor)
+    assert config._booleano("YTDLP_AUTOACTUALIZAR", True) is esperado
+
+# --- lista blanca de servidores -----------------------------------------------
+
+@pytest.mark.parametrize("guild_id, permitidos, esperado", [
+    (1, {1, 2}, True), (2, {1, 2}, True), (3, {1, 2}, False), (3, set(), True),
+    (None, {1}, True), (None, set(), True),      # sin servidor no hay a quién restringir
+])
+def test_servidor_permitido(bot_mod, guild_id, permitidos, esperado):
+    assert bot_mod.servidor_permitido(guild_id, frozenset(permitidos)) is esperado
+
+@pytest.mark.parametrize("permitidos, guild_id, sale", [({1}, 2, True), ({1}, 1, False), (set(), 2, False)])
+async def test_solo_sale_de_un_servidor_nuevo_que_no_esta_en_la_lista(bot_mod, monkeypatch, caplog, permitidos, guild_id, sale):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset(permitidos))
+    guild = _servidor(guild_id, "Ajeno")
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        await bot_mod.on_guild_join(guild)
+    assert guild.salidas == ([guild_id] if sale else [])
+    assert ("Ajeno (ID: 2)" in caplog.text) is sale
+
+@pytest.mark.parametrize("barra", [False, True])
+@pytest.mark.parametrize("permitidos, guild_id, pasa", [({1}, 2, False), ({1}, 1, True), ({1}, None, True), (set(), 2, True)])
+async def test_el_check_global_filtra_por_servidor(bot_mod, monkeypatch, barra, permitidos, guild_id, pasa):
+    """Con `/`, discord.py corre los checks del bot por otro camino (`HybridAppCommand._check_can_run`)."""
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset(permitidos))
+    ctx = _ctx(guild_id, bot_mod.bot if barra else None)
+    puede = bot_mod.bot.get_command("refresh").can_run if barra else bot_mod.bot.can_run
+    if pasa:
+        assert await puede(ctx)
+    else:
+        with pytest.raises(bot_mod.ServidorNoPermitido):
+            await puede(ctx)
+
+def test_el_arranque_avisa_de_la_lista_vacia_y_de_las_entradas_invalidas(bot_mod, monkeypatch, caplog):
+    """Un ID mal escrito no puede perderse en silencio, aunque la lista tenga otros."""
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset())
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([_servidor(1)])
+    assert "cualquier servidor" in caplog.text and "SERVIDORES_PERMITIDOS" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ("12x", "abc"))
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([_servidor(1)])
+    assert "12x, abc" in caplog.text and "cualquier servidor" not in caplog.text
+
+def test_el_arranque_avisa_de_los_servidores_ajenos_sin_salirse(bot_mod, monkeypatch, caplog):
+    monkeypatch.setattr(config, "SERVIDORES_PERMITIDOS", frozenset({1}))
+    monkeypatch.setattr(config, "SERVIDORES_INVALIDOS", ())
+    propio, ajeno = _servidor(1, "Propio"), _servidor(2, "Ajeno")
+    with caplog.at_level(logging.WARNING, logger="bot"):
+        bot_mod.avisar_lista_blanca([propio, ajeno])
+    assert "Ajeno" in caplog.text and "(ID: 2)" in caplog.text and "Propio" not in caplog.text
+    assert propio.salidas == [] and ajeno.salidas == []     # un ID mal escrito no puede sacar al bot de su servidor
+
+# --- errores de comandos ------------------------------------------------------
+
+@pytest.mark.parametrize("error, texto", [
+    (commands.MissingRequiredArgument(SimpleNamespace(name="query", displayed_name=None)), "Falta un argumento: `query`"),
+    (commands.BadArgument("no es un número"), "Argumento inválido: no es un número"),
+    (commands.CheckFailure("Tienes que estar en el mismo canal de voz que yo."), "Tienes que estar en el mismo canal de voz que yo."),
+    (commands.NoPrivateMessage("Los comandos de música funcionan en un servidor."), "Los comandos de música funcionan en un servidor."),
+    (commands.CheckFailure(), "No puedes usar ese comando aquí."),
+])
+async def test_los_avisos_de_error_son_efimeros_con_barra_y_con_prefijo(bot_mod, error, texto):
+    for ctx in (_ctx(1, bot_mod.bot), _ctx(1)):
+        await bot_mod.on_command_error(ctx, error)
+        assert ctx.enviados == [texto] and ctx.opciones == [{"ephemeral": True}]
+
+@pytest.mark.parametrize("barra", [False, True])
+async def test_un_servidor_no_permitido_no_recibe_respuesta(bot_mod, barra):
+    ctx = _ctx(2, bot_mod.bot if barra else None)
     await bot_mod.on_command_error(ctx, bot_mod.ServidorNoPermitido())
-
     assert ctx.enviados == []
 
-
-async def test_un_error_inesperado_con_barra_avisa_a_quien_escribio_y_se_propaga(bot_mod):
+@pytest.mark.parametrize("barra, enviados", [(True, ["Algo falló de mi lado. Prueba de nuevo."]), (False, [])])
+async def test_un_error_inesperado_se_propaga_y_con_barra_avisa_a_quien_escribio(bot_mod, barra, enviados):
     """Sin respuesta, el "pensando…" de una interacción diferida se queda colgado hasta que Discord la da por perdida."""
-    ctx = _ctx_de_barra(bot_mod, 1)
-
+    ctx = _ctx(1, bot_mod.bot if barra else None)
     with pytest.raises(RuntimeError, match="boom"):
         await bot_mod.on_command_error(ctx, RuntimeError("boom"))
-
-    assert ctx.enviados == ["Algo falló de mi lado. Prueba de nuevo."]
-    assert ctx.opciones == [{"ephemeral": True}]
-
-
-async def test_un_error_inesperado_con_prefijo_se_propaga_sin_decir_nada(bot_mod):
-    ctx = _ctx(1)
-
-    with pytest.raises(RuntimeError, match="boom"):
-        await bot_mod.on_command_error(ctx, RuntimeError("boom"))
-
-    assert ctx.enviados == []
-
+    assert ctx.enviados == enviados
+    assert ctx.opciones == [{"ephemeral": True}] * len(enviados)
 
 async def test_si_el_aviso_de_error_tampoco_se_puede_enviar_se_propaga_el_error_original(bot_mod):
-    ctx = _ctx_de_barra(bot_mod, 1)
+    ctx = _ctx(1, bot_mod.bot)
 
     async def _send_roto(texto, **kwargs):
         raise discord.HTTPException(SimpleNamespace(status=500, reason="boom"), "no se pudo")
 
     ctx.send = _send_roto
-
     with pytest.raises(RuntimeError, match="original"):
         await bot_mod.on_command_error(ctx, RuntimeError("original"))
+
+# --- comandos de barra --------------------------------------------------------
+
+@pytest.mark.parametrize("permitidos, copiados, sincronizados, limpiados, en_log", [
+    # Con lista blanca el último sync vacía los globales.
+    ({2, 1}, [1, 2], [1, 2, None], [None], ("17 registrados en el servidor 1", "17 registrados en el servidor 2")),
+    (set(), [], [None], [], ("17 registrados de forma global", "tardar")),
+])
+async def test_la_sincronizacion_es_por_servidor_con_lista_blanca_y_global_sin_ella(
+        bot_mod, monkeypatch, caplog, permitidos, copiados, sincronizados, limpiados, en_log):
+    arbol = ArbolFalso()
+    _con_arbol(bot_mod, monkeypatch, arbol, permitidos)
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.sincronizar_comandos()
+    assert (arbol.copiados, arbol.sincronizados, arbol.limpiados) == (copiados, sincronizados, limpiados)
+    assert all(fragmento in caplog.text for fragmento in en_log)
+
+async def test_los_comandos_de_barra_se_sincronizan_una_sola_vez_aunque_on_ready_se_repita(bot_mod, monkeypatch):
+    arbol = ArbolFalso()
+    _con_arbol(bot_mod, monkeypatch, arbol, {1})
+    for _ in range(3):
+        await bot_mod.on_ready()
+    assert arbol.sincronizados == [1, None]
+
+@pytest.mark.parametrize("fallan, permitidos, sincronizados, en_log", [
+    ({1}, {1, 2}, [2, None], ("No pude registrar los comandos de barra en el servidor 1", "17 registrados en el servidor 2")),
+    ({None}, set(), [], ("No pude registrar los comandos de barra de forma global",)),
+    ({None}, {1}, [1], ("No pude borrar los comandos de barra globales",)),
+])
+async def test_un_error_al_sincronizar_no_tumba_al_bot_ni_a_los_demas_servidores(
+        bot_mod, monkeypatch, caplog, fallan, permitidos, sincronizados, en_log):
+    arbol = ArbolFalso(fallan)
+    _con_arbol(bot_mod, monkeypatch, arbol, permitidos)
+    with caplog.at_level(logging.INFO, logger="bot"):
+        await bot_mod.sincronizar_comandos()
+    assert arbol.sincronizados == sincronizados
+    assert all(fragmento in caplog.text for fragmento in en_log)
+
+def test_refresh_tambien_es_un_comando_de_barra(bot_mod):
+    comando = bot_mod.bot.get_command("refresh")
+    assert isinstance(comando, commands.HybridCommand)
+    assert bot_mod.bot.tree.get_command("refresh") is comando.app_command
+    assert 1 <= len(comando.app_command.description) <= 100

@@ -7,110 +7,82 @@ import pytest
 
 from core import ajustes, config, guionista
 
+VOZ = "es_MX-ald-medium"
+
+
+def _escribir(contenido):
+    config.ARCHIVO_DE_AJUSTES.parent.mkdir(parents=True)
+    if not isinstance(contenido, (str, bytes)):
+        contenido = json.dumps(contenido)
+    config.ARCHIVO_DE_AJUSTES.write_bytes(contenido if isinstance(contenido, bytes) else contenido.encode())
+
+
+def _texto():
+    return config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8")
+
 
 def test_sin_archivo_valen_los_valores_por_defecto():
     assert ajustes.cargar() == {"voz": "espeak", "filtro_radio": True, "guionista": None}
-    assert ajustes.obtener("voz") == "espeak"
+    assert ajustes.obtener("voz") == "espeak" and ajustes.obtener("guionista") is None
 
 
-def test_lo_guardado_se_lee_de_vuelta_y_queda_en_el_archivo():
-    ajustes.guardar(voz="es_MX-ald-medium")
+def test_lo_guardado_se_lee_de_vuelta_y_queda_en_el_archivo_creando_la_carpeta():
+    assert not config.ARCHIVO_DE_AJUSTES.parent.exists()
+    ajustes.guardar(voz=VOZ)
     ajustes.guardar(filtro_radio=False)
 
-    assert ajustes.cargar() == {"voz": "es_MX-ald-medium", "filtro_radio": False, "guionista": None}
-    assert json.loads(config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8"))["voz"] == "es_MX-ald-medium"
+    assert ajustes.cargar() == {"voz": VOZ, "filtro_radio": False, "guionista": None}
+    assert json.loads(_texto())["voz"] == VOZ
 
 
 def test_los_tests_no_escriben_en_el_estado_del_proyecto():
     assert config.PROJECT_ROOT / "estado" not in config.ARCHIVO_DE_AJUSTES.parents
 
 
-def test_guardar_crea_la_carpeta():
-    assert not config.ARCHIVO_DE_AJUSTES.parent.exists()
-    ajustes.guardar(filtro_radio=False)
-    assert config.ARCHIVO_DE_AJUSTES.is_file()
-
-
 @pytest.mark.parametrize("contenido", ["{no es json", "[1, 2]", "", "null", b"\xff\xfe\x00"])
 def test_un_archivo_roto_o_raro_cae_a_los_valores_por_defecto(contenido):
-    config.ARCHIVO_DE_AJUSTES.parent.mkdir(parents=True)
-    config.ARCHIVO_DE_AJUSTES.write_bytes(contenido if isinstance(contenido, bytes) else contenido.encode())
-
+    _escribir(contenido)
     assert ajustes.cargar() == ajustes.POR_DEFECTO
 
 
-def test_un_valor_del_tipo_equivocado_se_ignora_sin_tirar_los_demas():
-    config.ARCHIVO_DE_AJUSTES.parent.mkdir(parents=True)
-    config.ARCHIVO_DE_AJUSTES.write_text(json.dumps({"voz": 7, "filtro_radio": False}), encoding="utf-8")
+@pytest.mark.parametrize("archivo, esperado", [
+    ({"voz": 7, "filtro_radio": False}, {"voz": "espeak", "filtro_radio": False, "guionista": None}),
+    *[({"guionista": v, "voz": VOZ}, {"voz": VOZ, "filtro_radio": True, "guionista": None})
+      for v in ("gpt", "", 7, ["claude"], False)],
+])
+def test_un_valor_invalido_en_el_archivo_se_ignora_sin_tirar_los_demas(archivo, esperado):
+    _escribir(archivo)
+    assert ajustes.cargar() == esperado
 
-    assert ajustes.cargar() == {"voz": "espeak", "filtro_radio": False, "guionista": None}
 
-
-def test_guardar_un_tipo_equivocado_es_error_y_no_toca_el_archivo():
-    ajustes.guardar(voz="es_MX-ald-medium")
-    antes = config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8")
-
+@pytest.mark.parametrize("cambio", [{"filtro_radio": "si"}, *[{"guionista": v} for v in ("gpt", "", "Claude", 7, ["claude"], True)]])
+def test_guardar_un_valor_invalido_es_error_y_no_toca_el_archivo(cambio):
+    ajustes.guardar(voz=VOZ)
+    antes = _texto()
     with pytest.raises(ValueError):
-        ajustes.guardar(filtro_radio="si")
-
-    assert config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8") == antes
+        ajustes.guardar(**cambio)
+    assert _texto() == antes
 
 
 def test_guardar_respeta_las_claves_que_este_modulo_no_conoce():
-    config.ARCHIVO_DE_AJUSTES.parent.mkdir(parents=True)
-    config.ARCHIVO_DE_AJUSTES.write_text(json.dumps({"futura": "x"}), encoding="utf-8")
-
-    ajustes.guardar(voz="es_MX-ald-medium")
-
-    assert json.loads(config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8")) == {
-        "futura": "x", "voz": "es_MX-ald-medium",
-    }
+    _escribir({"futura": "x"})
+    ajustes.guardar(voz=VOZ)
+    assert json.loads(_texto()) == {"futura": "x", "voz": VOZ}
     assert ajustes.obtener("futura") == "x"
 
 
-# --- guionista ---------------------------------------------------------------
-
-def test_sin_guionista_guardado_el_valor_es_none():
-    assert ajustes.obtener("guionista") is None
-
-
 @pytest.mark.parametrize("nombre", guionista.NOMBRES)
-def test_cada_guionista_conocido_se_guarda_y_se_lee_de_vuelta(nombre):
+def test_cada_guionista_conocido_se_guarda_se_lee_y_none_borra_la_eleccion(nombre):
     ajustes.guardar(guionista=nombre)
-
     assert ajustes.obtener("guionista") == nombre
-    assert json.loads(config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8"))["guionista"] == nombre
-
-
-def test_guardar_none_borra_la_eleccion():
-    ajustes.guardar(guionista="claude")
+    assert json.loads(_texto())["guionista"] == nombre
     ajustes.guardar(guionista=None)
-
     assert ajustes.obtener("guionista") is None
-
-
-@pytest.mark.parametrize("valor", ["gpt", "", "Claude", 7, ["claude"], True])
-def test_guardar_un_guionista_desconocido_es_error_y_no_toca_el_archivo(valor):
-    ajustes.guardar(guionista="ollama")
-    antes = config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8")
-
-    with pytest.raises(ValueError):
-        ajustes.guardar(guionista=valor)
-
-    assert config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8") == antes
-
-
-@pytest.mark.parametrize("valor", ["gpt", "", 7, ["claude"], False])
-def test_un_guionista_raro_en_el_archivo_se_ignora_sin_tirar_los_demas(valor):
-    config.ARCHIVO_DE_AJUSTES.parent.mkdir(parents=True)
-    config.ARCHIVO_DE_AJUSTES.write_text(json.dumps({"guionista": valor, "voz": "es_MX-ald-medium"}), encoding="utf-8")
-
-    assert ajustes.cargar() == {"voz": "es_MX-ald-medium", "filtro_radio": True, "guionista": None}
 
 
 def test_si_la_escritura_falla_el_archivo_queda_intacto_y_sin_temporales(monkeypatch):
-    ajustes.guardar(voz="es_MX-ald-medium")
-    antes = config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8")
+    ajustes.guardar(voz=VOZ)
+    antes = _texto()
 
     def falla(*_):
         raise OSError("disco lleno")
@@ -119,5 +91,5 @@ def test_si_la_escritura_falla_el_archivo_queda_intacto_y_sin_temporales(monkeyp
     with pytest.raises(OSError):
         ajustes.guardar(voz="es_ES-davefx-medium")
 
-    assert config.ARCHIVO_DE_AJUSTES.read_text(encoding="utf-8") == antes
+    assert _texto() == antes
     assert [p.name for p in config.ARCHIVO_DE_AJUSTES.parent.iterdir()] == ["ajustes.json"]

@@ -1,11 +1,6 @@
-"""La lógica del panel de escritorio sin GTK: `scripts/lavadj_panel_logica.py`.
+"""La lógica del panel sin GTK (`scripts/lavadj_panel_logica.py`): API del bot y Lavalink de juguete en 127.0.0.1, procesos doblados.
 
-Es solo biblioteca estándar, así que se importa con el venv agregando `scripts/` al
-path. Nada de red real: la API del bot y Lavalink son un servidor de juguete en
-127.0.0.1 y los procesos (Lavalink, el bot) son dobles de `subprocess`.
-
-La ventana (`scripts/lavadj-panel.py`) no se puede importar aquí, sin GTK ni con guion
-en el nombre. Lo único que se le comprueba es que no use nombres sin definir.
+La ventana (`scripts/lavadj-panel.py`) no se importa aquí (sin GTK, y con guion en el nombre): solo se le comprueba que no use nombres sin definir.
 """
 
 import ast
@@ -36,8 +31,6 @@ def _escribir(ruta, texto):
     ruta.write_bytes(texto.encode("utf-8"))
     return ruta
 
-
-# --- textos ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("segundos, esperado", [
     (0, "0 s"), (5.9, "5 s"), (59.9, "59 s"),
@@ -72,39 +65,25 @@ def test_acortar(logica, linea, esperado):
     assert logica._acortar(linea) == esperado
 
 
-# --- texto_de_estado -------------------------------------------------------------
-
 def test_estado_ocupado_muestra_la_tarea_aunque_no_haya_bot(logica):
-    assert logica.texto_de_estado(None, ocupado=True, tarea="bajando titulares…") \
-        == "bajando titulares…"
+    assert logica.texto_de_estado(None, ocupado=True, tarea="bajando titulares…") == "bajando titulares…"
     assert logica.texto_de_estado({"usuario": "x"}, ocupado=True, tarea="t", vigilando=True) == "t"
 
 
-def test_estado_levantando_mientras_se_vigila_el_arranque(logica):
-    assert logica.texto_de_estado(None, vigilando=True) == "levantando…"
+@pytest.mark.parametrize("estado, kwargs, esperado", [
+    (None, {"vigilando": True}, "levantando…"),
+    (None, {}, "sin proceso"),
+    ({}, {}, "sin proceso"),
+    ({"usuario": "LavaDJ", "uptime": 90, "voz": [{"cancion": None}, {"cancion": "Tema"}, {"cancion": "Otro"}]}, {}, "♪ Tema"),
+    ({"usuario": "LavaDJ#1", "uptime": 125, "voz": [{"cancion": ""}]}, {}, "LavaDJ#1 · hace 2 min"),
+    ({"usuario": "LavaDJ#1", "uptime": 0}, {}, "LavaDJ#1 · hace 0 s"),
+    ({"usuario": "LavaDJ#1"}, {}, "LavaDJ#1"),
+    ({"uptime": 60}, {}, "conectado · hace 1 min"),
+    ({"usuario": None, "uptime": None}, {}, "conectado"),
+])
+def test_texto_de_estado(logica, estado, kwargs, esperado):
+    assert logica.texto_de_estado(estado, **kwargs) == esperado
 
-
-@pytest.mark.parametrize("estado", [None, {}])
-def test_estado_sin_bot_es_sin_proceso(logica, estado):
-    assert logica.texto_de_estado(estado) == "sin proceso"
-
-
-def test_estado_muestra_la_cancion_que_suena(logica):
-    estado = {"usuario": "LavaDJ", "uptime": 90,
-              "voz": [{"cancion": None}, {"cancion": "Tema"}, {"cancion": "Otro"}]}
-    assert logica.texto_de_estado(estado) == "♪ Tema"
-
-
-def test_estado_sin_cancion_muestra_usuario_y_uptime(logica):
-    estado = {"usuario": "LavaDJ#1", "uptime": 125, "voz": [{"cancion": ""}]}
-    assert logica.texto_de_estado(estado) == "LavaDJ#1 · hace 2 min"
-    assert logica.texto_de_estado({"usuario": "LavaDJ#1", "uptime": 0}) == "LavaDJ#1 · hace 0 s"
-    assert logica.texto_de_estado({"usuario": "LavaDJ#1"}) == "LavaDJ#1"
-    assert logica.texto_de_estado({"uptime": 60}) == "conectado · hace 1 min"
-    assert logica.texto_de_estado({"usuario": None, "uptime": None}) == "conectado"
-
-
-# --- aviso_de_salud --------------------------------------------------------------
 
 @pytest.mark.parametrize("estado", [
     None, {}, {"salud": None, "ytdlp": None}, {"salud": {"estado": "ok"}},
@@ -115,38 +94,30 @@ def test_salud_sin_novedades_apaga_el_testigo(logica, estado):
     assert logica.aviso_de_salud(estado) is None
 
 
-def test_salud_mudo_es_grave_y_flojo_es_aviso(logica):
-    assert logica.aviso_de_salud({"salud": {"estado": "mudo", "motivo": "sin audio"}}) \
-        == ("MUDO", "grave", "sin audio")
-    assert logica.aviso_de_salud({"salud": {"estado": "flojo", "motivo": "poca cola"}}) \
-        == ("FLOJO", "aviso", "poca cola")
-    assert logica.aviso_de_salud({"salud": {"estado": "mudo"}}) == ("MUDO", "grave", "")
+@pytest.mark.parametrize("estado, esperado", [
+    ({"salud": {"estado": "mudo", "motivo": "sin audio"}}, ("MUDO", "grave", "sin audio")),
+    ({"salud": {"estado": "flojo", "motivo": "poca cola"}}, ("FLOJO", "aviso", "poca cola")),
+    ({"salud": {"estado": "mudo"}}, ("MUDO", "grave", "")),
+])
+def test_salud_mudo_es_grave_y_flojo_es_aviso(logica, estado, esperado):
+    assert logica.aviso_de_salud(estado) == esperado
 
 
-def test_salud_yt_dlp_viejo(logica):
-    texto, clase, detalle = logica.aviso_de_salud(
-        {"ytdlp": {"viejo": True, "version": "2026.01.02", "dias": 45}})
+def test_salud_yt_dlp_viejo_y_cliente_cambiado(logica):
+    texto, clase, detalle = logica.aviso_de_salud({"ytdlp": {"viejo": True, "version": "2026.01.02", "dias": 45}})
     assert (texto, clase) == ("YT-DLP", "aviso")
     assert "2026.01.02" in detalle and "45 días" in detalle
-
-
-def test_salud_cliente_de_youtube_cambiado_dice_que_poner_en_el_env(logica):
-    texto, clase, detalle = logica.aviso_de_salud(
-        {"ytdlp": {"cliente": "ios", "cliente_configurado": "android"}})
+    texto, clase, detalle = logica.aviso_de_salud({"ytdlp": {"cliente": "ios", "cliente_configurado": "android"}})
     assert (texto, clase) == ("YT-DLP", "aviso")
     assert "android" in detalle and "YTDLP_PLAYER_CLIENT=ios" in detalle
 
 
 def test_salud_informa_primero_lo_mas_grave(logica):
-    ytdlp = {"viejo": True, "version": "v", "dias": 40,
-             "cliente": "ios", "cliente_configurado": "android"}
+    ytdlp = {"viejo": True, "version": "v", "dias": 40, "cliente": "ios", "cliente_configurado": "android"}
     assert logica.aviso_de_salud({"salud": {"estado": "mudo"}, "ytdlp": ytdlp})[0] == "MUDO"
     assert logica.aviso_de_salud({"salud": {"estado": "flojo"}, "ytdlp": ytdlp})[0] == "FLOJO"
-    # yt-dlp viejo gana al cambio de cliente.
-    assert "días" in logica.aviso_de_salud({"ytdlp": ytdlp})[2]
+    assert "días" in logica.aviso_de_salud({"ytdlp": ytdlp})[2]    # yt-dlp viejo gana al cambio de cliente
 
-
-# --- el cajón de titulares -------------------------------------------------------
 
 def test_aviso_sin_titulares_distingue_sin_feeds_de_sin_bajar(logica):
     assert "No hay feeds" in logica.aviso_sin_titulares({})
@@ -157,11 +128,8 @@ def test_aviso_sin_titulares_distingue_sin_feeds_de_sin_bajar(logica):
 def test_resumen_de_titulares(logica):
     datos = {"titulares": [{"leido": True}, {"leido": False}, {}], "edad": 120}
     assert logica.resumen_de_titulares(datos) == "3 TITULARES · 1 YA AL AIRE · hace 2 min"
-    assert logica.resumen_de_titulares({"titulares": [{"leido": True}]}) \
-        == "1 TITULARES · 1 YA AL AIRE · sin bajar"
+    assert logica.resumen_de_titulares({"titulares": [{"leido": True}]}) == "1 TITULARES · 1 YA AL AIRE · sin bajar"
 
-
-# --- botones y arranque vigilado -------------------------------------------------
 
 @pytest.mark.parametrize("al_aire, ocupado, vigilando, esperado", [
     (False, False, False, (True, False, False)),
@@ -187,9 +155,7 @@ def test_veredicto_de_arranque(logica):
     assert logica.veredicto_de_arranque(vigilando, {"usuario": "x"}, 80.0) == "levanto"
 
 
-# --- .env y rutas ----------------------------------------------------------------
-
-def test_del_env(logica, monkeypatch, tmp_path):
+def test_del_env_y_sin_archivo(logica, monkeypatch, tmp_path):
     _escribir(tmp_path / ".env", "\n".join([
         "# API_PORT=1111",
         "  API_PORT = '1234' ",
@@ -205,11 +171,8 @@ def test_del_env(logica, monkeypatch, tmp_path):
     assert logica._del_env("VACIA", "por defecto") == "por defecto"
     assert logica._del_env("SIN_IGUAL", "por defecto") == "por defecto"
     assert logica._del_env("NO_ESTA", "por defecto") == "por defecto"
-
-
-def test_del_env_sin_archivo_usa_el_valor_por_defecto(logica, monkeypatch, tmp_path):
-    monkeypatch.setattr(logica, "PROJECT", tmp_path)
-    assert logica._del_env("API_PORT", "9876") == "9876"
+    (tmp_path / ".env").unlink()
+    assert logica._del_env("API_PORT", "9876") == "9876"    # sin archivo, el valor por defecto
 
 
 def test_las_rutas_cuelgan_de_la_raiz_del_proyecto(logica):
@@ -231,8 +194,6 @@ def test_dir_de_config_sigue_xdg_config_home(logica, monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CONFIG_HOME")
     assert logica._dir_de_config() == Path.home() / ".config"
 
-
-# --- hablar con la API del bot ---------------------------------------------------
 
 class _ApiDeJuguete(ThreadingHTTPServer):
     daemon_threads = True
@@ -303,18 +264,13 @@ def test_estado_bot_con_respuesta_rota_es_none(logica, api, respuesta):
     assert logica.estado_bot() is None
 
 
-def test_consultar_get_sin_parametros(logica, api):
+def test_consultar_codifica_los_parametros_en_la_url_y_sin_ellos_es_un_get_simple(logica, api):
     api.respuestas["/api/headlines"] = _json({"titulares": [{"texto": "a"}]})
-    assert logica.consultar("headlines", timeout=2) == ("", {"titulares": [{"texto": "a"}]})
-    assert (api.peticiones[0].metodo, api.peticiones[0].ruta) == ("GET", "/api/headlines")
-
-
-def test_consultar_codifica_los_parametros_en_la_url(logica, api):
     api.respuestas["/api/dj_volume"] = _json({"ok": True})
-    error, datos = logica.consultar("dj_volume", "POST", valor=50, motivo="el panel & yo")
-    assert (error, datos) == ("", {"ok": True})
-    assert api.peticiones[0].metodo == "POST"
-    assert api.peticiones[0].ruta == "/api/dj_volume?valor=50&motivo=el+panel+%26+yo"
+    assert logica.consultar("headlines", timeout=2) == ("", {"titulares": [{"texto": "a"}]})
+    assert logica.consultar("dj_volume", "POST", valor=50, motivo="el panel & yo") == ("", {"ok": True})
+    assert [(p.metodo, p.ruta) for p in api.peticiones] == [
+        ("GET", "/api/headlines"), ("POST", "/api/dj_volume?valor=50&motivo=el+panel+%26+yo")]
 
 
 @pytest.mark.parametrize("cuerpo", [b"", b"no es json"])
@@ -329,12 +285,10 @@ def test_consultar_http_de_error_devuelve_el_motivo(logica, api):
     assert logica.consultar("roto") == ("Internal Server Error", {})
 
 
-def test_consultar_sin_bot_devuelve_un_error_legible(logica, bot_caido):
+def test_consultar_sin_bot_o_con_timeout_devuelve_un_error_legible(logica, bot_caido, monkeypatch):
     error, datos = logica.consultar("status")
     assert "refused" in error and datos == {}
 
-
-def test_consultar_con_timeout_devuelve_el_error(logica, monkeypatch):
     def agotado(*args, **kwargs):
         raise TimeoutError("se acabó el tiempo")
     monkeypatch.setattr(logica.urllib.request, "urlopen", agotado)
@@ -356,22 +310,16 @@ def test_postear_con_http_de_error(logica, api):
     assert logica.postear("no_existe") == "Not Found"
 
 
-def test_lavalink_arriba_manda_la_clave(logica, api):
-    api.respuestas["/version"] = (200, b"4.0.8")
-    assert logica.lavalink_arriba() is True
+@pytest.mark.parametrize("respuesta, esperado", [((200, b"4.0.8"), True), ((401, b""), False)])
+def test_lavalink_manda_la_clave_y_si_la_rechaza_no_esta_arriba(logica, api, respuesta, esperado):
+    api.respuestas["/version"] = respuesta
+    assert logica.lavalink_arriba() is esperado
     assert api.peticiones[0].autorizacion == "clave"
-
-
-def test_lavalink_rechaza_o_no_esta(logica, api):
-    api.respuestas["/version"] = (401, b"")
-    assert logica.lavalink_arriba() is False
 
 
 def test_lavalink_abajo(logica, bot_caido):
     assert logica.lavalink_arriba() is False
 
-
-# --- levantar Lavalink -----------------------------------------------------------
 
 def _doble_run(monkeypatch, logica, *, resultado=None, lanza=None):
     llamadas = []
@@ -397,26 +345,18 @@ def test_levantar_lavalink_ok(logica, monkeypatch):
     assert kwargs["timeout"] == 180 and kwargs["capture_output"] and kwargs["text"]
 
 
-def test_levantar_lavalink_fallido_devuelve_la_ultima_linea_corta(logica, monkeypatch):
+def test_levantar_lavalink_fallido_devuelve_la_ultima_linea_corta_o_el_motivo(logica, monkeypatch):
     _doble_run(monkeypatch, logica, resultado=_completado(1, "uno\ndos\n", "tres\ncuatro\n"))
     assert logica.levantar_lavalink() == "cuatro"
     _doble_run(monkeypatch, logica, resultado=_completado(2, "", "x" * 300))
     assert logica.levantar_lavalink() == "x" * 120
-
-
-def test_levantar_lavalink_fallido_sin_salida(logica, monkeypatch):
     _doble_run(monkeypatch, logica, resultado=_completado(1, "  \n", ""))
     assert logica.levantar_lavalink() == "no pude levantar Lavalink"
-
-
-def test_levantar_lavalink_sin_script_o_con_timeout(logica, monkeypatch):
     _doble_run(monkeypatch, logica, lanza=FileNotFoundError())
     assert logica.levantar_lavalink() == "falta start-lavalink.sh"
     _doble_run(monkeypatch, logica, lanza=subprocess.TimeoutExpired("cmd", 180))
     assert logica.levantar_lavalink() == "Lavalink tardó demasiado en levantar"
 
-
-# --- levantar el bot -------------------------------------------------------------
 
 @pytest.fixture
 def arranque(logica, monkeypatch, tmp_path):
@@ -469,7 +409,9 @@ def test_levantar_bot_rota_el_log_grande_antes_de_tomar_la_marca(logica, arranqu
     assert (logica.START_LOG.parent / "arranque.log.1").read_bytes() == b"x" * 50
 
 
-def test_rotar_arranque_deja_en_paz_un_log_pequeno_y_aguanta_fallos(logica, arranque, monkeypatch):
+def test_rotar_arranque_deja_en_paz_un_log_pequeno_aguanta_fallos_y_sin_log_no_hace_nada(logica, arranque, monkeypatch):
+    logica.rotar_arranque()
+    assert not logica.START_LOG.exists()
     _escribir(logica.START_LOG, "x" * 50)
     logica.rotar_arranque()
     assert logica.START_LOG.read_bytes() == b"x" * 50
@@ -480,11 +422,6 @@ def test_rotar_arranque_deja_en_paz_un_log_pequeno_y_aguanta_fallos(logica, arra
     monkeypatch.setattr(Path, "replace", no_se_puede)
     logica.rotar_arranque()   # no rota, pero tampoco revienta
     assert logica.START_LOG.read_bytes() == b"x" * 50
-
-
-def test_rotar_arranque_sin_log_no_hace_nada(logica, arranque):
-    logica.rotar_arranque()
-    assert not logica.START_LOG.exists()
 
 
 def test_levantar_bot_cuando_popen_falla(logica, arranque):
@@ -501,8 +438,6 @@ def test_levantar_bot_si_no_puede_escribir_el_log(logica, arranque):
     assert arranque.popen == []
 
 
-# --- el motivo de la caída y el log ----------------------------------------------
-
 TRACEBACK = (
     "Traceback (most recent call last):\n"
     '  File "bot.py", line 3, in <module>\n'
@@ -518,40 +453,25 @@ def log_de_arranque(logica, monkeypatch, tmp_path):
     return ruta
 
 
-def test_motivo_es_la_linea_que_cierra_el_traceback(logica, log_de_arranque):
-    _escribir(log_de_arranque, "arrancando...\n" + TRACEBACK)
-    assert logica.motivo_de_la_caida(0) == "ModuleNotFoundError: No module named 'wavelink'"
+VIEJO = "ValueError: de un arranque anterior\n"
+WAVELINK = "ModuleNotFoundError: No module named 'wavelink'"
 
 
-def test_motivo_lee_solo_lo_escrito_desde_la_marca(logica, log_de_arranque):
-    viejo = "ValueError: de un arranque anterior\n"
-    _escribir(log_de_arranque, viejo)
-    assert logica.motivo_de_la_caida(0) == "ValueError: de un arranque anterior"
-    assert logica.motivo_de_la_caida(len(viejo.encode())) == ""
-    _escribir(log_de_arranque, viejo + TRACEBACK)
-    assert logica.motivo_de_la_caida(len(viejo.encode())) \
-        == "ModuleNotFoundError: No module named 'wavelink'"
-
-
-def test_motivo_ignora_lineas_en_blanco(logica, log_de_arranque):
-    _escribir(log_de_arranque, "\n\nboom\n\n  \n")
-    assert logica.motivo_de_la_caida(0) == "boom"
-
-
-def test_motivo_si_todo_parece_traceback_devuelve_la_ultima_linea(logica, log_de_arranque):
-    _escribir(log_de_arranque, 'Traceback (most recent call last):\n  File "x.py", line 1\n')
-    assert logica.motivo_de_la_caida(0) == 'File "x.py", line 1'
-
-
-def test_motivo_se_corta_a_160_caracteres(logica, log_de_arranque):
-    _escribir(log_de_arranque, "E" * 500 + "\n")
-    assert logica.motivo_de_la_caida(0) == "E" * 160
-
-
-def test_motivo_sin_archivo_o_vacio(logica, log_de_arranque):
-    assert logica.motivo_de_la_caida(0) == ""
-    _escribir(log_de_arranque, "")
-    assert logica.motivo_de_la_caida(0) == ""
+@pytest.mark.parametrize("contenido, marca, esperado", [
+    ("arrancando...\n" + TRACEBACK, 0, WAVELINK),                       # la línea que cierra el traceback
+    (VIEJO, 0, "ValueError: de un arranque anterior"),
+    (VIEJO, len(VIEJO.encode()), ""),                                    # solo se lee lo escrito desde la marca
+    (VIEJO + TRACEBACK, len(VIEJO.encode()), WAVELINK),
+    ("\n\nboom\n\n  \n", 0, "boom"),                                   # ignora líneas en blanco
+    ('Traceback (most recent call last):\n  File "x.py", line 1\n', 0, 'File "x.py", line 1'),   # todo parece traceback: la última
+    ("E" * 500 + "\n", 0, "E" * 160),
+    ("", 0, ""),
+    (None, 0, ""),                                                       # sin archivo
+])
+def test_motivo_de_la_caida(logica, log_de_arranque, contenido, marca, esperado):
+    if contenido is not None:
+        _escribir(log_de_arranque, contenido)
+    assert logica.motivo_de_la_caida(marca) == esperado
 
 
 def test_motivo_aguanta_bytes_que_no_son_utf8(logica, log_de_arranque):
@@ -573,13 +493,9 @@ def test_lineas_de_log_devuelve_las_ultimas_acortadas(logica, tmp_path):
     assert len(logica.lineas_de_log(50, ruta)) == 3
 
 
-def test_lineas_de_log_salta_las_vacias_y_deja_los_tracebacks(logica, tmp_path):
+def test_lineas_de_log_salta_las_vacias_y_deja_los_tracebacks_y_sin_archivo_es_vacia(logica, tmp_path):
     ruta = _escribir(tmp_path / "bot.log", f"{LINEAS[0]}\n\n   \nTraceback (most recent call last):\n\n")
-    assert logica.lineas_de_log(5, ruta) == [
-        "00:14  bot: Bot listo", "Traceback (most recent call last):"]
-
-
-def test_lineas_de_log_sin_archivo_es_lista_vacia(logica, tmp_path):
+    assert logica.lineas_de_log(5, ruta) == ["00:14  bot: Bot listo", "Traceback (most recent call last):"]
     assert logica.lineas_de_log(3, tmp_path / "no_hay.log") == []
 
 
@@ -598,8 +514,6 @@ def test_lineas_de_log_aguanta_bytes_que_no_son_utf8(logica, tmp_path):
     assert logica.lineas_de_log(1, ruta)[0].endswith("hola")
 
 
-# --- ajustes ---------------------------------------------------------------------
-
 @pytest.fixture
 def ajustes(logica, monkeypatch, tmp_path):
     nuevo = tmp_path / "config" / "lavadj" / "panel.json"
@@ -609,36 +523,24 @@ def ajustes(logica, monkeypatch, tmp_path):
     return SimpleNamespace(nuevo=nuevo, viejo=viejo)
 
 
-def test_leer_ajustes_sin_archivos_es_vacio(logica, ajustes):
+def test_leer_ajustes_sin_archivos_o_corrupto_es_vacio(logica, ajustes):
     assert logica.leer_ajustes() == {}
-
-
-def test_leer_ajustes_corrupto_es_vacio(logica, ajustes):
     _escribir(ajustes.nuevo, "{esto no es json")
     assert logica.leer_ajustes() == {}
 
 
-def test_leer_ajustes_usa_el_viejo_solo_si_no_hay_nuevo(logica, ajustes):
+def test_leer_ajustes_usa_el_viejo_solo_si_no_hay_nuevo_o_esta_corrupto(logica, ajustes):
     _escribir(ajustes.viejo, json.dumps({"luz": "noche"}))
+    assert logica.leer_ajustes() == {"luz": "noche"}
+    _escribir(ajustes.nuevo, "{roto")
     assert logica.leer_ajustes() == {"luz": "noche"}
     _escribir(ajustes.nuevo, json.dumps({"luz": "dia"}))
     assert logica.leer_ajustes() == {"luz": "dia"}
 
 
-def test_leer_ajustes_con_nuevo_corrupto_cae_al_viejo(logica, ajustes):
-    _escribir(ajustes.viejo, json.dumps({"dj_volumen": 80}))
-    _escribir(ajustes.nuevo, "{roto")
-    assert logica.leer_ajustes() == {"dj_volumen": 80}
-
-
-def test_guardar_ajuste_crea_las_carpetas_y_va_y_vuelve(logica, ajustes):
-    logica.guardar_ajuste("dj_volumen", 130)
-    assert ajustes.nuevo.exists()
-    assert logica.leer_ajustes() == {"dj_volumen": 130}
-
-
-def test_guardar_ajuste_conserva_las_otras_claves(logica, ajustes):
+def test_guardar_ajuste_crea_las_carpetas_va_y_vuelve_y_conserva_las_otras_claves(logica, ajustes):
     logica.guardar_ajuste("luz", "noche")
+    assert ajustes.nuevo.exists()
     logica.guardar_ajuste("dj_volumen", 0)
     logica.guardar_ajuste("luz", "dia")
     assert logica.leer_ajustes() == {"luz": "dia", "dj_volumen": 0}
@@ -664,8 +566,6 @@ def test_guardar_ajuste_que_no_se_puede_escribir_no_revienta(logica, monkeypatch
     logica.guardar_ajuste("luz", "dia")
     assert logica.leer_ajustes() == {}
 
-
-# --- guardas: lo que no se puede probar abriendo la ventana ----------------------
 
 def test_el_modulo_solo_importa_la_biblioteca_estandar():
     """El panel corre con el python del sistema, que no tiene nada del venv."""

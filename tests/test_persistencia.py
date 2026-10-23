@@ -62,39 +62,39 @@ def _foto_cualquiera(**cambios):
     return {**_foto(Player(Pista("a"), [Pista("b")])), **cambios}
 
 
-# --- la foto ---------------------------------------------------------------------
+def _viejo(archivo):
+    persistencia.guardar({1: _foto_cualquiera()})
+    return archivo.read_bytes()
 
-def test_la_foto_lleva_todo_lo_que_hace_falta_para_retomar():
-    player = Player(Pista("sonando"), [Pista("uno"), Pista("dos")], modo=wavelink.QueueMode.loop)
+
+def _intacto(archivo, viejo):
+    assert archivo.read_bytes() == viejo
+    assert list(archivo.parent.iterdir()) == [archivo]
+
+
+def _con_entradas(archivo, servidores):
+    archivo.parent.mkdir(parents=True)
+    archivo.write_text(json.dumps({"version": persistencia.VERSION, "servidores": servidores}))
+
+
+def test_la_foto_lleva_todo_lo_que_hace_falta_para_retomar_y_quien_pidio_cada_tema():
+    uno = Pista("uno")
+    uno.requester = "ana"
+    player = Player(Pista("sonando"), [uno, Pista("dos")], modo=wavelink.QueueMode.loop)
     player.paused = True
 
-    foto = _foto(player)
-
-    assert foto == {
+    assert _foto(player) == {
         "voz": 7, "texto": 8, "actual": _raw("sonando"), "posicion": 95_000,
-        "cola": [_raw("uno"), _raw("dos")], "modo": "loop", "volumen": 80,
+        "cola": [{**_raw("uno"), "pedido_por": "ana"}, _raw("dos")], "modo": "loop", "volumen": 80,
         "pausado": True, "autoplay": True, "hora": AHORA,
     }
 
 
-def test_los_cortes_del_dj_no_se_guardan():
-    player = Player(Pista("sonando"), [Pista("corte", clip=True), Pista("tema"), Pista("otro corte", clip=True)])
+def test_los_cortes_del_dj_no_se_guardan_ni_cuentan_como_tema_en_curso():
+    foto = _foto(Player(Pista("corte", clip=True), [Pista("c1", clip=True), Pista("tema"), Pista("c2", clip=True)]))
 
-    assert _foto(player)["cola"] == [_raw("tema")]
-
-
-def test_quien_pidio_el_tema_viaja_en_la_foto():
-    pista = Pista("tema")
-    pista.requester = "ana"
-    assert _foto(Player(None, [pista]))["cola"] == [{**_raw("tema"), "pedido_por": "ana"}]
-
-
-def test_si_lo_que_suena_es_un_corte_del_dj_no_es_el_tema_en_curso():
-    foto = _foto(Player(Pista("corte", clip=True), [Pista("sigue")]))
-
-    assert foto["actual"] is None
-    assert foto["posicion"] == 0
-    assert foto["cola"] == [_raw("sigue")]
+    assert foto["actual"] is None and foto["posicion"] == 0
+    assert foto["cola"] == [_raw("tema")]
 
 
 def test_sin_tema_ni_cola_no_hay_nada_que_retomar():
@@ -102,26 +102,21 @@ def test_sin_tema_ni_cola_no_hay_nada_que_retomar():
     assert _foto(Player(Pista("corte", clip=True), [Pista("otro", clip=True)])) is None
 
 
-def test_sin_canal_de_voz_no_hay_foto():
+def test_sin_canal_de_voz_no_hay_foto_y_sin_canal_de_texto_queda_vacio():
     assert _foto(Player(Pista("a"), canal=None)) is None
-
-
-def test_sin_canal_de_texto_la_foto_lo_deja_vacio():
     assert _foto(Player(Pista("a"), texto=None))["texto"] is None
 
 
 def test_la_foto_toma_la_hora_del_reloj_si_no_se_le_da_una(monkeypatch):
     monkeypatch.setattr(persistencia, "time", SimpleNamespace(time=lambda: 123.0))
-
     assert persistencia.tomar(Player(Pista("a")), posicion=0, autoplay=False, es_clip=_es_clip)["hora"] == 123.0
 
 
 def test_una_pista_que_no_cabe_en_json_se_deja_fuera_y_no_rompe_la_foto(caplog):
     mala = Pista("mala", raw={"encoded": "x", "info": object()})
-    player = Player(Pista("sonando"), [mala, Pista("buena")])
 
     with caplog.at_level("WARNING", logger="persistencia"):
-        foto = _foto(player)
+        foto = _foto(Player(Pista("sonando"), [mala, Pista("buena")]))
 
     assert foto["cola"] == [_raw("buena")]
     assert "no se puede guardar" in caplog.text
@@ -130,18 +125,14 @@ def test_una_pista_que_no_cabe_en_json_se_deja_fuera_y_no_rompe_la_foto(caplog):
 
 def test_si_el_tema_en_curso_no_cabe_en_json_queda_sin_tema_pero_con_cola():
     foto = _foto(Player(Pista("mala", raw={"info": object()}), [Pista("buena")]))
-
-    assert foto["actual"] is None
-    assert foto["cola"] == [_raw("buena")]
+    assert foto["actual"] is None and foto["cola"] == [_raw("buena")]
 
 
-# --- la huella: qué cuenta como "cambió" --------------------------------------------
-
-def test_la_huella_ignora_la_hora_y_la_posicion():
-    antes = {1: _foto_cualquiera()}
-    despues = {1: _foto_cualquiera(hora=AHORA + 600, posicion=5_000)}
-
-    assert persistencia.huella(antes) == persistencia.huella(despues)
+def test_la_huella_ignora_hora_y_posicion_pero_distingue_los_servidores():
+    huella = persistencia.huella
+    assert huella({1: _foto_cualquiera()}) == huella({1: _foto_cualquiera(hora=AHORA + 600, posicion=5_000)})
+    assert huella({1: _foto_cualquiera()}) != huella({2: _foto_cualquiera()})
+    assert huella({}) != huella({1: _foto_cualquiera()})
 
 
 @pytest.mark.parametrize("cambio", [
@@ -152,51 +143,27 @@ def test_la_huella_cambia_con_cualquier_otra_cosa(cambio):
     assert persistencia.huella({1: _foto_cualquiera()}) != persistencia.huella({1: _foto_cualquiera(**cambio)})
 
 
-def test_la_huella_distingue_los_servidores():
-    assert persistencia.huella({1: _foto_cualquiera()}) != persistencia.huella({2: _foto_cualquiera()})
-    assert persistencia.huella({}) != persistencia.huella({1: _foto_cualquiera()})
-
-
-# --- el archivo -------------------------------------------------------------------
-
-def test_ida_y_vuelta_por_el_archivo(archivo_de_colas):
+def test_ida_y_vuelta_por_el_archivo_de_la_configuracion(archivo_de_colas):
     fotos = {5: _foto(Player(Pista("a"), [Pista("b"), Pista("corte", clip=True), Pista("c")])), 6: _foto_cualquiera()}
 
     persistencia.guardar(fotos)
 
-    assert archivo_de_colas.exists()
+    assert archivo_de_colas != config.PROJECT_ROOT / "estado" / "colas.json"
     assert persistencia.cargar(ahora=AHORA) == fotos
     assert persistencia.cargar(ahora=AHORA)[5]["cola"] == [_raw("b"), _raw("c")]
-
-
-def test_el_archivo_es_json_corriente(archivo_de_colas):
-    persistencia.guardar({5: _foto_cualquiera()})
-
     crudo = json.loads(archivo_de_colas.read_text(encoding="utf-8"))
-
-    assert crudo["version"] == persistencia.VERSION
-    assert list(crudo["servidores"]) == ["5"]
+    assert crudo["version"] == persistencia.VERSION and list(crudo["servidores"]) == ["5", "6"]
 
 
 def test_se_crea_la_carpeta_si_no_existe(tmp_path):
     ruta = tmp_path / "otra" / "mas" / "colas.json"
-
     persistencia.guardar({1: _foto_cualquiera()}, ruta)
-
     assert ruta.exists()
 
 
-def test_sin_ruta_se_usa_la_de_la_configuracion(archivo_de_colas):
-    persistencia.guardar({1: _foto_cualquiera()})
-
-    assert archivo_de_colas.exists()
-    assert archivo_de_colas != config.PROJECT_ROOT / "estado" / "colas.json"
-
-
-def test_guardar_reemplaza_todo_lo_anterior(archivo_de_colas):
+def test_guardar_reemplaza_todo_lo_anterior():
     persistencia.guardar({1: _foto_cualquiera(), 2: _foto_cualquiera()})
     persistencia.guardar({2: _foto_cualquiera()})
-
     assert list(persistencia.cargar(ahora=AHORA)) == [2]
 
 
@@ -204,54 +171,29 @@ def test_el_archivo_de_estado_no_se_versiona():
     assert "estado/" in (config.PROJECT_ROOT / ".gitignore").read_text().split()
 
 
-# --- escritura atómica ---------------------------------------------------------------
-
-def _viejo(archivo_de_colas):
-    persistencia.guardar({1: _foto_cualquiera()})
-    return archivo_de_colas.read_bytes()
-
-
-def test_si_falla_el_cambio_de_archivo_el_anterior_queda_intacto(archivo_de_colas, monkeypatch):
+@pytest.mark.parametrize("donde, error", [("replace", "disco lleno"), ("fsync", "se cortó la luz")])
+def test_si_falla_el_cambio_o_la_escritura_a_medias_el_anterior_queda_intacto(archivo_de_colas, monkeypatch, donde, error):
     viejo = _viejo(archivo_de_colas)
 
-    def _falla(origen, destino):
-        raise OSError("disco lleno")
+    def _falla(*_):
+        raise OSError(error)
 
-    monkeypatch.setattr(persistencia.os, "replace", _falla)
+    monkeypatch.setattr(persistencia.os, donde, _falla)
     with pytest.raises(OSError):
         persistencia.guardar({2: _foto_cualquiera()})
 
-    assert archivo_de_colas.read_bytes() == viejo
-    assert list(archivo_de_colas.parent.iterdir()) == [archivo_de_colas]
-
-
-def test_si_falla_la_escritura_a_medias_el_anterior_queda_intacto(archivo_de_colas, monkeypatch):
-    viejo = _viejo(archivo_de_colas)
-
-    def _falla(fd):
-        raise OSError("se cortó la luz")
-
-    monkeypatch.setattr(persistencia.os, "fsync", _falla)
-    with pytest.raises(OSError):
-        persistencia.guardar({2: _foto_cualquiera()})
-
-    assert archivo_de_colas.read_bytes() == viejo
-    assert list(archivo_de_colas.parent.iterdir()) == [archivo_de_colas]
+    _intacto(archivo_de_colas, viejo)
 
 
 def test_lo_que_no_es_serializable_no_toca_el_archivo(archivo_de_colas):
     viejo = _viejo(archivo_de_colas)
-
     with pytest.raises(TypeError):
         persistencia.guardar({2: _foto_cualquiera(actual={"info": object()})})
-
-    assert archivo_de_colas.read_bytes() == viejo
-    assert list(archivo_de_colas.parent.iterdir()) == [archivo_de_colas]
+    _intacto(archivo_de_colas, viejo)
 
 
 def test_el_temporal_se_escribe_junto_al_archivo(archivo_de_colas, monkeypatch):
-    visto = []
-    cambiar = persistencia.os.replace
+    visto, cambiar = [], persistencia.os.replace
 
     def _espia(origen, destino):
         visto.append((origen, destino))
@@ -261,37 +203,27 @@ def test_el_temporal_se_escribe_junto_al_archivo(archivo_de_colas, monkeypatch):
     persistencia.guardar({1: _foto_cualquiera()})
 
     [(origen, destino)] = visto
-    assert destino == archivo_de_colas
-    assert origen != destino
+    assert destino == archivo_de_colas and origen != destino
     assert Path(origen).parent == destino.parent
 
-
-# --- archivo ausente, corrupto o raro ----------------------------------------------------
 
 def test_sin_archivo_no_hay_fotos_ni_ruido(caplog):
     with caplog.at_level("DEBUG", logger="persistencia"):
         assert persistencia.cargar() == {}
-
     assert caplog.records == []
 
 
 @pytest.mark.parametrize("contenido", [
-    "{esto no es json",
-    "",
-    b"\xff\xfe\x00\x80 bytes que no son UTF-8",
-    "[]",
-    "null",
-    '{"version": 99, "servidores": {}}',
-    '{"servidores": {}}',
-    '{"version": 1, "servidores": []}',
-    '{"version": 1}',
-])
+    "{esto no es json", "", b"\xff\xfe\x00\x80 bytes que no son UTF-8", "[]", "null",
+    '{"version": 99, "servidores": {}}', '{"servidores": {}}', '{"version": 1, "servidores": []}', '{"version": 1}',
+    None,
+], ids=lambda c: "carpeta" if c is None else repr(c)[:25])
 def test_un_archivo_que_no_sirve_se_trata_como_vacio_y_queda_en_el_log(archivo_de_colas, caplog, contenido):
-    archivo_de_colas.parent.mkdir(parents=True)
-    if isinstance(contenido, bytes):
-        archivo_de_colas.write_bytes(contenido)
+    if contenido is None:      # el archivo es una carpeta
+        archivo_de_colas.mkdir(parents=True)
     else:
-        archivo_de_colas.write_text(contenido, encoding="utf-8")
+        archivo_de_colas.parent.mkdir(parents=True)
+        archivo_de_colas.write_bytes(contenido if isinstance(contenido, bytes) else contenido.encode())
 
     with caplog.at_level("WARNING", logger="persistencia"):
         assert persistencia.cargar(ahora=AHORA) == {}
@@ -299,49 +231,28 @@ def test_un_archivo_que_no_sirve_se_trata_como_vacio_y_queda_en_el_log(archivo_d
     assert "lo trato como vacío" in caplog.text
 
 
-def test_si_el_archivo_es_una_carpeta_tampoco_rompe(archivo_de_colas, caplog):
-    archivo_de_colas.mkdir(parents=True)
-
-    with caplog.at_level("WARNING", logger="persistencia"):
-        assert persistencia.cargar(ahora=AHORA) == {}
-
-    assert "lo trato como vacío" in caplog.text
-
-
-def _con_entradas(archivo_de_colas, servidores):
-    archivo_de_colas.parent.mkdir(parents=True)
-    archivo_de_colas.write_text(json.dumps({"version": persistencia.VERSION, "servidores": servidores}))
-
-
-@pytest.mark.parametrize("rara", [
-    "no es un diccionario",
-    {"voz": 1},
-    {**_foto_cualquiera(), "extra": 1},
-    {**_foto_cualquiera(), "voz": "siete"},
-    {**_foto_cualquiera(), "cola": "no es lista"},
-    {**_foto_cualquiera(), "cola": ["no es una pista"]},
-    {**_foto_cualquiera(), "actual": "no es un dict"},
-    {**_foto_cualquiera(), "hora": "ayer"},
+@pytest.mark.parametrize("clave, rara", [
+    ("1", "no es un diccionario"),
+    ("1", {"voz": 1}),
+    ("1", {**_foto_cualquiera(), "extra": 1}),
+    ("1", {**_foto_cualquiera(), "voz": "siete"}),
+    ("1", {**_foto_cualquiera(), "cola": "no es lista"}),
+    ("1", {**_foto_cualquiera(), "cola": ["no es una pista"]}),
+    ("1", {**_foto_cualquiera(), "actual": "no es un dict"}),
+    ("1", {**_foto_cualquiera(), "hora": "ayer"}),
+    ("abc", _foto_cualquiera()),
 ])
-def test_una_foto_rara_se_descarta_y_las_buenas_se_quedan(archivo_de_colas, caplog, rara):
-    _con_entradas(archivo_de_colas, {"1": rara, "2": _foto_cualquiera()})
+def test_una_foto_rara_o_de_un_id_no_numerico_se_descarta_y_las_buenas_se_quedan(archivo_de_colas, caplog, clave, rara):
+    _con_entradas(archivo_de_colas, {clave: rara, "2": _foto_cualquiera()})
 
     with caplog.at_level("WARNING", logger="persistencia"):
         fotos = persistencia.cargar(ahora=AHORA)
 
     assert list(fotos) == [2]
-    assert "Descarto la foto de '1'" in caplog.text
+    assert f"Descarto la foto de {clave!r}" in caplog.text
 
 
-def test_un_id_de_servidor_que_no_es_numero_se_descarta(archivo_de_colas):
-    _con_entradas(archivo_de_colas, {"abc": _foto_cualquiera(), "3": _foto_cualquiera()})
-
-    assert list(persistencia.cargar(ahora=AHORA)) == [3]
-
-
-# --- vigencia --------------------------------------------------------------------------
-
-def test_una_foto_vieja_no_se_retoma(archivo_de_colas, caplog):
+def test_una_foto_vieja_no_se_retoma(caplog):
     persistencia.guardar({
         1: _foto_cualquiera(hora=AHORA - VIGENCIA - 1),
         2: _foto_cualquiera(hora=AHORA - VIGENCIA + 1),
@@ -358,45 +269,35 @@ def test_una_foto_vieja_no_se_retoma(archivo_de_colas, caplog):
 def test_la_vigencia_se_mide_contra_el_reloj_si_no_se_da_la_hora(monkeypatch):
     persistencia.guardar({1: _foto_cualquiera(hora=AHORA)})
     monkeypatch.setattr(persistencia, "time", SimpleNamespace(time=lambda: AHORA + VIGENCIA + 60))
-
     assert persistencia.cargar() == {}
 
 
-# --- borrar un servidor -------------------------------------------------------------------
-
-def test_borrar_saca_solo_ese_servidor(archivo_de_colas):
+def test_borrar_saca_solo_ese_servidor():
     persistencia.guardar({1: _foto_cualquiera(), 2: _foto_cualquiera()})
-
     persistencia.borrar(1)
-
     assert list(persistencia.cargar(ahora=AHORA)) == [2]
 
 
 def test_borrar_sin_archivo_no_crea_nada(archivo_de_colas):
     persistencia.borrar(1)
-
     assert not archivo_de_colas.parent.exists()
 
 
 def test_borrar_un_servidor_que_no_esta_no_reescribe_el_archivo(archivo_de_colas, monkeypatch):
     viejo = _viejo(archivo_de_colas)
     monkeypatch.setattr(persistencia, "_escribir", lambda *a: pytest.fail("no había nada que borrar"))
-
     persistencia.borrar(99)
-
     assert archivo_de_colas.read_bytes() == viejo
 
 
 def test_borrar_con_el_archivo_corrupto_no_rompe(archivo_de_colas):
     archivo_de_colas.parent.mkdir(parents=True)
     archivo_de_colas.write_text("{roto")
-
     persistencia.borrar(1)
-
     assert archivo_de_colas.read_text() == "{roto"
 
 
-def test_si_no_se_puede_escribir_borrar_lo_dice_y_sigue(archivo_de_colas, monkeypatch, caplog):
+def test_si_no_se_puede_escribir_borrar_lo_dice_y_sigue(monkeypatch, caplog):
     persistencia.guardar({1: _foto_cualquiera()})
 
     def _falla(origen, destino):
