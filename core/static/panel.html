@@ -106,8 +106,6 @@
   .voz progress { width:90px; accent-color:var(--acc); }
   .sec { background:transparent; }
   button.bad { color:var(--bad); background:transparent; border-color:var(--line); }
-  .guion { display:flex; align-items:center; gap:8px; padding:4px 0; }
-  .guion small { color:var(--mut); }
   .err { color:var(--bad); font-size:13px; overflow-wrap:anywhere; }
   .err:not(:empty) { margin-top:10px; }
   .news-panel { grid-column:1 / -1; }
@@ -137,7 +135,6 @@
   .row span:last-child { color:var(--fg); text-align:right; }
   #voz { overflow-wrap:anywhere; }
   #log { padding:14px; border:1px solid var(--line); border-radius:var(--radius); background:var(--bg); margin:0; max-height:300px; overflow-y:auto; overflow-wrap:anywhere; white-space:pre-wrap; font:12px/1.8 ui-monospace,Consolas,monospace; scrollbar-width:thin; }
-  .acciones { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
   .power { text-align:right; max-width:310px; flex-shrink:0; }
   #parar { border-color:transparent; color:var(--bad); background:transparent; font-size:13px; }
   #parar:hover:not(:disabled) { background:var(--raised); }
@@ -179,7 +176,7 @@
         <div class="range-ends mono"><span>0%</span><span>200%</span></div><small id="djEstado">Cargando estado del DJ…</small><div id="volumenError" class="err" role="status"></div>
         <div class="settings"><div><span class="control-label mono">Voz actual</span><div class="voice-current"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5 6 9H3v6h3l6 4V5zm4 3a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg><span id="vozActual">Cargando…</span></div><small id="vozDetalle"></small></div><div><label for="guionistas" class="control-label mono">Guionista del DJ</label><select id="guionistas" aria-label="Guionista del DJ"><option value="">Cargando…</option></select><div id="guionistaFallo" class="err" role="status"></div><div id="guionistaError" class="err" role="status"></div></div></div>
         <label class="filter" for="filtro"><span><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 7h6m4 0h8M3 17h11m4 0h3"/><circle cx="11" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>Filtro de radio</span><input id="filtro" type="checkbox"></label>
-        <details class="voice-picker"><summary>Cambiar voz</summary><div id="sinPiper" class="err" hidden>Las voces neuronales no están disponibles. Puedes seguir usando la voz del sistema.</div><div id="voces">Cargando catálogo de voces…</div><div id="vocesError" class="err" role="status"></div></details>
+        <details class="voice-picker"><summary>Cambiar voz</summary><div id="sinPiper" class="err" hidden>Falta Piper, el motor de las voces neuronales: instálalo con <code>pip install piper-tts</code> en el venv del bot y reinicia. Mientras tanto, el DJ usa la voz del sistema.</div><div id="voces">Cargando catálogo de voces…</div><div id="vocesError" class="err" role="status"></div></details>
         <audio id="muestra" preload="none"></audio>
       </div>
     </section>
@@ -220,7 +217,7 @@ const CALIDAD = {x_low:'muy baja', low:'baja', medium:'media', high:'alta'};
 let datosVoces = null, vistaVoces = '', escuchando = null, sondeoVoces = null, tiempoMuestra = null;
 let cargandoVoces = false, vozPendiente = false, filtroPendiente = false, revisionVoces = 0;
 const GUIONISTAS = [['frases', 'Frases fijas'], ['claude', 'Claude (API, cobra por uso)'], ['ollama', 'Ollama (local)']];
-const SIN_GUIONISTA = {claude:'no disponible', ollama:'no responde'};
+const SIN_GUIONISTA = {claude:'falta el SDK de anthropic', ollama:'no responde'};
 let datosGuionista = null, vistaGuionistas = '', cargandoGuionista = false, guionistaPendiente = false, revisionGuionista = 0;
 const caja = $('letraCaja'), det = $('letraDet');
 const AVISOS = {sin_letra:'No encontré la letra de esta canción.', error:'No pude buscar la letra.', nada_sonando:'No hay ninguna canción sonando.'};
@@ -262,18 +259,18 @@ function sinConexion() {
 }
 function elegirSala(voz) {
   const anterior = sala;
+  // servidorElegido es solo lo que eligió la persona: sin elección, el panel sigue al que suena.
   sala = voz.find(v => String(v.id) === servidorElegido) || voz.find(v => v.sonando) || voz[0] || null;
-  servidorElegido = sala ? String(sala.id) : null;
   const opciones = voz.map(v => `<option value="${esc(v.id)}">${esc(v.servidor)} · ${esc(v.canal || 'Sin canal')}</option>`).join('');
   if (opciones !== vistaServidores) { vistaServidores = opciones; $('selectorServidor').innerHTML = opciones; }
-  if (servidorElegido) $('selectorServidor').value = servidorElegido;
+  if (sala) $('selectorServidor').value = String(sala.id);
   $('elegirServidor').hidden = voz.length < 2;
   if (String(anterior?.id) !== String(sala?.id)) {
     versionLetra++; pedida = null; ancla = null; letra = {pista:null, servidor:null, sync:false, lineas:[]};
     $('radioAviso').textContent = ''; avisoLetra('Esperando una canción.');
   } else if (claveSala(anterior) !== claveSala(sala)) $('radioAviso').textContent = '';
   $('estadoPista').textContent = !sala ? 'En espera' : sala.dj ? 'Habla el DJ' : sala.pausado ? 'En pausa' : sala.sonando ? 'Sonando' : 'En espera';
-  $('cancion').textContent = sala?.cancion || 'La próxima canción te espera';
+  $('cancion').textContent = sala?.dj ? 'El DJ está al aire' : sala?.cancion || 'La próxima canción te espera';
   $('canal').textContent = sala ? sala.servidor + ' · ' + (sala.canal || 'Sin canal de voz') : 'Conecta el bot a un canal de voz desde Discord.';
   $('cola').textContent = sala ? (Number(sala.en_cola) || 0) + ' en cola' : 'Sin canciones en cola';
   anclaPista = sala ? {pos:Number(sala.posicion_ms) || 0, largo:Number(sala.duracion_ms) || 0, t:performance.now(), pausado:!sala.sonando || sala.pausado} : null;
